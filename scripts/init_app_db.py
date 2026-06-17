@@ -18,6 +18,46 @@ async def init_app_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS id INTEGER")
+        )
+        await conn.execute(
+            text("CREATE SEQUENCE IF NOT EXISTS app_settings_id_seq OWNED BY app_settings.id")
+        )
+        await conn.execute(
+            text("UPDATE app_settings SET id = nextval('app_settings_id_seq') WHERE id IS NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ALTER COLUMN id SET DEFAULT nextval('app_settings_id_seq')")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ALTER COLUMN id SET NOT NULL")
+        )
+        await conn.execute(
+            text(
+                "DO $$ BEGIN "
+                "IF EXISTS ("
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'app_settings' "
+                "AND column_name = 'value' AND data_type <> 'jsonb'"
+                ") THEN "
+                "ALTER TABLE app_settings ALTER COLUMN value TYPE JSONB USING to_jsonb(value); "
+                "END IF; END $$;"
+            )
+        )
+        await conn.execute(
+            text(
+                "DO $$ BEGIN "
+                "IF EXISTS ("
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'app_settings' "
+                "AND column_name = 'updated_at' AND data_type <> 'timestamp with time zone'"
+                ") THEN "
+                "ALTER TABLE app_settings DROP COLUMN updated_at; "
+                "ALTER TABLE app_settings ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(); "
+                "END IF; END $$;"
+            )
+        )
+        await conn.execute(
             text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS category VARCHAR(120) NOT NULL DEFAULT 'General'")
         )
         await conn.execute(
@@ -37,6 +77,9 @@ async def init_app_db() -> None:
         )
         await conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_app_settings_category ON app_settings (category)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_app_settings_key ON app_settings (key)")
         )
         await conn.execute(
             text("ALTER TABLE strategy_run_accounts ADD COLUMN IF NOT EXISTS report_json JSONB")
