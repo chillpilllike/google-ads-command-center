@@ -20,6 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_ENV=production \
     APP_INSTANCE_ROLE=primary \
+    PUBLIC_BASE_URL=https://googleads.gofinch.com \
     SESSION_COOKIE_SECURE=false \
     PORT=8000 \
     WEB_CONCURRENCY=1 \

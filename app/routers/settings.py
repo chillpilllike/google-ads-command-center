@@ -35,12 +35,24 @@ GOOGLE_ADS_OAUTH_SCOPES = (
     "openid",
 )
 def google_ads_redirect_uri(request: Request) -> str:
+    if settings.public_base_url:
+        return f"{settings.public_base_url.rstrip('/')}/settings/google-ads/oauth/callback"
     if settings.app_env != "production":
         host = request.url.hostname or "localhost"
         if host in {"localhost", "127.0.0.1"}:
             return f"http://{host}:8010/settings/google-ads/oauth/callback"
         return "http://localhost:8010/settings/google-ads/oauth/callback"
-    return str(request.url_for("google_ads_oauth_callback"))
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    if proto == "http" and host and not host.startswith(("localhost", "127.0.0.1")):
+        proto = "https"
+    if host:
+        return f"{proto}://{host}/settings/google-ads/oauth/callback"
+    return str(request.url_for("google_ads_oauth_callback")).replace("http://", "https://", 1)
 
 
 def _google_ads_client_config(values: dict[str, Any]) -> dict[str, dict[str, str]]:

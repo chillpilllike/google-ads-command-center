@@ -276,8 +276,8 @@ async def get_google_ads_connection_status(
                 uri
                 for uri in (
                     redirect_uri or "",
-                    "http://localhost:8010/analytics/oauth/callback",
-                    "http://127.0.0.1:8010/analytics/oauth/callback",
+                    "http://localhost:8010/settings/google-ads/oauth/callback",
+                    "http://127.0.0.1:8010/settings/google-ads/oauth/callback",
                 )
                 if uri
             )
