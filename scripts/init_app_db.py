@@ -18,6 +18,27 @@ async def init_app_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS category VARCHAR(120) NOT NULL DEFAULT 'General'")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS label VARCHAR(160) NOT NULL DEFAULT ''")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS help_text TEXT NOT NULL DEFAULT ''")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS input_type VARCHAR(40) NOT NULL DEFAULT 'text'")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS sensitive BOOLEAN NOT NULL DEFAULT false")
+        )
+        await conn.execute(
+            text("ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_app_settings_category ON app_settings (category)")
+        )
+        await conn.execute(
             text("ALTER TABLE strategy_run_accounts ADD COLUMN IF NOT EXISTS report_json JSONB")
         )
         await conn.execute(
