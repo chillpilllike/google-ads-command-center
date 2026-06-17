@@ -24,6 +24,7 @@ python3 -m pip install --user -r requirements.txt
 
 cat > .env <<EOF
 APP_ENV=${APP_ENV:-production}
+APP_INSTANCE_ROLE=${APP_INSTANCE_ROLE:-primary}
 SECRET_KEY=${SECRET_KEY}
 DATABASE_URL=${DATABASE_URL}
 ADMIN_EMAIL=${ADMIN_EMAIL}

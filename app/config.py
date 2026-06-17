@@ -14,6 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     app_name: str = "Google Ads Command Center"
     app_env: str = "local"
+    app_instance_role: str = "developer"
     secret_key: str = Field(default="")
     database_url: Optional[PostgresDsn] = Field(default=None)
     postgres_url: Optional[PostgresDsn] = Field(default=None)
@@ -41,6 +42,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def require_runtime_secrets(self) -> "Settings":
+        self.app_instance_role = str(self.app_instance_role or "developer").strip().lower()
+        if self.app_instance_role not in {"primary", "developer", "standby"}:
+            raise ValueError("APP_INSTANCE_ROLE must be one of: primary, developer, standby.")
         if self.database_url is None:
             self.database_url = self.postgres_url
         if self.database_url is None:
@@ -52,6 +56,14 @@ class Settings(BaseSettings):
             if not self.admin_password or self.admin_password == "admin123":
                 raise ValueError("ADMIN_PASSWORD must be set to a non-default value in production.")
         return self
+
+    @property
+    def is_primary_instance(self) -> bool:
+        return self.app_instance_role == "primary"
+
+    @property
+    def live_google_ads_allowed(self) -> bool:
+        return self.is_primary_instance
 
     @property
     def sqlalchemy_async_url(self) -> str:

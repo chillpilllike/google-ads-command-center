@@ -9,6 +9,9 @@ URL="http://127.0.0.1:${PORT}/"
 LOCK_DIR="/tmp/google_ads_command_center_launcher.lock"
 
 cd "$APP_DIR"
+export APP_INSTANCE_ROLE="${APP_INSTANCE_ROLE:-developer}"
+export GOOGLE_ADS_ALLOW_MUTATIONS=false
+export GOOGLE_ADS_DRY_RUN=true
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   for _ in {1..10}; do
@@ -53,7 +56,7 @@ if ! screen_exists "$WEB_SESSION"; then
   fi
 fi
 
-if ! app_process_exists ".venv/bin/dramatiq app.tasks"; then
+if [ "$APP_INSTANCE_ROLE" = "primary" ] && ! app_process_exists ".venv/bin/dramatiq app.tasks"; then
   screen -dmS "$WORKER_SESSION" .venv/bin/dramatiq app.tasks --processes 1 --threads 1
 fi
 

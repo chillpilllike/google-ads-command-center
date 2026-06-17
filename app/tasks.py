@@ -40,6 +40,7 @@ from app.models import (
     StrategyRun,
     StrategyRunAccount,
 )
+from app.runtime_role import primary_instance_required_result
 from app.services.cost_dashboard_snapshot import refresh_standard_cost_dashboard_snapshots
 from app.services.google_ads_account_discovery import discover_accounts_for_connection
 from app.services.google_ads_api_errors import (
@@ -1521,6 +1522,17 @@ def run_google_ads_automation_monitor(
 ) -> None:
     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
         with SessionLocal() as session:
+            runtime_block = primary_instance_required_result()
+            if runtime_block is not None:
+                mark_job_started(session, job_id, total=0)
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.succeeded,
+                    current=0,
+                    error=str(runtime_block.get("message")),
+                )
+                return
             preferences = enabled_automation_preferences(session, account_ids=account_ids)
             if not mark_job_started(session, job_id, total=len(preferences)):
                 return

@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from app.config import ROOT_DIR, Settings
+from app.config import ROOT_DIR, Settings, get_settings
 from app.models import AppSetting, GoogleAdsConnection
 
 
@@ -807,7 +807,19 @@ def get_sync_setting_map(session: Session) -> dict[str, Any]:
     values = {row.key: row.value for row in rows}
     for definition in SETTING_DEFINITIONS:
         values.setdefault(definition.key, definition.default)
-    return values
+    return apply_runtime_safety_settings(values)
+
+
+def apply_runtime_safety_settings(values: dict[str, Any]) -> dict[str, Any]:
+    safe_values = dict(values)
+    runtime_settings = get_settings()
+    safe_values["runtime.app_instance_role"] = runtime_settings.app_instance_role
+    safe_values["runtime.is_primary_instance"] = runtime_settings.is_primary_instance
+    if not runtime_settings.live_google_ads_allowed:
+        safe_values["optimizer.allow_mutations"] = False
+        safe_values["optimizer.dry_run"] = True
+        safe_values["optimizer.allow_total_budget_increase"] = False
+    return safe_values
 
 
 def _connection_value(connection: Optional[GoogleAdsConnection], attr: str, fallback: Any) -> Any:
@@ -821,6 +833,7 @@ def optimizer_env_from_settings(
     values: dict[str, Any],
     connection: Optional[GoogleAdsConnection] = None,
 ) -> dict[str, str]:
+    values = apply_runtime_safety_settings(values)
     mapping = {
         "GOOGLE_ADS_DEVELOPER_TOKEN": _connection_value(
             connection,

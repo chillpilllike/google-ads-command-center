@@ -78,7 +78,7 @@ The repository includes a production Dockerfile that starts:
 - one Dramatiq worker for background jobs;
 - the automation scheduler loop that queues due monitor jobs.
 
-In Coolify, deploy the public GitHub repository with the included `Dockerfile` and set only runtime values as environment variables. Do not place Google/Odoo/OpenAI/OAuth credentials in the Dockerfile.
+In Coolify, deploy the public GitHub repository with the included `Dockerfile`. The Dockerfile contains the source-clone URL and a runtime `ENV` block; for public repos, keep real secrets in Coolify variables or use a private Dockerfile/repo for hardcoded production values.
 
 Required Coolify variables:
 
@@ -105,6 +105,28 @@ SCHEDULER_ENABLED=true
 AUTOMATION_SCHEDULER_INTERVAL_SECONDS=900
 AUTOMATION_SCHEDULER_RECOMPUTE_EVERY_RUNS=4
 ```
+
+Only the hosted server should be the live automation controller:
+
+```bash
+APP_INSTANCE_ROLE=primary
+DRAMATIQ_ENABLED=true
+SCHEDULER_ENABLED=true
+GOOGLE_ADS_ALLOW_MUTATIONS=true
+GOOGLE_ADS_DRY_RUN=false
+```
+
+Local development should stay read-only/dry-run:
+
+```bash
+APP_INSTANCE_ROLE=developer
+DRAMATIQ_ENABLED=false
+SCHEDULER_ENABLED=false
+GOOGLE_ADS_ALLOW_MUTATIONS=false
+GOOGLE_ADS_DRY_RUN=true
+```
+
+The app enforces this at runtime: non-primary instances force Google Ads mutations off and dry-run on, and they do not queue automation monitor jobs.
 
 If you split Coolify into separate services later, use the same image and set `DRAMATIQ_ENABLED=false` or `SCHEDULER_ENABLED=false` on the web-only service.
 

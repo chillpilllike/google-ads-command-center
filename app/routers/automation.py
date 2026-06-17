@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_session
 from app.dependencies import require_user, settings, templates
 from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
+from app.runtime_role import primary_instance_required_result, runtime_role_status
 from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
 from app.services.google_ads_automation import (
     automation_strategy_summary,
@@ -316,6 +317,8 @@ async def queue_automation_monitor(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(require_user),
 ) -> RedirectResponse:
+    if primary_instance_required_result() is not None:
+        raise HTTPException(status_code=403, detail="This app instance is not primary; live automation can only be queued from the primary server.")
     account = await session.get(GoogleAdsAccount, int(account_id))
     if account is None or not account.is_active:
         raise HTTPException(status_code=400, detail="Select an active Google Ads account.")
@@ -355,6 +358,9 @@ async def automation_scheduler_tick(
     force: int = 0,
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
+    runtime_block = primary_instance_required_result()
+    if runtime_block is not None:
+        return JSONResponse({"queued": False, "reason": "not_primary_instance", **runtime_role_status()})
     client_host = request.client.host if request.client else ""
     if client_host not in {"127.0.0.1", "::1", "localhost"}:
         raise HTTPException(status_code=403, detail="Automation scheduler tick is local-only.")

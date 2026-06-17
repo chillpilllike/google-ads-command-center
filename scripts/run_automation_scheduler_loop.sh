@@ -2,12 +2,21 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+APP_INSTANCE_ROLE="${APP_INSTANCE_ROLE:-developer}"
 INTERVAL_SECONDS="${AUTOMATION_SCHEDULER_INTERVAL_SECONDS:-900}"
 RECOMPUTE_EVERY_RUNS="${AUTOMATION_SCHEDULER_RECOMPUTE_EVERY_RUNS:-4}"
 LOG_FILE="${AUTOMATION_SCHEDULER_LOG:-${APP_DIR}/state/automation_scheduler.log}"
 
 cd "$APP_DIR"
 mkdir -p "$(dirname "$LOG_FILE")"
+
+case "$(printf '%s' "$APP_INSTANCE_ROLE" | tr '[:upper:]' '[:lower:]')" in
+  primary) ;;
+  *)
+    echo "Automation scheduler disabled because APP_INSTANCE_ROLE=${APP_INSTANCE_ROLE}; only primary may queue live automation." >>"$LOG_FILE"
+    exit 0
+    ;;
+esac
 
 run_count=0
 while true; do

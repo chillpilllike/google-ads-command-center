@@ -10,6 +10,15 @@ if [ -z "${DATABASE_URL:-}" ]; then
   exit 1
 fi
 
+APP_INSTANCE_ROLE="$(printf '%s' "${APP_INSTANCE_ROLE:-developer}" | tr '[:upper:]' '[:lower:]')"
+export APP_INSTANCE_ROLE
+if [ "$APP_INSTANCE_ROLE" != "primary" ]; then
+  export GOOGLE_ADS_ALLOW_MUTATIONS=false
+  export GOOGLE_ADS_DRY_RUN=true
+  export DRAMATIQ_ENABLED=false
+  export SCHEDULER_ENABLED=false
+fi
+
 mkdir -p state reports
 
 if [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "false" ] && [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "0" ]; then

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT_DIR))
 from sqlalchemy import select
 
 from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount
+from app.runtime_role import primary_instance_required_result
 from app.services.google_ads_automation import (
     budget_guard_due_now,
     enabled_automation_preferences,
@@ -36,6 +37,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    runtime_block = primary_instance_required_result()
+    if runtime_block is not None:
+        print(runtime_block["message"])
+        print(runtime_block)
+        return
     now = datetime.now(timezone.utc)
     with SessionLocal() as session:
         selected_ids = [int(item) for item in args.account_id if item]
