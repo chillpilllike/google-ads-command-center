@@ -2031,6 +2031,33 @@ def testing_daily_budget_from_sales(
     }
 
 
+def _has_existing_automation_production_lanes(session: Session, account: GoogleAdsAccount) -> bool:
+    """Treat already-created automation accounts as established even if daily metrics are still empty."""
+    rows = session.execute(
+        select(
+            GoogleAdsCampaignMetric.campaign_name,
+            GoogleAdsCampaignMetric.campaign_status,
+            GoogleAdsCampaignMetric.channel_type,
+        )
+        .where(
+            GoogleAdsCampaignMetric.account_id == account.id,
+            GoogleAdsCampaignMetric.campaign_name.ilike("AUTO |%"),
+        )
+        .order_by(GoogleAdsCampaignMetric.synced_at.desc())
+        .limit(50)
+    ).all()
+    enabled_names = [
+        str(name or "").lower()
+        for name, status, _channel in rows
+        if str(status or "").upper() == "ENABLED"
+    ]
+    if any("core / scale" in name or "fix / watch" in name or "waste / recovery" in name for name in enabled_names):
+        return True
+    pmax_count = sum(1 for name, _status, channel in rows if str(channel or "").upper() == "PERFORMANCE_MAX" and str(name or "").startswith("AUTO |"))
+    search_count = sum(1 for name, _status, channel in rows if str(channel or "").upper() == "SEARCH" and str(name or "").startswith("AUTO |"))
+    return pmax_count > 0 and search_count > 0
+
+
 def campaign_bootstrap_decision(
     session: Session,
     preference: GoogleAdsAutomationPreference,
@@ -2047,8 +2074,9 @@ def campaign_bootstrap_decision(
     age_days = (now.astimezone(timezone.utc) - started_at).days if started_at else None
     no_recent_impressions = int(metrics.get("impressions") or 0) <= 0
     enough_conversions = float(metrics.get("conversions") or 0) >= threshold
+    existing_automation_lanes = _has_existing_automation_production_lanes(session, account)
 
-    if no_recent_impressions and started_at is None:
+    if no_recent_impressions and not existing_automation_lanes and started_at is None:
         started_at = now.astimezone(timezone.utc)
         state = {
             **state,
@@ -2059,10 +2087,14 @@ def campaign_bootstrap_decision(
         age_days = 0
 
     in_bootstrap = started_at is not None and (age_days or 0) < bootstrap_days
-    if enough_conversions:
+    if enough_conversions or existing_automation_lanes:
         mode = "pmax_allowed"
         allowed_campaign_types = ["rsa", "dsa", "pmax"]
-        reason = "Last 7 days have enough purchase conversion signal for PMax."
+        reason = (
+            "Existing automation-owned production campaigns are already live, so the account is treated as established."
+            if existing_automation_lanes and not enough_conversions
+            else "Last 7 days have enough purchase conversion signal for PMax."
+        )
     elif no_recent_impressions or in_bootstrap:
         mode = "testing_no_pmax"
         allowed_campaign_types = ["rsa", "dsa"]
@@ -2087,6 +2119,7 @@ def campaign_bootstrap_decision(
         "pmax_allowed": "pmax" in allowed_campaign_types,
         "no_recent_impressions": no_recent_impressions,
         "enough_7d_conversions": enough_conversions,
+        "existing_automation_lanes": existing_automation_lanes,
         "pmax_min_7d_conversions": threshold,
         "bootstrap_days": bootstrap_days,
         "bootstrap_started_at": started_at.isoformat() if started_at else None,
