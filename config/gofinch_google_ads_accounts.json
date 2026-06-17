@@ -1,0 +1,236 @@
+{
+  "manager_groups": [
+    {
+      "manager": {
+        "name": "gofinch",
+        "customer_id": "161-070-3615"
+      },
+      "sub_accounts": [
+        {
+          "name": "Nutricity Austria",
+          "customer_id": "264-019-8743"
+        },
+        {
+          "name": "NutriCity Czech Republic",
+          "customer_id": "915-308-3949"
+        },
+        {
+          "name": "NutriCity Denmark",
+          "customer_id": "510-797-1093"
+        },
+        {
+          "name": "NutriCity Finland",
+          "customer_id": "636-309-8182"
+        },
+        {
+          "name": "Nutricity France",
+          "customer_id": "467-860-1329"
+        },
+        {
+          "name": "NutriCity Lithuania",
+          "customer_id": "462-140-7235"
+        },
+        {
+          "name": "NutriCity NZ (co.nz)",
+          "customer_id": "359-962-1343"
+        },
+        {
+          "name": "Nutricity Spain",
+          "customer_id": "300-277-5588"
+        },
+        {
+          "name": "Nutrihub CA",
+          "customer_id": "483-890-3197"
+        },
+        {
+          "name": "Prime Supps - INR Account",
+          "customer_id": "351-357-2068"
+        },
+        {
+          "name": "SuppCity INR Account",
+          "customer_id": "207-351-3329"
+        },
+        {
+          "name": "Vitagen Australia",
+          "customer_id": "492-481-8196"
+        }
+      ]
+    },
+    {
+      "manager": {
+        "name": "Gofinch-New-Manager-Account",
+        "customer_id": "361-254-1464"
+      },
+      "sub_accounts": [
+        {
+          "name": "Nutricity Brazil",
+          "customer_id": "560-925-3788"
+        },
+        {
+          "name": "Nutricity Chile",
+          "customer_id": "526-843-0892"
+        },
+        {
+          "name": "Nutricity China",
+          "customer_id": "221-584-4896"
+        },
+        {
+          "name": "Nutricity Cyprus",
+          "customer_id": "440-538-0825"
+        },
+        {
+          "name": "Nutricity Estonia",
+          "customer_id": "498-908-0417"
+        },
+        {
+          "name": "Nutricity Germany",
+          "customer_id": "354-651-9270"
+        },
+        {
+          "name": "Nutricity Greece",
+          "customer_id": "410-253-4425"
+        },
+        {
+          "name": "Nutricity Indonesia",
+          "customer_id": "519-933-0448"
+        },
+        {
+          "name": "Nutricity Israel",
+          "customer_id": "984-523-6431"
+        },
+        {
+          "name": "Nutricity Italy",
+          "customer_id": "680-196-9372"
+        },
+        {
+          "name": "Nutricity Japan",
+          "customer_id": "283-074-8821"
+        },
+        {
+          "name": "Nutricity Latvia",
+          "customer_id": "819-791-2209"
+        },
+        {
+          "name": "Nutricity Malaysia",
+          "customer_id": "724-814-6142"
+        },
+        {
+          "name": "Nutricity Mexico",
+          "customer_id": "494-612-9541"
+        },
+        {
+          "name": "Nutricity Netherlands",
+          "customer_id": "723-792-8790"
+        },
+        {
+          "name": "Nutricity Norway",
+          "customer_id": "247-139-8707"
+        },
+        {
+          "name": "Nutricity Singapore",
+          "customer_id": "616-912-4564"
+        },
+        {
+          "name": "Nutricity South Africa",
+          "customer_id": "209-019-9131"
+        },
+        {
+          "name": "Nutricity Sweden",
+          "customer_id": "443-080-6933"
+        },
+        {
+          "name": "Nutricity Taiwan",
+          "customer_id": "933-780-4745"
+        },
+        {
+          "name": "Nutricity Turkey",
+          "customer_id": "724-243-7894"
+        },
+        {
+          "name": "Nutricity Uruguay",
+          "customer_id": "865-869-0594"
+        }
+      ]
+    },
+    {
+      "manager": {
+        "name": "Gofinch-other manager account",
+        "customer_id": "551-437-6378"
+      },
+      "sub_accounts": [
+        {
+          "name": "Nutricity Argentina",
+          "customer_id": "216-343-1327"
+        },
+        {
+          "name": "Nutricity AU",
+          "customer_id": "484-711-5629"
+        },
+        {
+          "name": "Nutricity Laos",
+          "customer_id": "405-815-6472"
+        },
+        {
+          "name": "Nutricity Luxembourg",
+          "customer_id": "150-314-0398"
+        },
+        {
+          "name": "Nutricity New Zealand(.nz)",
+          "customer_id": "601-307-9244"
+        },
+        {
+          "name": "Nutricity Poland",
+          "customer_id": "416-248-8043"
+        },
+        {
+          "name": "Nutricity Romania",
+          "customer_id": "865-607-0999"
+        },
+        {
+          "name": "Nutricity Slovenia",
+          "customer_id": "193-416-9882"
+        },
+        {
+          "name": "Nutricity South Korea",
+          "customer_id": "746-839-8829"
+        },
+        {
+          "name": "Nutricity Switzerland",
+          "customer_id": "143-467-1688"
+        },
+        {
+          "name": "Nutricity USA",
+          "customer_id": "256-545-2394"
+        }
+      ]
+    },
+    {
+      "manager": {
+        "name": "Manager Account",
+        "customer_id": "405-659-8313"
+      },
+      "sub_accounts": [
+        {
+          "name": "Nutricity CA",
+          "customer_id": "349-546-3031"
+        },
+        {
+          "name": "BoostGo - AUD Account",
+          "customer_id": "985-690-5758"
+        },
+        {
+          "name": "Espot - AUD Account",
+          "customer_id": "168-532-5188"
+        },
+        {
+          "name": "NutriCity - AUD Account",
+          "customer_id": "897-616-2539"
+        },
+        {
+          "name": "NutriCity - UK Account",
+          "customer_id": "582-036-5427"
+        }
+      ]
+    }
+  ]
+}
