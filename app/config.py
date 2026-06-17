@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     app_name: str = "Google Ads Command Center"
     app_env: str = "local"
     app_instance_role: str = "developer"
+    session_cookie_secure: bool = False
     secret_key: str = Field(default="")
     database_url: Optional[PostgresDsn] = Field(default=None)
     postgres_url: Optional[PostgresDsn] = Field(default=None)

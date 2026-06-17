@@ -20,6 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_ENV=production \
     APP_INSTANCE_ROLE=primary \
+    SESSION_COOKIE_SECURE=false \
     PORT=8000 \
     WEB_CONCURRENCY=1 \
     DATABASE_URL=change-this-in-private-dockerfile-or-coolify \
