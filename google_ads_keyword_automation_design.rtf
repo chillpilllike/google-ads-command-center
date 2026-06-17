@@ -1,0 +1,51 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Arial;}}
+\f0\fs24
+\b Google Ads Keyword Automation Tool - Design Documentation\b0\par
+\par
+\b Document scope\b0\par
+This document describes the keyword automation portion of the internal Google Ads management tool. Campaign creation, ad copy generation, asset generation, and landing page automation are separate modules and are not covered in this document.\par
+\par
+\b Tool purpose\b0\par
+The keyword module helps the advertiser discover, review, export, and optionally apply keyword and negative keyword recommendations for owned Google Ads accounts. The goal is to reduce manual review time while keeping operator control, deduplication, and policy safeguards in place.\par
+\par
+\b Primary users\b0\par
+The tool is used by internal account operators who manage the advertiser's own Google Ads accounts. It is not a public self-service SaaS tool and is not used to manage unrelated third-party advertisers.\par
+\par
+\b Google Ads data used\b0\par
+The keyword module reads keyword-related performance data from Google Ads, including search term data, search term insight data, campaign/ad group context, clicks, impressions, cost, conversions, conversion value, and related performance metrics. The tool stores retrieved snapshots in PostgreSQL so repeated UI review and exports do not repeatedly call the Google Ads API.\par
+\par
+\b Other data used\b0\par
+The module can combine Google Ads keyword signals with first-party business data such as GA4 ecommerce/search data and ecommerce order/category context. This is used only to score relevance and prioritize terms. The Google Ads API remains the source of Google Ads performance metrics.\par
+\par
+\b Keyword candidate workflow\b0\par
+1. The system collects recent and all-time search-term snapshots for enabled accounts.\par
+2. Terms are cleaned, normalized, and deduplicated per Google Ads account.\par
+3. Candidate rows are stored in PostgreSQL with source dataset keys, source snapshot identifiers, metrics, quality labels, scores, review status, first seen time, and last seen time.\par
+4. Operators can review candidates in the web interface, filter them, copy them, or export them as CSV.\par
+5. If auto-apply is enabled for an account, only reviewed and eligible keyword candidates are considered for mutation. Otherwise, recommendations remain review-only.\par
+\par
+\b Negative keyword workflow\b0\par
+The tool also identifies negative keyword candidates from low-quality or wasteful search terms. It avoids terms that have conversion history or positive keyword evidence. Policy-related disapproval terms can be stored separately when the issue is a blocking disapproval such as unapproved substances. Limited-but-eligible policy cases are not automatically treated as negative keywords.\par
+\par
+\b Deduplication and governance\b0\par
+Each candidate is normalized before storage. Positive keyword candidates are unique by account and normalized keyword. Negative keyword candidates are unique by account, scope, campaign, ad group, normalized keyword, and match type. Review status is stored so rejected terms are not reused by later automation runs.\par
+\par
+\b API operations\b0\par
+The keyword module primarily uses read operations through GoogleAdsService queries to retrieve search terms and search term insights. Mutation operations are only used when an account is explicitly configured for live keyword or negative keyword application. The system records job results and Google Ads API errors so operators can audit what happened.\par
+\par
+\b Quota controls\b0\par
+The system uses saved PostgreSQL snapshots before requesting fresh Google Ads data. Automation jobs have per-account row limits and daily API budgets. If the Google Ads API reports quota exhaustion, the retry time is stored and later automation jobs stop before making additional Google Ads calls until the retry window has passed.\par
+\par
+\b Safety controls\b0\par
+The module is designed to keep account operators in control. Automation can be configured as monitor-only or live-enabled per account. Live mutation is gated by account settings, review status, deduplication, policy checks, and stored job state. Errors are stored in the application database for review instead of being hidden.\par
+\par
+\b Data storage\b0\par
+The application stores keyword snapshots, keyword candidates, negative keyword candidates, review state, source metadata, and job results in PostgreSQL. This supports auditability, deduplication, retries, and reduced API usage.\par
+\par
+\b Access and authentication\b0\par
+Google Ads access is performed through authorized Google Ads API credentials for the advertiser's managed accounts. The web application is used internally by authorized operators. API credentials are stored outside the document workflow and are not included in exports.\par
+\par
+\b Summary\b0\par
+This keyword automation module is intended to make keyword review and optimization more efficient while limiting unnecessary Google Ads API usage. It relies on saved snapshots, deduplication, review controls, quota guards, and operator-visible job records.\par
+}

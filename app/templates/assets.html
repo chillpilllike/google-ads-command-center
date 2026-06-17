@@ -1,0 +1,283 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Account assets</div>
+    <h2 class="page-title">Assets</h2>
+  </div>
+  {% if selected_account %}
+  <div class="col-auto ms-auto">
+    <form method="post" action="/assets/generate">
+      <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+      <input type="hidden" name="include_sitelinks" value="on">
+      <input type="hidden" name="include_structured_snippets" value="on">
+      <input type="hidden" name="include_pmax_search_themes" value="on">
+      <input type="hidden" name="include_promotions" value="on">
+      <button class="btn btn-primary" type="submit">
+        <i class="ti ti-sparkles me-2"></i>
+        Generate assets
+      </button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Asset automation settings saved.</div>
+{% endif %}
+{% if generated_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Asset generation queued as job #{{ generated_job_id }}. The generation step uses saved Odoo, GA4, Google Ads, and automation data to update the mapped asset registry.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ generated_job_id }}">View job</a>
+</div>
+{% endif %}
+{% if generated_error %}
+<div class="alert alert-danger" role="alert">Asset generation could not be queued. Check the worker and background jobs page.</div>
+{% endif %}
+
+{% if not accounts %}
+<div class="alert alert-warning" role="alert">No active Google Ads accounts are saved yet.</div>
+{% else %}
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Account</h3>
+      </div>
+      <div class="card-body">
+        <form method="get" action="/assets">
+          <label class="form-label" for="asset-account-id">Google Ads account</label>
+          <select class="form-select" id="asset-account-id" name="account_id" onchange="this.form.submit()">
+            {% for account in accounts %}
+            <option value="{{ account.id }}" {% if selected_account and account.id == selected_account.id %}selected{% endif %}>
+              {{ account.name }} · {{ account.customer_id }}
+            </option>
+            {% endfor %}
+          </select>
+        </form>
+        {% if selected_account %}
+        <div class="datagrid mt-3">
+          <div class="datagrid-item">
+            <div class="datagrid-title">Customer ID</div>
+            <div class="datagrid-content">{{ selected_account.customer_id }}</div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">Currency</div>
+            <div class="datagrid-content">{{ selected_account.currency_code or "UNKNOWN" }}</div>
+          </div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if selected_account and preference %}
+    <form class="card mt-3" method="post" action="/assets/preferences">
+      <div class="card-header">
+        <h3 class="card-title">Automation</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+        <label class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" name="auto_discount_promotions_enabled" {% if preference.auto_discount_promotions_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto discount promotions</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_coupon_promotions_enabled" {% if preference.auto_coupon_promotions_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto coupon promotions</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_sitelinks_enabled" {% if preference.auto_sitelinks_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto sitelinks</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_structured_snippets_enabled" {% if preference.auto_structured_snippets_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto structured snippets</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_pmax_search_themes_enabled" {% if preference.auto_pmax_search_themes_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto PMax search themes</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_callouts_enabled" {% if preference.auto_callouts_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto callouts</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_price_assets_enabled" {% if preference.auto_price_assets_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto price assets</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_business_messages_enabled" {% if preference.auto_business_messages_enabled %}checked{% endif %}>
+          <span class="form-check-label">Auto WhatsApp message asset</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_campaign_asset_mapping_enabled" {% if preference.auto_campaign_asset_mapping_enabled %}checked{% endif %}>
+          <span class="form-check-label">Campaign-level mappings</span>
+        </label>
+        <label class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" name="auto_ad_group_asset_mapping_enabled" {% if preference.auto_ad_group_asset_mapping_enabled %}checked{% endif %}>
+          <span class="form-check-label">Ad group-level mappings</span>
+        </label>
+        <div class="hr-text">WhatsApp</div>
+        <div class="row g-2">
+          <div class="col-4">
+            <label class="form-label" for="whatsapp-country-code">Code</label>
+            <input class="form-control" id="whatsapp-country-code" name="whatsapp_country_code" maxlength="8" value="{{ preference.whatsapp_country_code or '+1' }}">
+          </div>
+          <div class="col-8">
+            <label class="form-label" for="whatsapp-phone">Phone</label>
+            <input class="form-control" id="whatsapp-phone" name="whatsapp_phone_number" maxlength="40" value="{{ preference.whatsapp_phone_number or '+14434007587' }}" placeholder="+14434007587">
+          </div>
+        </div>
+        <label class="form-label mt-2" for="whatsapp-starter">Starter message</label>
+        <input class="form-control" id="whatsapp-starter" name="whatsapp_starter_message" maxlength="140" value="{{ preference.whatsapp_starter_message or 'Can I get help choosing a product?' }}">
+        <label class="form-label mt-2" for="whatsapp-cta-desc">CTA description</label>
+        <input class="form-control" id="whatsapp-cta-desc" name="whatsapp_call_to_action_description" maxlength="30" value="{{ preference.whatsapp_call_to_action_description or 'Chat with us' }}">
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-outline-primary w-100" type="submit">
+          <i class="ti ti-device-floppy me-2"></i>
+          Save automation
+        </button>
+      </div>
+    </form>
+
+    <form class="card mt-3" method="post" action="/assets/generate">
+      <div class="card-header">
+        <h3 class="card-title">Generate</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+        <label class="form-check">
+          <input class="form-check-input" type="checkbox" name="include_sitelinks" {% if preference.auto_sitelinks_enabled %}checked{% endif %}>
+          <span class="form-check-label">Sitelinks from product URLs</span>
+        </label>
+        <label class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="include_structured_snippets" {% if preference.auto_structured_snippets_enabled %}checked{% endif %}>
+          <span class="form-check-label">Structured snippets from products</span>
+        </label>
+        <label class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="include_pmax_search_themes" {% if preference.auto_pmax_search_themes_enabled %}checked{% endif %}>
+          <span class="form-check-label">PMax search themes</span>
+        </label>
+        <label class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="include_promotions" {% if preference.auto_discount_promotions_enabled or preference.auto_coupon_promotions_enabled %}checked{% endif %}>
+          <span class="form-check-label">Discounts and coupons</span>
+        </label>
+        <div class="form-hint mt-3">Generation updates mapped assets and marks removed Odoo sources for Google removal on the next publish sync.</div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit">
+          <i class="ti ti-sparkles me-2"></i>
+          Generate selected assets
+        </button>
+      </div>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="col-lg-8">
+    <div class="row row-cards mb-3">
+      {% for key, label in asset_type_labels.items() %}
+      <div class="col-sm-6 col-xl-3">
+        <div class="card">
+          <div class="card-body">
+            <div class="subheader">{{ label }}</div>
+            <div class="h1 mb-0">{{ asset_counts.get(key, 0) }}</div>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Created assets</h3>
+        {% if selected_account %}
+        <div class="card-actions text-secondary small">{{ selected_account.name }}</div>
+        {% endif %}
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Asset</th>
+              <th>Status</th>
+              <th>Source</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for asset in generated_assets %}
+            {% set payload = asset.payload_json or {} %}
+            <tr>
+              <td><span class="badge bg-blue-lt">{{ asset_type_labels.get(asset.asset_type, asset.asset_type) }}</span></td>
+              <td class="asset-preview">
+                <div class="fw-semibold">{{ asset.name }}</div>
+                <div class="text-secondary small">
+                  {% if asset.asset_type == "sitelink" %}
+                  {{ payload.link_text }} · {{ payload.final_url }}
+                  {% if payload.description1 or payload.description2 %}<br>{{ payload.description1 }}{% if payload.description2 %} · {{ payload.description2 }}{% endif %}{% endif %}
+                  {% elif asset.asset_type == "structured_snippet" %}
+                  {{ payload.header }}: {{ payload.values|join(", ") if payload.values else "" }}
+                  {% elif asset.asset_type == "promotion" %}
+                  {{ payload.promotion_target }}{% if payload.code %} · Code {{ payload.code }}{% endif %}
+                  {% if payload.minimum_amount_display %}<br>{{ payload.minimum_amount_display }}{% endif %}
+                  {% if payload.start_date or payload.end_date %}<br>{{ payload.start_date }}{% if payload.end_date %} to {{ payload.end_date }}{% endif %}{% endif %}
+                  {% elif asset.asset_type == "callout" %}
+                  {{ payload.callout_text }}
+                  {% elif asset.asset_type == "price" %}
+                  {{ payload.currency_code }} · {{ payload.price_offerings|length if payload.price_offerings else 0 }} rows
+                  {% elif asset.asset_type == "business_message" %}
+                  {{ payload.provider }} · {{ payload.phone_number }}
+                  {% elif asset.asset_type in ["headline", "description"] %}
+                  {{ payload.text }}
+                  {% elif asset.asset_type == "pmax_search_theme" %}
+                  {{ payload.search_theme }}
+                  {% else %}
+                  {{ payload }}
+                  {% endif %}
+                </div>
+                {% if asset.google_resource_name %}
+                <div class="text-secondary small">{{ asset.google_resource_name }}</div>
+                {% endif %}
+                {% if asset.last_error %}
+                <div class="text-danger small">{{ asset.last_error|truncate(140, True, "...") }}</div>
+                {% endif %}
+              </td>
+              <td>
+                {% if asset.status in ["draft", "validated"] %}
+                <span class="badge bg-blue-lt">{{ asset.status }}</span>
+                {% elif asset.status in ["published", "enabled"] %}
+                <span class="badge bg-green-lt">{{ asset.status }}</span>
+                {% elif asset.status in ["needs_review", "blocked"] %}
+                <span class="badge bg-yellow-lt">{{ asset.status|replace("_", " ") }}</span>
+                {% elif asset.status == "failed" %}
+                <span class="badge bg-red-lt">failed</span>
+                {% else %}
+                <span class="badge bg-secondary-lt">{{ asset.status }}</span>
+                {% endif %}
+              </td>
+              <td>
+                <div>{{ asset.source_type }}</div>
+                <div class="text-secondary small">{{ asset.source_key }}</div>
+              </td>
+              <td class="text-secondary">{{ asset.updated_at.strftime("%Y-%m-%d %H:%M") if asset.updated_at else "" }}</td>
+              <td class="text-end">
+                <a class="btn btn-sm btn-outline-secondary" href="/assets/generated/{{ asset.id }}.json">JSON</a>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No generated assets for this account yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

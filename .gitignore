@@ -1,0 +1,11 @@
+.env
+.env.gofinch
+config/google_ads_accounts.json
+config/gofinch_google_ads_accounts.json
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.launcher-build/
+reports/
+state/

@@ -1,0 +1,41 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Page feed safety</div>
+    <h2 class="page-title">Restricted Words</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <button class="btn btn-primary" type="submit" form="restricted-words-form">
+      <i class="ti ti-device-floppy me-2"></i>
+      Save list
+    </button>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Restricted words were saved to Postgres. New page-feed CSV exports will exclude matching product titles.</div>
+{% endif %}
+
+<form class="card" id="restricted-words-form" method="post" action="/restricted-words">
+  <div class="card-header">
+    <h3 class="card-title">Product title blocklist</h3>
+    <div class="card-actions text-secondary small">{{ term_count }} normalized terms</div>
+  </div>
+  <div class="card-body">
+    <label class="form-label" for="restricted-terms">Restricted terms</label>
+    <textarea class="form-control font-monospace" id="restricted-terms" name="terms" rows="28" spellcheck="false">{{ terms }}</textarea>
+    <div class="form-hint">
+      Add one term or phrase per line. Matching is case-insensitive and ignores punctuation/accent differences. Products with matching Odoo titles are excluded from hosted CSV page feeds and API page-feed publish paths.
+    </div>
+  </div>
+  <div class="card-footer d-flex justify-content-end">
+    <button class="btn btn-primary" type="submit">
+      <i class="ti ti-device-floppy me-2"></i>
+      Save list
+    </button>
+  </div>
+</form>
+{% endblock %}

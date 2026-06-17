@@ -1,0 +1,94 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Worker control</div>
+    <h2 class="page-title">Background Jobs</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/jobs"><i class="ti ti-refresh me-2"></i>Refresh</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if killed %}
+<div class="alert alert-warning" role="alert">Kill requested. Queued jobs are canceled immediately; running jobs stop after the current account/API unit finishes.</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header">
+    <h3 class="card-title">Recent background jobs</h3>
+    <div class="card-actions text-secondary small">Auto-refreshes while work is active.</div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Job</th>
+          <th>Status</th>
+          <th>Progress</th>
+          <th>Created</th>
+          <th>Started</th>
+          <th>Finished</th>
+          <th>Worker message</th>
+          <th class="w-1"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        {% set status_value = job.status.value %}
+        {% set tone = "secondary" %}
+        {% if status_value == "running" %}{% set tone = "blue" %}{% endif %}
+        {% if status_value == "succeeded" %}{% set tone = "green" %}{% endif %}
+        {% if status_value == "failed" %}{% set tone = "red" %}{% endif %}
+        {% if status_value in ["cancel_requested", "canceled"] %}{% set tone = "yellow" %}{% endif %}
+        {% set percent = ((job.progress_current * 100 / job.progress_total)|round(0, "floor")) if job.progress_total else 0 %}
+        <tr id="job-{{ job.id }}">
+          <td class="text-secondary">#{{ job.id }}</td>
+          <td>
+            <div class="fw-semibold">{{ job.label }}</div>
+            <div class="text-secondary small">{{ job.job_type }}</div>
+            {% if job.error %}
+            <div class="text-danger small mt-1">{{ job.error }}</div>
+            {% endif %}
+          </td>
+          <td><span class="badge bg-{{ tone }}-lt">{{ status_value.replace("_", " ") }}</span></td>
+          <td style="min-width: 180px">
+            <div class="d-flex align-items-center gap-2">
+              <div class="progress progress-sm flex-fill">
+                <div class="progress-bar bg-primary" style="width: {{ percent }}%"></div>
+              </div>
+              <div class="text-secondary small text-nowrap">{{ job.progress_current }}/{{ job.progress_total }}</div>
+            </div>
+          </td>
+          <td class="text-secondary">{{ job.created_at.strftime("%Y-%m-%d %H:%M:%S") if job.created_at else "" }}</td>
+          <td class="text-secondary">{{ job.started_at.strftime("%Y-%m-%d %H:%M:%S") if job.started_at else "" }}</td>
+          <td class="text-secondary">{{ job.finished_at.strftime("%Y-%m-%d %H:%M:%S") if job.finished_at else "" }}</td>
+          <td class="text-secondary small">{{ job.message_id[:8] if job.message_id else "not dispatched" }}</td>
+          <td>
+            {% if status_value in ["queued", "running", "cancel_requested"] %}
+            <form method="post" action="/jobs/{{ job.id }}/kill">
+              <button class="btn btn-sm btn-outline-danger" type="submit">
+                <i class="ti ti-hand-stop me-1"></i>
+                Kill
+              </button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-secondary">No background jobs have been queued yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% if has_active_jobs %}
+<script>
+  window.setTimeout(() => window.location.reload(), 8000);
+</script>
+{% endif %}
+{% endblock %}

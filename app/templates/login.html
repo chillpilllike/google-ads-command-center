@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="page page-center">
+  <div class="container-tight py-4">
+    <form class="card card-md" method="post" action="/login" autocomplete="on">
+      <div class="card-body">
+        <h1 class="h2 text-center mb-4">{{ app_name }}</h1>
+        {% if error %}
+        <div class="alert alert-danger" role="alert">{{ error }}</div>
+        {% endif %}
+        <div class="mb-3">
+          <label class="form-label" for="email">Username</label>
+          <input class="form-control" id="email" type="text" name="email" required autofocus>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="password">Password</label>
+          <input class="form-control" id="password" type="password" name="password" required>
+        </div>
+        <button class="btn btn-primary w-100" type="submit">Sign in</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

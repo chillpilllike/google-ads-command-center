@@ -1,0 +1,359 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Automation review queue</div>
+    <h2 class="page-title">Negative Keyword Bank</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/automation"><i class="ti ti-robot me-2"></i>Automation</a>
+    <a class="btn btn-outline-primary" href="/jobs"><i class="ti ti-list-check me-2"></i>Jobs</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if sync_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Negative keyword refresh queued as job #{{ sync_job_id }}.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ sync_job_id }}">View jobs</a>
+</div>
+{% endif %}
+
+<div class="row row-cards">
+  <div class="col-lg-3">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Accounts</h3>
+      </div>
+      <div class="list-group list-group-flush keyword-account-list">
+        {% for item in account_summaries %}
+        {% set account = item.account %}
+        <a class="list-group-item list-group-item-action {% if selected_account and selected_account.id == account.id %}active{% endif %}" href="{{ item.url }}">
+          <div class="d-flex w-100 justify-content-between gap-2">
+            <span class="fw-semibold text-truncate">{{ account.name }}</span>
+            <span class="badge bg-secondary-lt">{{ item.negative_count }}</span>
+          </div>
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">{{ account.customer_id }} - {{ account.currency_code or "UNKNOWN" }}</div>
+          {% if item.last_pulled_at %}
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">Last pulled {{ item.last_pulled_at.strftime("%Y-%m-%d %H:%M") }}</div>
+          {% endif %}
+          {% if item.last_seen_at %}
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">Last seen {{ item.last_seen_at.strftime("%Y-%m-%d %H:%M") }}</div>
+          {% endif %}
+        </a>
+        {% else %}
+        <div class="list-group-item text-secondary">No active Google Ads accounts.</div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <form class="card mt-3" method="post" action="/negative-keywords/sync">
+      <div class="card-header">
+        <h3 class="card-title">Manual refresh</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" name="account_id" value="{{ selected_account.id if selected_account else 0 }}">
+        <div class="mb-3">
+          <label class="form-label" for="sync_scope">Scope</label>
+          <select class="form-select" id="sync_scope" name="sync_scope">
+            <option value="selected">Checked accounts</option>
+            <option value="all">All active accounts</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
+            <label class="form-label mb-0">Accounts</label>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="negative-select-all-accounts">Select all</button>
+          </div>
+          <div class="keyword-manual-account-list border rounded">
+            {% for item in account_summaries %}
+            {% set account = item.account %}
+            <label class="form-check keyword-manual-account-option">
+              <input
+                class="form-check-input negative-account-checkbox"
+                type="checkbox"
+                name="account_ids"
+                value="{{ account.id }}"
+                {% if selected_account and account.id == selected_account.id %}checked{% endif %}
+              >
+              <span class="form-check-label">
+                <span class="d-block fw-semibold">{{ account.name }}</span>
+                <span class="text-secondary small">{{ account.customer_id }} - {{ item.negative_count }} saved</span>
+              </span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit" {% if not selected_account %}disabled{% endif %}>
+          <i class="ti ti-shield-search me-2"></i>
+          Refresh negative bank
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-9">
+    <div class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">
+            {% if selected_account %}{{ selected_account.name }}{% else %}Negative candidates{% endif %}
+          </h3>
+          {% if selected_account %}
+          <div class="text-secondary small">
+            {{ selected_account.customer_id }} - {{ total }} saved candidate{{ "" if total == 1 else "s" }}
+            {% if selected_account_summary and selected_account_summary.last_pulled_at %}
+            - Last pulled {{ selected_account_summary.last_pulled_at.strftime("%Y-%m-%d %H:%M:%S") }}
+            {% endif %}
+          </div>
+          {% endif %}
+        </div>
+        <div class="card-actions">
+          <form class="d-flex flex-wrap gap-2 align-items-end" method="get" action="/negative-keywords">
+            <input type="hidden" name="account_id" value="{{ selected_account.id if selected_account else 0 }}">
+            <div>
+              <label class="form-label" for="negative-q">Search</label>
+              <input class="form-control form-control-sm keyword-search-input" id="negative-q" name="q" value="{{ q }}" type="search">
+            </div>
+            <div>
+              <label class="form-label" for="reason">Reason</label>
+              <select class="form-select form-select-sm" id="reason" name="reason">
+                <option value="">All</option>
+                {% for key, label in reason_labels.items() %}
+                <option value="{{ key }}" {% if selected_reason == key %}selected{% endif %}>{{ label }} ({{ reason_counts.get(key, 0) }})</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label class="form-label" for="review-status">Status</label>
+              <select class="form-select form-select-sm" id="review-status" name="review_status">
+                <option value="">All</option>
+                {% for key, label in status_labels.items() %}
+                <option value="{{ key }}" {% if selected_status == key %}selected{% endif %}>{{ label }} ({{ status_counts.get(key, 0) }})</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label class="form-label" for="per-page">Page</label>
+              <select class="form-select form-select-sm" id="per-page" name="per_page">
+                {% for size in [50, 100, 250, 500] %}
+                <option value="{{ size }}" {% if per_page == size %}selected{% endif %}>{{ size }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <button class="btn btn-sm btn-outline-primary" type="submit"><i class="ti ti-filter me-1"></i>Apply</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="card-body border-bottom">
+        <div class="d-flex flex-wrap align-items-end gap-2">
+          <button class="btn btn-sm btn-primary" type="button" data-copy-kind="selected">
+            <i class="ti ti-copy me-1"></i>
+            Copy selected
+          </button>
+          <button class="btn btn-sm btn-outline-primary" type="button" data-copy-kind="page">
+            <i class="ti ti-copy me-1"></i>
+            Copy page
+          </button>
+          <button class="btn btn-sm btn-outline-primary" type="button" data-copy-kind="all">
+            <i class="ti ti-copy me-1"></i>
+            Copy filtered
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" type="button" data-export-kind="selected">
+            <i class="ti ti-file-download me-1"></i>
+            Export selected
+          </button>
+          <a class="btn btn-sm btn-outline-secondary {% if not selected_account %}disabled{% endif %}" href="{{ export_filtered_url if selected_account else '#' }}" {% if not selected_account %}aria-disabled="true" tabindex="-1"{% endif %}>
+            <i class="ti ti-file-spreadsheet me-1"></i>
+            Export filtered CSV
+          </a>
+          <div class="text-secondary small" id="negative-copy-status">
+            {% if copy_truncated %}Filtered copy is capped at {{ copy_limit }} terms.{% endif %}
+          </div>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table keyword-table">
+          <thead>
+            <tr>
+              <th class="w-1">
+                <input class="form-check-input" type="checkbox" id="select-negative-keyword">
+              </th>
+              <th>Negative keyword</th>
+              <th>Reason</th>
+              <th class="text-end">Confidence</th>
+              <th class="text-end">Clicks</th>
+              <th class="text-end">Cost</th>
+              <th class="text-end">Impr.</th>
+              <th>Campaign</th>
+              <th>Status</th>
+              <th>Last pulled</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in page_rows %}
+            {% set match_text = "[" ~ row.keyword ~ "]" if row.match_type == "exact" else ('"' ~ row.keyword ~ '"' if row.match_type == "phrase" else row.keyword) %}
+            <tr>
+              <td>
+                <input class="form-check-input negative-row-check" type="checkbox" value="{{ match_text }}" data-negative-id="{{ row.id }}" data-term="{{ match_text }}">
+              </td>
+              <td>
+                <div class="fw-semibold text-break">{{ match_text }}</div>
+                <div class="text-secondary small">{{ row.match_type|title }} - Score {{ "{:,.0f}".format(row.score or 0) }}</div>
+              </td>
+              <td>
+                <span class="badge bg-orange-lt">{{ reason_labels.get(row.reason_label, row.reason_label) }}</span>
+                {% if row.guard_reasons %}
+                <div class="text-secondary small">{{ row.guard_reasons|join(", ") }}</div>
+                {% endif %}
+              </td>
+              <td class="text-end">{{ "{:.0%}".format(row.confidence or 0) }}</td>
+              <td class="text-end">{{ "{:,.0f}".format(row.clicks or 0) }}</td>
+              <td class="text-end">{{ "{:,.2f}".format(row.cost or 0) }}</td>
+              <td class="text-end">{{ "{:,.0f}".format(row.impressions or 0) }}</td>
+              <td class="keyword-source-cell">
+                <div>{{ row.campaign_name or "Account-level review" }}</div>
+                {% if row.campaign_id %}
+                <div class="text-secondary small">{{ row.campaign_id }}</div>
+                {% endif %}
+              </td>
+              <td>
+                <span class="badge bg-blue-lt">{{ status_labels.get(row.review_status, row.review_status) }}</span>
+                <div class="text-secondary small">{{ row.guard_status }}</div>
+              </td>
+              <td class="text-secondary">{{ row.last_pulled_at.strftime("%Y-%m-%d %H:%M") if row.last_pulled_at else "" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="10" class="text-secondary">No negative keyword candidates for this account yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card-footer d-flex align-items-center justify-content-between gap-2">
+        {% set total_start = ((page - 1) * per_page) + 1 if total else 0 %}
+        {% set total_end = [page * per_page, total]|min if total else 0 %}
+        <div class="text-secondary small">Showing {{ total_start }}-{{ total_end }} of {{ total }}</div>
+        <ul class="pagination m-0">
+          <li class="page-item {% if not prev_url %}disabled{% endif %}">
+            <a class="page-link" href="{{ first_url }}" aria-label="First"><i class="ti ti-chevrons-left"></i></a>
+          </li>
+          <li class="page-item {% if not prev_url %}disabled{% endif %}">
+            <a class="page-link" href="{{ prev_url or '#' }}" aria-label="Previous"><i class="ti ti-chevron-left"></i></a>
+          </li>
+          <li class="page-item disabled"><span class="page-link">{{ page }} / {{ total_pages }}</span></li>
+          <li class="page-item {% if not next_url %}disabled{% endif %}">
+            <a class="page-link" href="{{ next_url or '#' }}" aria-label="Next"><i class="ti ti-chevron-right"></i></a>
+          </li>
+          <li class="page-item {% if not next_url %}disabled{% endif %}">
+            <a class="page-link" href="{{ last_url }}" aria-label="Last"><i class="ti ti-chevrons-right"></i></a>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<textarea class="visually-hidden" id="negative-copy-fallback" aria-hidden="true"></textarea>
+<script id="negative-copy-data" type="application/json">{{ {"page": visible_terms, "all": copy_terms}|tojson }}</script>
+<script id="negative-export-data" type="application/json">{{ {"baseUrl": export_filtered_url}|tojson }}</script>
+<script>
+(function () {
+  const dataEl = document.getElementById("negative-copy-data");
+  const exportDataEl = document.getElementById("negative-export-data");
+  const statusEl = document.getElementById("negative-copy-status");
+  const selectPageEl = document.getElementById("select-negative-keyword");
+  const fallbackEl = document.getElementById("negative-copy-fallback");
+  const selectAllAccounts = document.getElementById("negative-select-all-accounts");
+  const scopeSelect = document.getElementById("sync_scope");
+  const payload = dataEl ? JSON.parse(dataEl.textContent || "{}") : {};
+  const exportPayload = exportDataEl ? JSON.parse(exportDataEl.textContent || "{}") : {};
+  const cleanTerm = (term) => String(term || "").replace(/[\r\n]+/g, " ").trim();
+
+  function selectedTerms() {
+    return Array.from(document.querySelectorAll(".negative-row-check:checked"))
+      .map((item) => cleanTerm(item.dataset.term || item.value))
+      .filter(Boolean);
+  }
+
+  function selectedIds() {
+    return Array.from(document.querySelectorAll(".negative-row-check:checked"))
+      .map((item) => Number.parseInt(item.dataset.negativeId || "", 10))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  }
+
+  function termsFor(kind) {
+    if (kind === "selected") return selectedTerms();
+    if (kind === "all") return payload.all || [];
+    return payload.page || [];
+  }
+
+  async function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch (error) {
+        // Fall back for browsers that expose Clipboard API but deny write permission.
+      }
+    }
+    if (!fallbackEl) return;
+    fallbackEl.value = text;
+    fallbackEl.classList.remove("visually-hidden");
+    fallbackEl.focus();
+    fallbackEl.select();
+    document.execCommand("copy");
+    fallbackEl.classList.add("visually-hidden");
+  }
+
+  document.querySelectorAll("[data-copy-kind]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const lines = termsFor(button.dataset.copyKind).map(cleanTerm).filter(Boolean);
+      if (!lines.length) {
+        if (statusEl) statusEl.textContent = "No negative keywords selected.";
+        return;
+      }
+      await copyText(lines.join("\n"));
+      if (statusEl) statusEl.textContent = `Copied ${lines.length} negative keyword${lines.length === 1 ? "" : "s"}.`;
+    });
+  });
+
+  document.querySelectorAll("[data-export-kind]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const ids = selectedIds();
+      if (!ids.length) {
+        if (statusEl) statusEl.textContent = "No negative keywords selected.";
+        return;
+      }
+      const url = new URL(exportPayload.baseUrl || "/negative-keywords/export", window.location.origin);
+      ids.forEach((id) => url.searchParams.append("selected_ids", String(id)));
+      window.location.href = url.toString();
+    });
+  });
+
+  selectPageEl?.addEventListener("change", () => {
+    document.querySelectorAll(".negative-row-check").forEach((item) => {
+      item.checked = selectPageEl.checked;
+    });
+  });
+
+  selectAllAccounts?.addEventListener("click", () => {
+    const boxes = Array.from(document.querySelectorAll(".negative-account-checkbox"));
+    const shouldCheck = boxes.some((box) => !box.checked);
+    boxes.forEach((box) => {
+      box.checked = shouldCheck;
+    });
+    selectAllAccounts.textContent = shouldCheck ? "Clear" : "Select all";
+  });
+
+  scopeSelect?.addEventListener("change", () => {
+    document.querySelector(".keyword-manual-account-list")?.classList.toggle("opacity-50", scopeSelect.value === "all");
+  });
+})();
+</script>
+{% endblock %}

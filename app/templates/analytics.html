@@ -1,0 +1,496 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Traffic and ecommerce enhancer</div>
+    <h2 class="page-title">Google Analytics</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/jobs"><i class="ti ti-list-check me-2"></i>Jobs</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if ga_oauth == "connected" %}
+<div class="alert alert-success" role="alert">Google Analytics was connected. Property discovery has been queued.</div>
+{% endif %}
+{% if ga_oauth_error %}
+<div class="alert alert-danger" role="alert">
+  Google Analytics action could not finish: {{ ga_oauth_error|replace("_", " ") }}.
+</div>
+{% endif %}
+{% if discover_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Google Analytics property discovery queued as job #{{ discover_job_id }}.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ discover_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if sync_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>GA4 ecommerce pull queued as job #{{ sync_job_id }}.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ sync_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if mapping_saved %}
+<div class="alert alert-success" role="alert">Google Analytics website mapping was saved.</div>
+{% endif %}
+{% if mapping_deleted %}
+<div class="alert alert-info" role="alert">Google Analytics website mapping was removed from the active list.</div>
+{% endif %}
+
+<div class="row row-cards mb-3">
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Connections</div>
+        <div class="h1 mb-1">{{ status_summary.connection_count }}</div>
+        <div class="text-secondary small">Connected Gmail accounts</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Properties</div>
+        <div class="h1 mb-1">{{ status_summary.property_count }}</div>
+        <div class="text-secondary small">GA4 properties discovered</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Web streams</div>
+        <div class="h1 mb-1">{{ status_summary.stream_count }}</div>
+        <div class="text-secondary small">Website streams available</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Mappings</div>
+        <div class="h1 mb-1">{{ status_summary.mapping_count }}</div>
+        <div class="text-secondary small">GA to Ads links</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Snapshots</div>
+        <div class="h1 mb-1">{{ status_summary.snapshot_count }}</div>
+        <div class="text-secondary small">Stored GA4 reports</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-lg-2">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Latest pull</div>
+        <div class="h3 mb-1">
+          {% if status_summary.latest_pull_at %}{{ status_summary.latest_pull_at.strftime("%Y-%m-%d") }}{% else %}None{% endif %}
+        </div>
+        <div class="text-secondary small">
+          {% if status_summary.latest_pull_at %}{{ status_summary.latest_pull_at.strftime("%H:%M") }}{% else %}No GA4 data yet{% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards">
+  <div class="col-xl-4">
+    <form class="card mb-3" method="post" action="/analytics/connect">
+      <div class="card-header">
+        <h3 class="card-title">Connect Google Analytics</h3>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label" for="analytics-connection-id">Reconnect account</label>
+          <select class="form-select" id="analytics-connection-id" name="connection_id">
+            <option value="0">New Google Analytics Gmail</option>
+            {% for connection in connections %}
+            <option value="{{ connection.id }}">{{ connection.name }}{% if connection.email %} - {{ connection.email }}{% endif %}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="form-label" for="analytics-connection-name">Display name</label>
+          <input class="form-control" id="analytics-connection-name" name="connection_name" placeholder="Google Analytics Gmail">
+        </div>
+        <div class="text-secondary small mt-2">
+          Uses the Google OAuth client saved in Settings. Enable Analytics Admin API and Analytics Data API in the same Google Cloud project.
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit">
+          <i class="ti ti-brand-google me-2"></i>
+          Connect GA4
+        </button>
+      </div>
+    </form>
+
+    <form class="card mb-3" method="post" action="/analytics/ecommerce/sync">
+      <div class="card-header">
+        <h3 class="card-title">Manual ecommerce pull</h3>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label" for="analytics-sync-scope">Scope</label>
+          <select class="form-select" id="analytics-sync-scope" name="sync_scope">
+            <option value="selected">Checked connections / properties</option>
+            <option value="all">All active GA4 properties</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Connections</label>
+          <div class="border rounded p-2" style="max-height: 180px; overflow: auto;">
+            {% for connection in connections %}
+            <label class="form-check">
+              <input class="form-check-input" type="checkbox" name="connection_ids" value="{{ connection.id }}" {% if loop.first %}checked{% endif %}>
+              <span class="form-check-label">
+                {{ connection.name }}
+                <span class="text-secondary small">{% if connection.email %}{{ connection.email }}{% else %}No email saved{% endif %}</span>
+              </span>
+            </label>
+            {% else %}
+            <div class="text-secondary small">Connect Google Analytics first.</div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Optional property filter</label>
+          <div class="border rounded p-2" style="max-height: 180px; overflow: auto;">
+            {% for property in properties %}
+            <label class="form-check">
+              <input class="form-check-input" type="checkbox" name="property_ids" value="{{ property.id }}">
+              <span class="form-check-label">
+                {{ property.display_name or property.property_id }}
+                <span class="text-secondary small">{{ property.property_id }}</span>
+              </span>
+            </label>
+            {% else %}
+            <div class="text-secondary small">Discover properties first.</div>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="analytics-pull-mode">Pull range</label>
+          <select class="form-select" id="analytics-pull-mode" name="pull_mode">
+            <option value="recent">Recent window</option>
+            <option value="all_time">All time available</option>
+          </select>
+        </div>
+        <div class="row g-2">
+          <div class="col-6">
+            <label class="form-label" for="analytics-days">Days</label>
+            <input class="form-control" id="analytics-days" name="days" type="number" min="1" max="365" value="{{ default_recent_days }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label" for="analytics-max-rows">Rows</label>
+            <input class="form-control" id="analytics-max-rows" name="max_rows" type="number" min="50" max="250000" value="10000">
+          </div>
+        </div>
+        <label class="form-check mt-3">
+          <input class="form-check-input" type="checkbox" name="force" checked>
+          <span class="form-check-label">Force fresh GA4 API pull</span>
+        </label>
+        <div class="text-secondary small mt-2">
+          All-time GA4 pulls start from 2020-01-01 and store only what Google Analytics can return for the property.
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit" {% if not connections %}disabled{% endif %}>
+          <i class="ti ti-database-import me-2"></i>
+          Pull ecommerce data
+        </button>
+      </div>
+    </form>
+
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Connections</h3>
+      </div>
+      <div class="list-group list-group-flush">
+        {% for connection in connections %}
+        <div class="list-group-item">
+          <div class="d-flex justify-content-between gap-2">
+            <div>
+              <div class="fw-semibold">{{ connection.name }}</div>
+              <div class="text-secondary small">{{ connection.email or "No email saved" }}</div>
+              <div class="text-secondary small">
+                {{ connection.discovered_property_count }} properties - {{ connection.discovered_stream_count }} streams
+              </div>
+              {% if connection.last_discovery_error %}
+              <div class="text-danger small">{{ connection.last_discovery_error|truncate(180, True, "...") }}</div>
+              {% endif %}
+            </div>
+            <form method="post" action="/analytics/connections/{{ connection.id }}/discover">
+              <button class="btn btn-sm btn-outline-primary" type="submit">
+                <i class="ti ti-world-search me-1"></i>
+                Discover
+              </button>
+            </form>
+          </div>
+        </div>
+        {% else %}
+        <div class="list-group-item text-secondary">No Analytics Gmail is connected.</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-xl-8">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Map GA4 streams to Ads accounts</h3>
+      </div>
+      <form method="post" action="/analytics/mappings">
+        <div class="card-body">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label" for="analytics-property">GA4 property</label>
+              <select class="form-select" id="analytics-property" name="analytics_property_id" required>
+                {% for property in properties %}
+                <option value="{{ property.id }}">{{ property.display_name or property.property_id }} - {{ property.property_id }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="analytics-stream">Web stream</label>
+              <select class="form-select" id="analytics-stream" name="analytics_stream_id">
+                <option value="0">All streams in property</option>
+                {% for stream in streams %}
+                <option value="{{ stream.id }}">{{ stream.property.display_name or stream.property.property_id }} - {{ stream.display_name or stream.stream_id }}{% if stream.default_uri %} - {{ stream.default_uri }}{% endif %}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="analytics-website">Odoo website</label>
+              <select class="form-select" id="analytics-website" name="website_key">
+                <option value="">No Odoo website mapping</option>
+                {% for website in websites %}
+                <option value="{{ website.store_id }}:{{ website.website_id }}">{{ website.store.name }} - {{ website.name }} - {{ website.domain or "domain missing" }}</option>
+                {% endfor %}
+                {% for store in stores %}
+                <option value="{{ store.id }}:0">{{ store.name }} - all websites</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" for="analytics-account">Google Ads account</label>
+              <select class="form-select" id="analytics-account" name="account_id">
+                <option value="0">No Ads account yet</option>
+                {% for account in accounts %}
+                <option value="{{ account.id }}">{{ account.name }} - {{ account.customer_id }}</option>
+                {% endfor %}
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="card-footer d-flex justify-content-end">
+          <button class="btn btn-primary" type="submit" {% if not properties %}disabled{% endif %}>
+            <i class="ti ti-link-plus me-2"></i>
+            Save mapping
+          </button>
+        </div>
+      </form>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>GA4 stream</th>
+              <th>Odoo website</th>
+              <th>Ads account</th>
+              <th>Source</th>
+              <th class="w-1"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for mapping in mappings %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ mapping.property.display_name or mapping.property.property_id }}</div>
+                <div class="text-secondary small">
+                  {% if mapping.stream %}{{ mapping.stream.display_name or mapping.stream.stream_id }}{% else %}All streams{% endif %}
+                  {% if mapping.stream and mapping.stream.default_uri %} - {{ mapping.stream.default_uri }}{% endif %}
+                </div>
+              </td>
+              <td>
+                {% if mapping.store %}
+                <div>{{ mapping.store.name }}</div>
+                <div class="text-secondary small">Website {{ mapping.website_id or "all" }}</div>
+                {% else %}
+                <span class="text-secondary">Not mapped</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if mapping.account %}
+                <div>{{ mapping.account.name }}</div>
+                <div class="text-secondary small">{{ mapping.account.customer_id }}</div>
+                {% else %}
+                <span class="text-secondary">Not mapped</span>
+                {% endif %}
+              </td>
+              <td><span class="badge bg-azure-lt">{{ mapping.match_source|replace("_", " ") }}</span></td>
+              <td>
+                <form method="post" action="/analytics/mappings/{{ mapping.id }}/delete">
+                  <button class="btn btn-sm btn-outline-danger" type="submit">
+                    <i class="ti ti-trash me-1"></i>
+                    Remove
+                  </button>
+                </form>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-secondary">No active GA4-to-Ads mappings yet. Discovery can auto-map matching domains.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">GA4 ecommerce plan</h3>
+        <div class="card-actions">
+          <form class="d-flex gap-2 align-items-end" method="get" action="/analytics">
+            <div>
+              <label class="form-label" for="plan-account">Ads account</label>
+              <select class="form-select form-select-sm" id="plan-account" name="plan_account_id">
+                {% for account in accounts %}
+                <option value="{{ account.id }}" {% if selected_plan_account_id == account.id %}selected{% endif %}>{{ account.name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <button class="btn btn-sm btn-outline-primary" type="submit">
+              <i class="ti ti-filter me-1"></i>
+              View
+            </button>
+          </form>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-lg-4">
+            <div class="subheader mb-2">Scale pages</div>
+            <div class="list-group list-group-flush border rounded">
+              {% for page in enhancement_plan.scale_landing_pages[:8] %}
+              <div class="list-group-item">
+                <div class="fw-semibold text-break">{{ page.url|truncate(90, True, "...") }}</div>
+                <div class="text-secondary small">{{ "{:,.0f}".format(page.purchases or 0) }} purchases - {{ "{:,.0f}".format(page.revenue or 0) }} revenue</div>
+              </div>
+              {% else %}
+              <div class="list-group-item text-secondary">Pull mapped GA4 ecommerce data to populate this.</div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-lg-4">
+            <div class="subheader mb-2">Testing pages</div>
+            <div class="list-group list-group-flush border rounded">
+              {% for page in enhancement_plan.testing_landing_pages[:8] %}
+              <div class="list-group-item">
+                <div class="fw-semibold text-break">{{ page.url|truncate(90, True, "...") }}</div>
+                <div class="text-secondary small">{{ "{:,.0f}".format(page.add_to_carts or 0) }} carts - {{ "{:,.0f}".format(page.checkouts or 0) }} checkouts</div>
+              </div>
+              {% else %}
+              <div class="list-group-item text-secondary">Cart and checkout pages without purchases will appear here.</div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-lg-4">
+            <div class="subheader mb-2">Protected pages</div>
+            <div class="list-group list-group-flush border rounded">
+              {% for page in enhancement_plan.protect_from_waste_pages[:8] %}
+              <div class="list-group-item">
+                <div class="fw-semibold text-break">{{ page.url|truncate(90, True, "...") }}</div>
+                <div class="text-secondary small">{{ "{:,.0f}".format(page.engaged_sessions or 0) }} engaged sessions</div>
+              </div>
+              {% else %}
+              <div class="list-group-item text-secondary">Pages with useful engagement will be guarded from waste decisions.</div>
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+        <div class="text-secondary small mt-3">{{ enhancement_plan.basis }}</div>
+      </div>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Stored GA4 datasets</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Dataset</th>
+              <th class="text-end">Snapshots</th>
+              <th class="text-end">Rows</th>
+              <th>Latest pull</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in dataset_summaries %}
+            <tr>
+              <td><span class="badge bg-blue-lt">{{ item.dataset_key|replace("_", " ") }}</span></td>
+              <td class="text-end">{{ item.snapshot_count }}</td>
+              <td class="text-end">{{ "{:,}".format(item.row_count) }}</td>
+              <td class="text-secondary">{{ item.latest_pull_at.strftime("%Y-%m-%d %H:%M") if item.latest_pull_at else "Never" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-secondary">No GA4 ecommerce snapshots are saved yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Latest pulls</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Property / stream</th>
+              <th>Ads account</th>
+              <th>Dataset</th>
+              <th class="text-end">Rows</th>
+              <th>Scope</th>
+              <th>Fetched</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for snapshot in latest_snapshots %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ snapshot.property_name or "Unknown property" }}</div>
+                <div class="text-secondary small">{{ snapshot.stream_name or "All streams" }}{% if snapshot.default_uri %} - {{ snapshot.default_uri }}{% endif %}</div>
+              </td>
+              <td>
+                {% if snapshot.account_name %}
+                <div>{{ snapshot.account_name }}</div>
+                <div class="text-secondary small">{{ snapshot.customer_id }}</div>
+                {% else %}
+                <span class="text-secondary">Unmapped</span>
+                {% endif %}
+              </td>
+              <td><span class="badge bg-azure-lt">{{ snapshot.dataset_key|replace("_", " ") }}</span></td>
+              <td class="text-end">{{ "{:,}".format(snapshot.row_count or 0) }}</td>
+              <td class="text-secondary small">{{ snapshot.scope_key }}</td>
+              <td class="text-secondary">{{ snapshot.fetched_at.strftime("%Y-%m-%d %H:%M") if snapshot.fetched_at else "" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No pulls are stored yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

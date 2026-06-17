@@ -1,0 +1,586 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Confirmed sales source</div>
+    <h2 class="page-title">Odoo Stores</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <button class="btn btn-primary" type="button" data-bs-toggle="collapse" data-bs-target="#store-form-panel">
+      <i class="ti ti-plus me-2"></i>
+      Add more
+    </button>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Odoo store settings were saved to Postgres.</div>
+{% endif %}
+{% if deleted %}
+<div class="alert alert-info" role="alert">Store was removed from the active list.</div>
+{% endif %}
+{% if sync_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Odoo confirmed-order sync queued as job #{{ sync_job_id }}. Cost guard will use the saved Postgres rows after the worker finishes.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ sync_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if website_sync_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Odoo website sync queued as job #{{ website_sync_job_id }}. The mapping selector will use the saved website list after the worker finishes.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ website_sync_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if product_feed_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Odoo product/page feed sync queued as job #{{ product_feed_job_id }}. Ad Factory will reuse the saved winner, watch, fallback, and exclusion rows after it finishes.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ product_feed_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if page_feed_publish_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Google Ads page feed publish queued as job #{{ page_feed_publish_job_id }}. It runs validate-only unless live mutation safety switches are enabled.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ page_feed_publish_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if page_feed_generated %}
+<div class="alert alert-success" role="alert">Hosted Google page-feed CSV URLs were refreshed. No Google Ads API calls were used.</div>
+{% endif %}
+
+<div class="collapse mb-3" id="store-form-panel">
+  <div class="card">
+    <div class="card-header">
+      <h3 class="card-title">Add or update store</h3>
+    </div>
+    <form method="post" action="/stores">
+      <div class="card-body">
+        <input type="hidden" name="store_id" id="store-id" value="0">
+        <div class="row g-3">
+          <div class="col-md-4">
+            <label class="form-label" for="store-name">Name</label>
+            <input class="form-control" id="store-name" name="name" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label" for="store-url">Odoo URL</label>
+            <input class="form-control" id="store-url" name="base_url" placeholder="https://example.com" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label" for="store-db">Database</label>
+            <input class="form-control" id="store-db" name="database" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label" for="store-user">User</label>
+            <input class="form-control" id="store-user" name="username" required>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label" for="store-api-key">Password/API key</label>
+            <input class="form-control" id="store-api-key" name="api_key" type="password" placeholder="Saved in Postgres; leave blank to keep">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label" for="store-website-id">Default website filter</label>
+            <input class="form-control" id="store-website-id" name="website_id" type="number" min="1">
+          </div>
+          <div class="col-md-2 d-flex align-items-end">
+            <label class="form-check">
+              <input class="form-check-input" type="checkbox" id="store-is-multisite" name="is_multisite">
+              <span class="form-check-label">Multisite</span>
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="card-footer d-flex justify-content-end">
+        <button class="btn btn-primary" type="submit">
+          <i class="ti ti-device-floppy me-2"></i>
+          Save store
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="row row-cards">
+  <div class="col-xl-7">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Stores</h3>
+        <div class="card-actions">
+          <form class="d-flex gap-2 align-items-center" method="post" action="/stores/sync">
+            <input class="form-control form-control-sm w-auto" type="number" min="1" max="168" name="hours" value="12" title="Hours">
+            <button class="btn btn-outline-primary btn-sm" type="submit">
+              <i class="ti ti-refresh me-1"></i>
+              Sync all
+            </button>
+          </form>
+          <form method="post" action="/stores/websites/sync">
+            <button class="btn btn-outline-secondary btn-sm" type="submit">
+              <i class="ti ti-world-search me-1"></i>
+              Sync websites
+            </button>
+          </form>
+          <form class="d-flex gap-2 align-items-center" method="post" action="/stores/product-feed/sync">
+            <input class="form-control form-control-sm w-auto" type="number" min="1" max="60" name="days" value="7" title="Days">
+            <button class="btn btn-outline-success btn-sm" type="submit">
+              <i class="ti ti-target-arrow me-1"></i>
+              Product feed
+            </button>
+          </form>
+          <form class="d-flex gap-2 align-items-center" method="post" action="/stores/page-feed/publish">
+            <input class="form-control form-control-sm w-auto" type="number" min="1" max="5000000" name="max_urls" value="{{ page_feed_default_max_urls }}" title="Max URLs">
+            <button class="btn btn-outline-warning btn-sm" type="submit">
+              <i class="ti ti-link me-1"></i>
+              Generate feed URLs
+            </button>
+          </form>
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Store</th>
+              <th>Connection</th>
+              <th>Last sync</th>
+              <th class="w-1"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for store in stores %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ store.name }}</div>
+                <div class="text-secondary small">
+                  {% if store.is_multisite %}<span class="badge bg-blue-lt me-1">Multisite</span>{% endif %}
+                  {% if store.website_id %}<span class="badge bg-secondary-lt">Website {{ store.website_id }}</span>{% else %}<span class="badge bg-secondary-lt">All websites</span>{% endif %}
+                </div>
+                {% set store_websites = websites|selectattr("store_id", "equalto", store.id)|list %}
+                {% if store_websites %}
+                <div class="text-secondary small mt-1">
+                  {{ store_websites|length }} website{{ "s" if store_websites|length != 1 else "" }}:
+                  {% for website in store_websites[:4] %}
+                  <span class="badge bg-azure-lt me-1">{{ website.name }}</span>
+                  {% endfor %}
+                  {% if store_websites|length > 4 %}<span class="badge bg-secondary-lt">+{{ store_websites|length - 4 }}</span>{% endif %}
+                </div>
+                {% endif %}
+              </td>
+              <td>
+                <div>{{ store.base_url }}</div>
+                <div class="text-secondary small">{{ store.database }} · {{ store.username }} · {% if store.api_key %}key saved{% else %}key missing{% endif %}</div>
+                {% if store.last_sync_error %}
+                <div class="text-danger small">{{ store.last_sync_error|truncate(160) }}</div>
+                {% endif %}
+              </td>
+              <td class="text-secondary">{{ store.last_sync_at or "Not synced" }}</td>
+              <td>
+                <div class="btn-list flex-nowrap">
+                  <button
+                    class="btn btn-outline-secondary btn-sm edit-store-button"
+                    type="button"
+                    data-store-id="{{ store.id }}"
+                    data-store-name="{{ store.name }}"
+                    data-store-url="{{ store.base_url }}"
+                    data-store-db="{{ store.database }}"
+                    data-store-user="{{ store.username }}"
+                    data-store-website-id="{{ store.website_id or '' }}"
+                    data-store-multisite="{{ '1' if store.is_multisite else '0' }}"
+                  >
+                    <i class="ti ti-pencil me-1"></i>
+                    Edit
+                  </button>
+                  <form method="post" action="/stores/{{ store.id }}/sync">
+                    <input type="hidden" name="hours" value="12">
+                    <button class="btn btn-outline-primary btn-sm" type="submit">
+                      <i class="ti ti-refresh me-1"></i>
+                      Sync
+                    </button>
+                  </form>
+                  <form method="post" action="/stores/{{ store.id }}/websites/sync">
+                    <button class="btn btn-outline-secondary btn-sm" type="submit">
+                      <i class="ti ti-world-search me-1"></i>
+                      Websites
+                    </button>
+                  </form>
+                  <button class="btn btn-outline-danger btn-sm delete-store-button" type="button" data-bs-toggle="modal" data-bs-target="#deleteStoreModal" data-store-id="{{ store.id }}" data-store-name="{{ store.name }}">
+                    <i class="ti ti-trash me-1"></i>
+                    Delete
+                  </button>
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-secondary">No Odoo stores are saved yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-xl-5">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">Map store to Google Ads accounts</h3>
+      </div>
+      <form method="post" action="/stores/mappings">
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label" for="mapping-store">Odoo store</label>
+            <select class="form-select" id="mapping-store" name="store_id" required>
+              {% for store in stores %}
+              <option value="{{ store.id }}">{{ store.name }}{% if store.website_id %} · website {{ store.website_id }}{% endif %}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="mapping-website-search">Website / multisite</label>
+            <input class="form-control mb-2" id="mapping-website-search" type="search" placeholder="Search website name or domain">
+            <div class="store-website-list border rounded">
+              {% for store in stores %}
+              <label class="dropdown-item store-website-option" data-store-id="{{ store.id }}" data-website-search="all websites {{ store.name|lower }}">
+                <input class="form-check-input me-2" type="radio" name="website_id" value="0" data-store-id="{{ store.id }}" {% if loop.first %}checked{% endif %}>
+                <span>
+                  <span class="d-block">All websites in {{ store.name }}</span>
+                  <span class="text-secondary small">Use only when the whole Odoo store maps to the same Google Ads account.</span>
+                </span>
+              </label>
+              {% endfor %}
+              {% for website in websites %}
+              <label class="dropdown-item store-website-option" data-store-id="{{ website.store_id }}" data-website-search="{{ website.name|lower }} {{ website.domain|lower }} {{ website.website_id }}">
+                <input class="form-check-input me-2" type="radio" name="website_id" value="{{ website.website_id }}" data-store-id="{{ website.store_id }}">
+                <span>
+                  <span class="d-block">{{ website.name }}</span>
+                  <span class="text-secondary small">Website {{ website.website_id }}{% if website.domain %} · {{ website.domain }}{% endif %}</span>
+                </span>
+              </label>
+              {% else %}
+              <div class="text-secondary p-3">No Odoo websites have been synced yet. Use Sync websites, then map a specific multisite.</div>
+              {% endfor %}
+            </div>
+            <div class="form-hint">For multisite stores, select the exact Odoo website before choosing the Google Ads account.</div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="mapping-search">Google Ads accounts</label>
+            <input class="form-control mb-2" id="mapping-search" type="search" placeholder="Search by name or customer ID">
+            <div class="store-account-list border rounded">
+              {% for account in accounts %}
+              <label class="dropdown-item store-account-option" data-account-search="{{ account.name|lower }} {{ account.customer_id }}">
+                <input class="form-check-input me-2" type="checkbox" name="account_ids" value="{{ account.id }}">
+                <span>
+                  <span class="d-block">{{ account.name }}</span>
+                  <span class="text-secondary small">{{ account.customer_id }} · {{ account.currency_code or "UNKNOWN" }}</span>
+                </span>
+              </label>
+              {% else %}
+              <div class="text-secondary p-3">No active Google Ads accounts.</div>
+              {% endfor %}
+            </div>
+          </div>
+          <div>
+            <label class="form-label" for="revenue-weight">Revenue weight</label>
+            <input class="form-control" id="revenue-weight" name="revenue_weight" type="number" min="0.01" step="0.01" value="1">
+            <div class="form-hint">When one Odoo store maps to multiple ad accounts, sales are allocated by weight to avoid double-counting.</div>
+          </div>
+        </div>
+        <div class="card-footer d-flex justify-content-end">
+          <button class="btn btn-primary" type="submit">
+            <i class="ti ti-link me-2"></i>
+            Save mapping
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Last 12h confirmed Odoo sales</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Store</th><th>Website</th><th>Currency</th><th>Orders</th><th>Sales</th><th>Margin</th></tr></thead>
+          <tbody>
+            {% for row in sales_rows %}
+            {% set store = stores|selectattr("id", "equalto", row.store_id)|first %}
+            <tr>
+              <td>{{ store.name if store else row.store_id }}</td>
+              <td>{{ row.website_name }}</td>
+              <td>{{ row.currency }}</td>
+              <td>{{ row.orders }}</td>
+              <td>{{ "{:,.2f}".format(row.amount) }}</td>
+              <td>{{ "{:,.2f}".format(row.margin) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No confirmed Odoo sales synced in the last 12 hours.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3 d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Hosted Google page-feed URLs now have their own menu with store/account filters and separate best, good, new, and mixed product feeds.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/page-feeds">
+    <i class="ti ti-file-spreadsheet me-1"></i>
+    Open Page Feeds
+  </a>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header">
+    <h3 class="card-title">Product/page feed signals</h3>
+    <div class="card-actions">
+      {% for item in product_feed_summary %}
+      {% if item.label == "winner" %}
+      <span class="badge bg-green-lt">{{ item.count }} winners</span>
+      {% elif item.label == "watch" %}
+      <span class="badge bg-yellow-lt">{{ item.count }} watch</span>
+      {% elif item.label == "exclude" %}
+      <span class="badge bg-red-lt">{{ item.count }} excluded</span>
+      {% elif item.label == "fallback" %}
+      <span class="badge bg-azure-lt">{{ item.count }} fallback</span>
+      {% else %}
+      <span class="badge bg-secondary-lt">{{ item.count }} {{ item.label }}</span>
+      {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead>
+        <tr>
+          <th>Signal</th>
+          <th>Website / account</th>
+          <th>Product page</th>
+          <th>Odoo sales</th>
+          <th>Google data</th>
+          <th>Spend cap</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in product_feed_rows %}
+        {% set source = row.source_json or {} %}
+        <tr>
+          <td>
+            {% if row.label == "winner" %}
+            <span class="badge bg-green-lt">winner</span>
+            {% elif row.label == "watch" %}
+            <span class="badge bg-yellow-lt">watch</span>
+            {% elif row.label == "exclude" %}
+            <span class="badge bg-red-lt">exclude</span>
+            {% elif row.label == "fallback" %}
+            <span class="badge bg-azure-lt">fallback</span>
+            {% else %}
+            <span class="badge bg-secondary-lt">{{ row.label }}</span>
+            {% endif %}
+            <div class="text-secondary small mt-1">{{ row.reason|truncate(110) }}</div>
+          </td>
+          <td>
+            <div class="fw-semibold">{{ row.website_name }}</div>
+            <div class="text-secondary small">{{ row.account.name }} · {{ row.account.customer_id }}</div>
+          </td>
+          <td>
+            <div class="fw-semibold">{{ row.product_name|truncate(80) }}</div>
+            <div class="text-secondary small">{{ row.product_code }}</div>
+            {% if row.product_url %}
+            <a class="small" href="{{ row.product_url }}" target="_blank" rel="noopener">{{ row.product_url|truncate(90) }}</a>
+            {% endif %}
+          </td>
+          <td>
+            <div>{{ row.currency_code or "UNKNOWN" }} {{ "{:,.2f}".format(row.sales_amount or 0) }}</div>
+            <div class="text-secondary small">
+              Margin {{ "{:,.2f}".format(row.margin_amount or 0) }}
+              {% if row.margin_percent is not none %} · {{ "{:,.1f}".format((row.margin_percent or 0) * 100) }}%{% endif %}
+              <br>{{ row.order_count }} orders · {{ "{:,.1f}".format(row.quantity or 0) }} qty
+            </div>
+          </td>
+          <td>
+            <div>{{ row.account.currency_code or "" }} {{ "{:,.2f}".format(row.google_cost or 0) }} cost</div>
+            <div class="text-secondary small">
+              {{ "{:,.2f}".format(row.google_conversions or 0) }} conv · value {{ "{:,.2f}".format(row.google_conversion_value or 0) }}
+              {% if row.zero_conversion_cost %}<br><span class="text-danger">Zero-conv cost {{ "{:,.2f}".format(row.zero_conversion_cost) }}</span>{% endif %}
+            </div>
+          </td>
+          <td class="text-secondary">
+            {% if source.normal_spend_cap is not none %}
+            20%: {{ row.account.currency_code or "" }} {{ "{:,.2f}".format(source.normal_spend_cap or 0) }}<br>
+            30%: {{ row.account.currency_code or "" }} {{ "{:,.2f}".format(source.priority_spend_cap or 0) }}
+            {% else %}
+            Rate unavailable
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-secondary">No product/page feed signals yet. Run Product feed after Odoo orders and websites are synced.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">Active sales mappings</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Odoo store</th><th>Website</th><th>Google Ads account</th><th>Revenue weight</th><th class="w-1"></th></tr></thead>
+      <tbody>
+        {% for row in mapping_rows %}
+        <tr>
+          <td>
+            <div class="fw-semibold">{{ row.store.name }}</div>
+            <div class="text-secondary small">{% if row.store.is_multisite %}Multisite{% else %}Single website{% endif %}</div>
+          </td>
+          <td>
+            {% if row.website %}
+            <div class="fw-semibold">{{ row.website.name }}</div>
+            <div class="text-secondary small">Website {{ row.website.website_id }}{% if row.website.domain %} · {{ row.website.domain }}{% endif %}</div>
+            {% else %}
+            <div class="fw-semibold">All websites</div>
+            <div class="text-secondary small">Store-wide allocation</div>
+            {% endif %}
+          </td>
+          <td>
+            <div>{{ row.account.name }}</div>
+            <div class="text-secondary small">{{ row.account.customer_id }} · {{ row.account.currency_code or "UNKNOWN" }}</div>
+          </td>
+          <td>{{ "{:,.2f}".format(row.revenue_weight or 1) }}</td>
+          <td>
+            <button class="btn btn-outline-danger btn-sm delete-mapping-button" type="button" data-bs-toggle="modal" data-bs-target="#deleteMappingModal" data-mapping-id="{{ row.id }}" data-label="{{ row.store.name }}{% if row.website %} / {{ row.website.name }}{% endif %} → {{ row.account.name }}">
+              <i class="ti ti-unlink me-1"></i>
+              Remove
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-secondary">No store to Google Ads mappings yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal modal-blur fade" id="deleteStoreModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      <div class="modal-status bg-danger"></div>
+      <div class="modal-body text-center py-4">
+        <i class="ti ti-alert-triangle icon mb-2 text-danger icon-lg"></i>
+        <h3>Delete store?</h3>
+        <div class="text-secondary" id="delete-store-message">This removes the store from active mappings.</div>
+      </div>
+      <div class="modal-footer">
+        <div class="w-100">
+          <div class="row">
+            <div class="col"><button type="button" class="btn w-100" data-bs-dismiss="modal">No</button></div>
+            <div class="col">
+              <form id="delete-store-form" method="post" action="#">
+                <button type="submit" class="btn btn-danger w-100">Yes</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal modal-blur fade" id="deleteMappingModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      <div class="modal-status bg-danger"></div>
+      <div class="modal-body text-center py-4">
+        <i class="ti ti-unlink icon mb-2 text-danger icon-lg"></i>
+        <h3>Remove mapping?</h3>
+        <div class="text-secondary" id="delete-mapping-message">The sales guard will stop allocating this store to the account.</div>
+      </div>
+      <div class="modal-footer">
+        <div class="w-100">
+          <div class="row">
+            <div class="col"><button type="button" class="btn w-100" data-bs-dismiss="modal">No</button></div>
+            <div class="col">
+              <form id="delete-mapping-form" method="post" action="#">
+                <button type="submit" class="btn btn-danger w-100">Yes</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const panel = document.getElementById("store-form-panel");
+  const setValue = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value || "";
+  };
+  document.querySelectorAll(".edit-store-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      setValue("store-id", button.dataset.storeId);
+      setValue("store-name", button.dataset.storeName);
+      setValue("store-url", button.dataset.storeUrl);
+      setValue("store-db", button.dataset.storeDb);
+      setValue("store-user", button.dataset.storeUser);
+      setValue("store-website-id", button.dataset.storeWebsiteId);
+      const multisite = document.getElementById("store-is-multisite");
+      if (multisite) multisite.checked = button.dataset.storeMultisite === "1";
+      if (window.bootstrap && panel) window.bootstrap.Collapse.getOrCreateInstance(panel).show();
+    });
+  });
+
+  const search = document.getElementById("mapping-search");
+  if (search) {
+    search.addEventListener("input", () => {
+      const term = search.value.trim().toLowerCase();
+      document.querySelectorAll(".store-account-option").forEach((option) => {
+        option.classList.toggle("d-none", term && !String(option.dataset.accountSearch || "").includes(term));
+      });
+    });
+  }
+
+  const mappingStore = document.getElementById("mapping-store");
+  const websiteSearch = document.getElementById("mapping-website-search");
+  const filterWebsiteOptions = () => {
+    const storeId = mappingStore ? String(mappingStore.value || "") : "";
+    const term = websiteSearch ? websiteSearch.value.trim().toLowerCase() : "";
+    let firstVisibleInput = null;
+    let checkedVisible = false;
+    document.querySelectorAll(".store-website-option").forEach((option) => {
+      const matchesStore = String(option.dataset.storeId || "") === storeId;
+      const matchesSearch = !term || String(option.dataset.websiteSearch || "").includes(term);
+      const visible = matchesStore && matchesSearch;
+      option.classList.toggle("d-none", !visible);
+      const input = option.querySelector("input[type='radio']");
+      if (visible && input && !firstVisibleInput) firstVisibleInput = input;
+      if (visible && input && input.checked) checkedVisible = true;
+    });
+    if (!checkedVisible && firstVisibleInput) firstVisibleInput.checked = true;
+  };
+  if (mappingStore) mappingStore.addEventListener("change", filterWebsiteOptions);
+  if (websiteSearch) websiteSearch.addEventListener("input", filterWebsiteOptions);
+  filterWebsiteOptions();
+
+  const deleteStoreForm = document.getElementById("delete-store-form");
+  const deleteStoreMessage = document.getElementById("delete-store-message");
+  document.querySelectorAll(".delete-store-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (deleteStoreForm) deleteStoreForm.action = `/stores/${button.dataset.storeId}/delete`;
+      if (deleteStoreMessage) deleteStoreMessage.textContent = `Delete ${button.dataset.storeName} from active Odoo stores?`;
+    });
+  });
+
+  const deleteMappingForm = document.getElementById("delete-mapping-form");
+  const deleteMappingMessage = document.getElementById("delete-mapping-message");
+  document.querySelectorAll(".delete-mapping-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (deleteMappingForm) deleteMappingForm.action = `/stores/mappings/${button.dataset.mappingId}/delete`;
+      if (deleteMappingMessage) deleteMappingMessage.textContent = `Remove ${button.dataset.label}?`;
+    });
+  });
+})();
+</script>
+{% endblock %}

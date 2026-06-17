@@ -1,0 +1,604 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">AI ad creation</div>
+    <h2 class="page-title">Ad Factory</h2>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if created %}
+<div class="alert alert-success" role="alert">Draft saved to the Postgres review queue.</div>
+{% endif %}
+{% if approved %}
+<div class="alert alert-success" role="alert">Draft approved for publish check.</div>
+{% endif %}
+{% if publish_checked %}
+<div class="alert alert-info" role="alert">Publish check saved on the draft.</div>
+{% endif %}
+{% if insights_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Google Ads 60-day insight sync queued as job #{{ insights_job_id }}. It reuses fresh snapshots and only pulls missing or expired datasets.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ insights_job_id }}">View jobs</a>
+</div>
+{% endif %}
+{% if deleted %}
+<div class="alert alert-success" role="alert">Draft deleted from Postgres.</div>
+{% endif %}
+
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <form class="card" method="post" action="/ad-factory/generate">
+      <div class="card-header">
+        <h3 class="card-title">Generate new ad</h3>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label" for="account_search">Account</label>
+          {% set default_account = default_ad_factory_account %}
+          {% set default_account_domain = account_domain_map.get(default_account.id) if default_account else none %}
+          <input type="hidden" id="account_id" name="account_id" value="{{ default_account.id if default_account else '' }}">
+          <div class="dropdown ad-account-picker">
+            <button class="form-select text-start ad-account-picker-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" id="selected-account-button">
+              {% if default_account %}
+              {{ default_account.name }} · {{ default_account.customer_id }}
+              {% else %}
+              No active accounts
+              {% endif %}
+            </button>
+            <div class="dropdown-menu ad-account-picker-menu p-0">
+              <div class="p-2 border-bottom">
+                <input class="form-control form-control-sm" id="account_search" type="search" placeholder="Search name or any account digits">
+              </div>
+              <div class="ad-account-picker-list">
+                {% for account in accounts %}
+                {% set account_domain = account_domain_map.get(account.id) %}
+                <button
+                  class="dropdown-item ad-account-option {% if default_account and account.id == default_account.id %}active{% endif %}"
+                  type="button"
+                  data-account-id="{{ account.id }}"
+                  data-account-label="{{ account.name }} · {{ account.customer_id }}"
+                  data-account-name="{{ account.name|lower }}"
+                  data-account-number="{{ account.customer_id }}"
+                  data-website-url="{{ account_domain.url if account_domain else '' }}"
+                  data-website-source="{{ account_domain.label if account_domain else '' }}"
+                >
+                  <span class="d-block">{{ account.name }}</span>
+                  <span class="text-secondary small">{{ account.customer_id }} · {{ account.currency_code or "UNKNOWN" }}</span>
+                </button>
+                {% endfor %}
+                <div class="dropdown-item text-secondary ad-account-empty d-none">No matching accounts.</div>
+              </div>
+            </div>
+          </div>
+          <div class="form-hint">Search by account name, full number, middle digits, or last 4 digits.</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="ad_type">Ad type</label>
+          <select class="form-select" id="ad_type" name="ad_type">
+            <option value="pmax">Performance Max text assets</option>
+            <option value="rsa">Responsive Search Ad</option>
+            <option value="dsa">Dynamic Search Ad</option>
+          </select>
+        </div>
+        <div class="mb-3 d-none" data-rsa-options>
+          <label class="form-label" for="rsa_source_mode">RSA source</label>
+          <select class="form-select" id="rsa_source_mode" name="rsa_source_mode">
+            {% for key, label in rsa_source_modes.items() %}
+            <option value="{{ key }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-hint">Keyword-only RSA uses saved Google Ads insight snapshots and skips Odoo page-feed targets.</div>
+        </div>
+        <div class="mb-3 d-none" data-rsa-keyword-options>
+          <label class="form-label" for="rsa_keyword_lookback">Google keyword lookback</label>
+          <select class="form-select" id="rsa_keyword_lookback" name="rsa_keyword_lookback">
+            {% for key, label in keyword_lookback_options.items() %}
+            <option value="{{ key }}" {% if key == "60" %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-hint">Uses clicked search terms and search-term insight categories already saved in Postgres.</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="campaign_product_mode">Product feed mode</label>
+          <select class="form-select" id="campaign_product_mode" name="campaign_product_mode">
+            {% for key, label in campaign_product_modes.items() %}
+            <option value="{{ key }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+          <div class="form-hint">Use best performers for tight spend control; use good/new modes for separate testing campaigns.</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="website_url">Website URL</label>
+          <input class="form-control" id="website_url" name="website_url" type="url" value="{{ default_account_domain.url if default_account_domain else '' }}" data-autofill-value="{{ default_account_domain.url if default_account_domain else '' }}" placeholder="https://example.com" required>
+          <div class="form-hint" id="website-url-source">{% if default_account_domain %}Mapped: {{ default_account_domain.label }}{% else %}No mapped website{% endif %}</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="final_url">Final URL</label>
+          <input class="form-control" id="final_url" name="final_url" type="url" placeholder="Leave blank to use website URL">
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="business_name">Business name</label>
+          <input class="form-control" id="business_name" name="business_name" maxlength="25" type="text">
+          <div class="form-hint">25 characters maximum.</div>
+        </div>
+        <div class="hr-text">Bidding</div>
+        <div class="mb-3">
+          <label class="form-label" for="bidding_strategy">Bidding strategy</label>
+          <select class="form-select" id="bidding_strategy" name="bidding_strategy" required>
+            <option value="maximize_conversion_value_target_roas">Maximize conversion value with Target ROAS</option>
+            <option value="maximize_conversion_value_no_target">Maximize conversion value without Target ROAS</option>
+            <option value="maximize_clicks">Maximize clicks with maximum CPC</option>
+          </select>
+        </div>
+        <div class="mb-3" data-bidding-field="target-roas">
+          <label class="form-label" for="target_roas_percent">Target ROAS</label>
+          <div class="input-group">
+            <input class="form-control" id="target_roas_percent" name="target_roas_percent" type="number" min="1" step="1" value="350">
+            <span class="input-group-text">%</span>
+          </div>
+        </div>
+        <div class="mb-3 d-none" data-bidding-field="max-cpc">
+          <label class="form-label" for="max_cpc_bid_limit">Maximum CPC bid limit</label>
+          <input class="form-control" id="max_cpc_bid_limit" name="max_cpc_bid_limit" type="number" min="0.01" step="0.01" placeholder="300">
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="daily_budget">Daily budget</label>
+          <input class="form-control" id="daily_budget" name="daily_budget" type="number" min="0.01" step="0.01" required placeholder="120000">
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit">
+          <i class="ti ti-sparkles me-2"></i>
+          Generate draft
+        </button>
+      </div>
+    </form>
+    <form class="card mt-3" method="post" action="/ad-factory/insights/sync">
+      <div class="card-header">
+        <h3 class="card-title">Sync 60-day insights</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" id="insights_account_id" name="account_id" value="{{ default_account.id if default_account else '' }}">
+        <div class="mb-3">
+          <label class="form-label" for="insights-account-label">Account</label>
+          <input class="form-control" id="insights-account-label" value="{{ default_account.name ~ ' · ' ~ default_account.customer_id if default_account else '' }}" readonly>
+        </div>
+        <div class="row g-2">
+          <div class="col-6">
+            <label class="form-label" for="insights-days">Days</label>
+            <input class="form-control" id="insights-days" name="days" type="number" min="1" max="365" value="60">
+          </div>
+          <div class="col-6">
+            <label class="form-label" for="insights-max-rows">Max rows</label>
+            <input class="form-control" id="insights-max-rows" name="max_rows" type="number" min="50" max="50000" value="5000">
+          </div>
+        </div>
+        <label class="form-check mt-3">
+          <input class="form-check-input" type="checkbox" name="force">
+          <span class="form-check-label">Force refresh even if today has cached JSON</span>
+        </label>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-outline-primary w-100" type="submit">
+          <i class="ti ti-database-import me-2"></i>
+          Sync insights
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Recent drafts</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Account</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Bidding</th>
+              <th>Website</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for draft in drafts %}
+            <tr id="draft-{{ draft.id }}">
+              <td>#{{ draft.id }}</td>
+              <td>
+                {{ draft.account.name }}
+                {% set identity = draft.generated_assets.campaign_identity if draft.generated_assets and draft.generated_assets.campaign_identity else {} %}
+                {% if identity %}
+                <div class="text-secondary small">{{ identity.campaign_name }}</div>
+                {% endif %}
+              </td>
+              <td><span class="badge bg-blue-lt">{{ draft.ad_type|upper }}</span></td>
+              <td>
+                {% if draft.status == "approved" %}
+                <span class="badge bg-green-lt">approved</span>
+                {% elif draft.status == "publish_blocked" %}
+                <span class="badge bg-red-lt">blocked</span>
+                {% elif draft.status == "publish_ready" %}
+                <span class="badge bg-green-lt">publish ready</span>
+                {% elif draft.validation_json.ok %}
+                <span class="badge bg-blue-lt">review</span>
+                {% else %}
+                <span class="badge bg-yellow-lt">fix</span>
+                {% endif %}
+              </td>
+              <td>
+                {% set bidding = draft.generated_assets.bidding if draft.generated_assets and draft.generated_assets.bidding else {} %}
+                {% if bidding %}
+                <div class="fw-semibold">{{ bidding.strategy_label }}</div>
+                <div class="text-secondary small">
+                  Budget: {{ bidding.currency_code }} {{ "{:,.2f}".format(bidding.daily_budget or 0) }}
+                  {% if bidding.target_roas_percent %}<br>Target ROAS: {{ "{:,.0f}".format(bidding.target_roas_percent) }}%{% endif %}
+                  {% if bidding.max_cpc_bid_limit %}<br>Max CPC: {{ bidding.currency_code }} {{ "{:,.2f}".format(bidding.max_cpc_bid_limit) }}{% endif %}
+                </div>
+                {% else %}
+                <span class="text-secondary">Missing</span>
+                {% endif %}
+              </td>
+              <td class="text-secondary">{{ draft.website_url }}</td>
+              <td class="text-secondary">{{ draft.created_at.strftime("%Y-%m-%d %H:%M") if draft.created_at else "" }}</td>
+              <td class="text-end">
+                <div class="btn-list justify-content-end">
+                  {% if draft.validation_json.ok and draft.status not in ["approved", "publish_ready", "publish_blocked"] %}
+                  <form method="post" action="/ad-factory/drafts/{{ draft.id }}/approve">
+                    <button class="btn btn-sm btn-outline-primary" type="submit">Approve</button>
+                  </form>
+                  {% endif %}
+                  {% if draft.validation_json.ok %}
+                  <form method="post" action="/ad-factory/drafts/{{ draft.id }}/publish">
+                    <button class="btn btn-sm btn-primary" type="submit">Publish check</button>
+                  </form>
+                  {% endif %}
+                  <form
+                    class="js-delete-draft-form"
+                    method="post"
+                    action="/ad-factory/drafts/{{ draft.id }}/delete"
+                    data-draft-id="{{ draft.id }}"
+                    data-draft-account="{{ draft.account.name }}"
+                  >
+                    <button class="btn btn-sm btn-outline-danger" type="submit">
+                      <i class="ti ti-trash me-1"></i>
+                      Delete
+                    </button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td colspan="8">
+                <div class="row g-2">
+                  {% if draft.generated_assets.headlines %}
+                  <div class="col-md-6">
+                    <div class="subheader">Headlines · {{ draft.generated_assets.headlines|length }}/{{ draft.validation_json.requirements.headlines.target if draft.validation_json.requirements and draft.validation_json.requirements.headlines else 15 }}</div>
+                    <div class="d-flex flex-wrap gap-1">
+                      {% for headline in draft.generated_assets.headlines %}
+                      <span class="badge bg-secondary-lt ad-asset-badge">
+                        {{ headline }}
+                        <span class="text-secondary ms-1">{{ headline|length }}/30</span>
+                      </span>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.long_headlines %}
+                  <div class="col-md-6">
+                    <div class="subheader">Long headlines · {{ draft.generated_assets.long_headlines|length }}/5</div>
+                    <div class="text-secondary small">
+                      {% for item in draft.generated_assets.long_headlines %}
+                      <div>{{ item }} <span class="text-muted">({{ item|length }}/90)</span></div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  <div class="col-md-6">
+                    <div class="subheader">Descriptions · {{ draft.generated_assets.descriptions|length }}/{{ draft.validation_json.requirements.descriptions.target if draft.validation_json.requirements and draft.validation_json.requirements.descriptions else 4 }}</div>
+                    <div class="text-secondary small">
+                      {% for description in draft.generated_assets.descriptions %}
+                      <div>{{ description }} <span class="text-muted">({{ description|length }}/90)</span></div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="subheader">Automation</div>
+                    {% set feed = draft.generated_assets.odoo_product_feed if draft.generated_assets and draft.generated_assets.odoo_product_feed else {} %}
+                    <div class="text-secondary small">
+                      Final URL expansion: {{ "on" if draft.generated_assets.google_ai_settings.final_url_expansion else "off" }}<br>
+                      Text automation: {{ "on" if draft.generated_assets.google_ai_settings.text_asset_automation else "off" }}<br>
+                      AI Max requested: {{ "on" if draft.generated_assets.google_ai_settings.ai_max_requested else "off" }}
+                      {% if feed %}
+                      {% if draft.generated_assets.rsa_source_mode %}
+                      <br>RSA source: {{ draft.generated_assets.rsa_source_mode.label }}
+                      {% endif %}
+                      <br>Product mode: {{ draft.generated_assets.campaign_product_mode.label if draft.generated_assets.campaign_product_mode else feed.campaign_mode_label }}
+                      <br>Odoo page feed: {{ feed.page_feed_targets|length }} targets · {{ feed.negative_page_targets|length }} exclusions{% if feed.using_fallback %} · fallback{% endif %}
+                      {% if feed.hosted_page_feed %}
+                      <br>Hosted feed: {{ feed.hosted_page_feed.feed_name }}{% if feed.hosted_page_feed.filename %} · {{ feed.hosted_page_feed.filename }}{% endif %}
+                      {% endif %}
+                      {% endif %}
+                      {% if draft.generated_assets.google_keyword_plan %}
+                      <br>Google keyword plan: {{ draft.generated_assets.google_keyword_plan.row_count }} terms · {{ draft.generated_assets.google_keyword_plan.lookback_label }}
+                      {% endif %}
+	                      {% if draft.generated_assets.google_ads_research %}
+	                      <br>Saved research datasets: {{ draft.generated_assets.google_ads_research.datasets|length }}
+	                      {% endif %}
+                      {% if draft.generated_assets.campaign_identity %}
+                      <br>Campaign name: {{ draft.generated_assets.campaign_identity.campaign_name }}
+                      <br>Resume code: {{ draft.generated_assets.campaign_identity.campaign_code }}
+                      {% if draft.generated_assets.existing_google_campaign %}
+                      <br>Resume match: {{ draft.generated_assets.existing_google_campaign.campaign_name }}
+                      {% endif %}
+                      {% endif %}
+	                    </div>
+	                  </div>
+                  {% if draft.generated_assets.page_feed_targets %}
+                  <div class="col-md-6">
+                    <div class="subheader">Page feed targets</div>
+                    <div class="text-secondary small">
+                      {% for url in draft.generated_assets.page_feed_targets[:5] %}
+                      <div>{{ url|truncate(100) }}</div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.negative_page_targets %}
+                  <div class="col-md-6">
+                    <div class="subheader">Negative page targets</div>
+                    <div class="text-secondary small">
+                      {% for url in draft.generated_assets.negative_page_targets[:5] %}
+                      <div>{{ url|truncate(100) }}</div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.keyword_clusters %}
+                  <div class="col-md-6">
+                    <div class="subheader">Exact clusters</div>
+                    <div class="text-secondary small">
+                      {% for cluster in draft.generated_assets.keyword_clusters[:4] %}
+                      <div>{{ cluster.ad_group_name }}{% if cluster.exact_terms %}: {{ cluster.exact_terms[:4]|join(", ") }}{% endif %}</div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.google_keyword_plan and draft.generated_assets.google_keyword_plan.terms %}
+                  <div class="col-md-6">
+                    <div class="subheader">Google keyword terms</div>
+                    <div class="d-flex flex-wrap gap-1">
+                      {% for term in draft.generated_assets.google_keyword_plan.terms[:20] %}
+                      <span class="badge bg-azure-lt">{{ term }}</span>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.source_terms %}
+                  <div class="col-md-6">
+                    <div class="subheader">Source terms</div>
+                    <div class="d-flex flex-wrap gap-1">
+                      {% for term in draft.generated_assets.source_terms %}
+                      <span class="badge bg-green-lt">{{ term }}</span>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.generated_assets.publish_result %}
+                  <div class="col-12">
+                    {% set result = draft.generated_assets.publish_result %}
+                    <div class="alert {% if result.ok %}alert-success{% else %}alert-danger{% endif %} mb-0">
+                      {% if result.blockers %}
+                      {% for blocker in result.blockers %}
+                      <div>{{ blocker }}</div>
+                      {% endfor %}
+                      {% endif %}
+                      {% if result.warnings %}
+                      {% for warning in result.warnings %}
+                      <div>{{ warning }}</div>
+                      {% endfor %}
+                      {% endif %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.validation_json.errors %}
+                  <div class="col-12">
+                    <div class="alert alert-warning mb-0">
+                      {% for error in draft.validation_json.errors %}
+                      <div>{{ error }}</div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                  {% if draft.validation_json.warnings %}
+                  <div class="col-12">
+                    <div class="text-secondary small">
+                      {% for warning in draft.validation_json.warnings %}
+                      <div>{{ warning }}</div>
+                      {% endfor %}
+                    </div>
+                  </div>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="text-secondary">No ad drafts yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal modal-blur fade" id="deleteDraftModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm modal-dialog-centered" role="document">
+    <div class="modal-content">
+      <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      <div class="modal-status bg-danger"></div>
+      <div class="modal-body text-center py-4">
+        <i class="ti ti-alert-triangle icon mb-2 text-danger icon-lg"></i>
+        <h3>Delete draft?</h3>
+        <div class="text-secondary" id="delete-draft-modal-message">
+          This draft will be permanently deleted from Postgres.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <div class="w-100">
+          <div class="row">
+            <div class="col">
+              <button type="button" class="btn w-100" data-bs-dismiss="modal">No</button>
+            </div>
+            <div class="col">
+              <button type="button" class="btn btn-danger w-100" id="confirm-delete-draft">Yes, delete</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const accountInput = document.getElementById("account_id");
+  const accountSearch = document.getElementById("account_search");
+  const selectedAccountButton = document.getElementById("selected-account-button");
+  const insightsAccountInput = document.getElementById("insights_account_id");
+  const insightsAccountLabel = document.getElementById("insights-account-label");
+  const websiteUrlInput = document.getElementById("website_url");
+  const websiteUrlSource = document.getElementById("website-url-source");
+  const accountOptions = Array.from(document.querySelectorAll(".ad-account-option"));
+  const emptyAccount = document.querySelector(".ad-account-empty");
+  const digitOnly = (value) => String(value || "").replace(/\D+/g, "");
+  const emptyWebsiteShells = new Set(["", "http://", "https://"]);
+
+  function setMappedWebsite(option) {
+    if (!websiteUrlInput) return;
+    const mappedUrl = option.dataset.websiteUrl || "";
+    const mappedSource = option.dataset.websiteSource || "";
+    const previousAutofill = websiteUrlInput.dataset.autofillValue || "";
+    const current = (websiteUrlInput.value || "").trim();
+    const currentIsAutofill = emptyWebsiteShells.has(current.toLowerCase()) || current === previousAutofill;
+    if (mappedUrl) {
+      websiteUrlInput.value = mappedUrl;
+      websiteUrlInput.dataset.autofillValue = mappedUrl;
+    } else if (currentIsAutofill) {
+      websiteUrlInput.value = "";
+      websiteUrlInput.dataset.autofillValue = "";
+    }
+    if (websiteUrlSource) {
+      websiteUrlSource.textContent = mappedSource ? `Mapped: ${mappedSource}` : "No mapped website";
+    }
+  }
+
+  function selectAccount(option) {
+    if (!option || !accountInput || !selectedAccountButton) return;
+    accountInput.value = option.dataset.accountId || "";
+    selectedAccountButton.textContent = option.dataset.accountLabel || option.textContent.trim();
+    if (insightsAccountInput) insightsAccountInput.value = option.dataset.accountId || "";
+    if (insightsAccountLabel) insightsAccountLabel.value = option.dataset.accountLabel || option.textContent.trim();
+    setMappedWebsite(option);
+    accountOptions.forEach((item) => item.classList.toggle("active", item === option));
+  }
+
+  function filterAccounts() {
+    const term = (accountSearch?.value || "").trim().toLowerCase();
+    const digits = digitOnly(term);
+    let visible = 0;
+    accountOptions.forEach((option) => {
+      const name = option.dataset.accountName || "";
+      const label = (option.dataset.accountLabel || "").toLowerCase();
+      const accountNumber = digitOnly(option.dataset.accountNumber || "");
+      const matchesText = !term || name.includes(term) || label.includes(term);
+      const matchesDigits = digits && accountNumber.includes(digits);
+      const matches = matchesText || Boolean(matchesDigits);
+      option.classList.toggle("d-none", !matches);
+      if (matches) visible += 1;
+    });
+    emptyAccount?.classList.toggle("d-none", visible !== 0);
+  }
+
+  accountOptions.forEach((option) => {
+    option.addEventListener("click", () => {
+      selectAccount(option);
+      if (accountSearch) {
+        accountSearch.value = "";
+        filterAccounts();
+      }
+    });
+  });
+  accountSearch?.addEventListener("input", filterAccounts);
+  document.querySelector(".ad-account-picker")?.addEventListener("shown.bs.dropdown", () => {
+    accountSearch?.focus();
+    accountSearch?.select();
+  });
+
+  const select = document.getElementById("bidding_strategy");
+  const targetRoas = document.querySelector('[data-bidding-field="target-roas"]');
+  const maxCpc = document.querySelector('[data-bidding-field="max-cpc"]');
+  const targetInput = document.getElementById("target_roas_percent");
+  const cpcInput = document.getElementById("max_cpc_bid_limit");
+  function renderBiddingFields() {
+    const value = select ? select.value : "";
+    const usesTarget = value === "maximize_conversion_value_target_roas";
+    const usesCpc = value === "maximize_clicks";
+    targetRoas?.classList.toggle("d-none", !usesTarget);
+    maxCpc?.classList.toggle("d-none", !usesCpc);
+    if (targetInput) targetInput.required = usesTarget;
+    if (cpcInput) cpcInput.required = usesCpc;
+  }
+  select?.addEventListener("change", renderBiddingFields);
+  renderBiddingFields();
+
+  const adTypeSelect = document.getElementById("ad_type");
+  const rsaSourceSelect = document.getElementById("rsa_source_mode");
+  const rsaOptions = document.querySelector("[data-rsa-options]");
+  const rsaKeywordOptions = document.querySelector("[data-rsa-keyword-options]");
+  function renderRsaSourceFields() {
+    const isRsa = adTypeSelect?.value === "rsa";
+    const usesGoogleKeywords = isRsa && rsaSourceSelect?.value === "google_keywords";
+    rsaOptions?.classList.toggle("d-none", !isRsa);
+    rsaKeywordOptions?.classList.toggle("d-none", !usesGoogleKeywords);
+  }
+  adTypeSelect?.addEventListener("change", renderRsaSourceFields);
+  rsaSourceSelect?.addEventListener("change", renderRsaSourceFields);
+  renderRsaSourceFields();
+
+  const deleteModalEl = document.getElementById("deleteDraftModal");
+  const deleteMessage = document.getElementById("delete-draft-modal-message");
+  const confirmDelete = document.getElementById("confirm-delete-draft");
+  let pendingDeleteForm = null;
+
+  document.querySelectorAll(".js-delete-draft-form").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      pendingDeleteForm = form;
+      const draftId = form.dataset.draftId || "";
+      const account = form.dataset.draftAccount || "this account";
+      if (deleteMessage) {
+        deleteMessage.textContent = `Delete draft #${draftId} for ${account} from Postgres? This cannot be undone.`;
+      }
+      const modal = window.bootstrap && deleteModalEl ? window.bootstrap.Modal.getOrCreateInstance(deleteModalEl) : null;
+      modal?.show();
+    });
+  });
+
+  confirmDelete?.addEventListener("click", () => {
+    if (!pendingDeleteForm) return;
+    confirmDelete.disabled = true;
+    confirmDelete.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status"></span>Deleting';
+    pendingDeleteForm.submit();
+  });
+})();
+</script>
+{% endblock %}

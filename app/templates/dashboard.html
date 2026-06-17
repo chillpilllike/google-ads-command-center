@@ -1,0 +1,123 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Operations</div>
+    <h2 class="page-title">One-click Google Ads strategies</h2>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+<div class="row row-cards mb-3">
+  <div class="col-sm-4">
+    <div class="card"><div class="card-body"><div class="subheader">Accounts</div><div class="h1 mb-0">{{ counts.accounts }}</div></div></div>
+  </div>
+  <div class="col-sm-4">
+    <a class="card card-link" href="/jobs"><div class="card-body"><div class="subheader">Queued jobs</div><div class="h1 mb-0">{{ counts.queued }}</div></div></a>
+  </div>
+  <div class="col-sm-4">
+    <a class="card card-link" href="/jobs"><div class="card-body"><div class="subheader">Running jobs</div><div class="h1 mb-0">{{ counts.running }}</div></div></a>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body">
+    <div class="row g-3 align-items-center">
+      <div class="col-md">
+        <div class="d-flex align-items-center gap-2 mb-1">
+          <span class="badge bg-{{ google_ads_status.status_tone }}-lt">{{ google_ads_status.status_label }}</span>
+          <span class="fw-semibold">Google Ads connection</span>
+        </div>
+        <div class="text-secondary">
+          Gmail: {{ google_ads_status.connected_email }} ·
+          Accounts: {{ google_ads_status.account_count }} ·
+          Managers: {{ google_ads_status.manager_count }} ·
+          Currencies: {{ google_ads_status.currency_summary }}
+        </div>
+      </div>
+      <div class="col-md-auto">
+        <a class="btn btn-outline-primary" href="/settings">
+          <i class="ti ti-settings me-2"></i>
+          View connection settings
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<form class="row row-cards" method="post" action="/runs">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Strategies</h3></div>
+      <div class="list-group list-group-flush">
+        {% for strategy in strategies %}
+        <label class="list-group-item">
+          <input class="form-check-input me-2" type="checkbox" name="strategy_keys" value="{{ strategy.key }}" {% if loop.first %}checked{% endif %}>
+          <span class="fw-semibold">{{ strategy.name }}</span>
+          {% if strategy.is_destructive %}<span class="badge bg-red-lt ms-2">Apply</span>{% endif %}
+          <div class="text-secondary small mt-1">{{ strategy.description }}</div>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Accounts</h3>
+        <div class="card-actions">
+          <button class="btn btn-primary" type="submit">
+            <i class="ti ti-player-play me-2"></i>
+            Queue selected
+          </button>
+        </div>
+      </div>
+      <div class="table-responsive account-table">
+        <table class="table table-vcenter card-table table-striped">
+          <thead>
+            <tr>
+              <th class="w-1"></th>
+              <th>Account</th>
+              <th>Customer ID</th>
+              <th>Manager</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for account in accounts %}
+            <tr>
+              <td><input class="form-check-input" type="checkbox" name="account_ids" value="{{ account.id }}"></td>
+              <td class="fw-semibold">{{ account.name }}</td>
+              <td class="text-secondary">{{ account.customer_id }}</td>
+              <td class="text-secondary">{{ account.manager_name }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</form>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">Recent runs</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>ID</th><th>Status</th><th>Strategies</th><th>Accounts</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for run in runs %}
+        <tr>
+          <td><a href="/runs/{{ run.id }}">#{{ run.id }}</a></td>
+          <td><span class="badge bg-blue-lt">{{ run.status.value }}</span></td>
+          <td>{{ run.strategy_keys|join(", ") }}</td>
+          <td>{{ run.account_ids|length }}</td>
+          <td class="text-secondary">{{ run.created_at.strftime("%Y-%m-%d %H:%M") if run.created_at else "" }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-secondary">No strategy runs yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

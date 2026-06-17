@@ -1,0 +1,48 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Account</div>
+    <h2 class="page-title">User Settings</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <button class="btn btn-primary" type="submit" form="user-settings-form">
+      <i class="ti ti-device-floppy me-2"></i>
+      Save user
+    </button>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">User settings saved to Postgres.</div>
+{% endif %}
+{% if error %}
+<div class="alert alert-danger" role="alert">{{ error }}</div>
+{% endif %}
+<div class="row row-cards">
+  <div class="col-lg-6">
+    <form id="user-settings-form" class="card" method="post" action="/user-settings">
+      <div class="card-header">
+        <h3 class="card-title">Login</h3>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label" for="username">Username</label>
+          <input class="form-control" id="username" type="text" name="username" value="{{ user.email }}" required>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="current_password">Current password</label>
+          <input class="form-control" id="current_password" type="password" name="current_password" autocomplete="current-password">
+          <div class="form-hint">Required only when changing password.</div>
+        </div>
+        <div>
+          <label class="form-label" for="new_password">New password</label>
+          <input class="form-control" id="new_password" type="password" name="new_password" autocomplete="new-password">
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

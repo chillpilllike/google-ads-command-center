@@ -1,0 +1,210 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Hosted CSV for Google Ads</div>
+    <h2 class="page-title">Page Feeds</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/settings">
+      <i class="ti ti-settings me-2"></i>
+      Page feed settings
+    </a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if generated %}
+<div class="alert alert-success" role="alert">Generated {{ generated_count or 0 }} hosted page feed URL{% if generated_count != "1" %}s{% endif %}. No Google Ads API calls were used.</div>
+{% endif %}
+{% if no_mappings %}
+<div class="alert alert-warning" role="alert">No active Odoo store to Google Ads mappings matched those filters.</div>
+{% endif %}
+
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <form class="card" method="get" action="/page-feeds">
+      <div class="card-header">
+        <h3 class="card-title">Filter</h3>
+      </div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label" for="filter-store">Odoo store</label>
+          <select class="form-select" id="filter-store" name="store_id">
+            <option value="">All stores</option>
+            {% for store in stores %}
+            <option value="{{ store.id }}" {% if selected_store_id == store.id %}selected{% endif %}>{{ store.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="filter-website">Website</label>
+          <select class="form-select" id="filter-website" name="website_id">
+            <option value="">All websites</option>
+            <option value="0" {% if selected_website_id == 0 %}selected{% endif %}>All websites mapping</option>
+            {% for website in websites %}
+            <option value="{{ website.website_id }}" {% if selected_website_id == website.website_id %}selected{% endif %}>{{ website.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="filter-account">Google Ads account</label>
+          <select class="form-select" id="filter-account" name="account_id">
+            <option value="">All accounts</option>
+            {% for account in accounts %}
+            <option value="{{ account.id }}" {% if selected_account_id == account.id %}selected{% endif %}>{{ account.name }} · {{ account.customer_id }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="filter-kind">Feed kind</label>
+          <select class="form-select" id="filter-kind" name="feed_kind">
+            <option value="">All feed kinds</option>
+            {% for key, label in feed_kinds.items() %}
+            <option value="{{ key }}" {% if selected_feed_kind == key %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-outline-primary w-100" type="submit">
+          <i class="ti ti-filter me-2"></i>
+          Apply filters
+        </button>
+      </div>
+    </form>
+
+    <form class="card mt-3" method="post" action="/page-feeds/generate">
+      <div class="card-header">
+        <h3 class="card-title">Generate URLs</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" name="store_id" value="{{ selected_store_id }}">
+        <input type="hidden" name="account_id" value="{{ selected_account_id }}">
+        <input type="hidden" name="website_id" value="{{ selected_website_id }}">
+        <label class="form-label">Feed kinds</label>
+        {% for key, label in feed_kinds.items() %}
+        <label class="form-check">
+          <input class="form-check-input" type="checkbox" name="feed_kinds" value="{{ key }}" {% if key in ["best", "good", "new"] %}checked{% endif %}>
+          <span class="form-check-label">{{ label }}</span>
+        </label>
+        {% endfor %}
+        <div class="mt-3">
+          <label class="form-label" for="max-urls">Max URLs per feed</label>
+          <input class="form-control" id="max-urls" name="max_urls" type="number" min="1" max="5000000" value="{{ page_feed_default_max_urls }}">
+        </div>
+        <div class="form-hint mt-3">Uses the filters above. The hosted CSV updates when Odoo page signals change; Google may still need a scheduled refresh or a fresh feed upload depending on how you attached it.</div>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit">
+          <i class="ti ti-file-spreadsheet me-2"></i>
+          Generate page feed URLs
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h3 class="card-title">How campaigns should use these feeds</h3>
+      </div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <div class="subheader">Stable feed names</div>
+            <div class="text-secondary small">Use the feed name shown below in Google Ads Business data. Campaigns should attach that feed name without the <code>.csv</code> extension.</div>
+          </div>
+          <div class="col-md-6">
+            <div class="subheader">Separate campaign lanes</div>
+            <div class="text-secondary small">Best-products campaigns attach the best feed, good-products campaigns attach the good feed, and discovery campaigns attach the new feed.</div>
+          </div>
+          <div class="col-md-6">
+            <div class="subheader">When products move</div>
+            <div class="text-secondary small">A product promoted into good or best appears in that feed on the next generation. Keep campaign-to-feed mapping stable.</div>
+          </div>
+          <div class="col-md-6">
+            <div class="subheader">Refresh behavior</div>
+            <div class="text-secondary small">If Google is configured to fetch the URL on a schedule, the same file URL can refresh. If it was uploaded once manually, create or update the feed in Google Ads again.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Generated hosted page feeds</h3>
+        <div class="card-actions text-secondary small">Base URL: {{ page_feed_base_url }}</div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Store / account</th>
+              <th>Feed</th>
+              <th>URL</th>
+              <th>Status</th>
+              <th>Rows</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in page_feed_rows %}
+            {% set publication = row.publication %}
+            {% set result = row.result %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ publication.store.name }}</div>
+                <div class="text-secondary small">{{ publication.website_name }}</div>
+                <div class="text-secondary small">{{ publication.account.name }} · {{ publication.account.customer_id }}</div>
+              </td>
+              <td>
+                <span class="badge bg-blue-lt">{{ result.feed_kind_label }}</span>
+                <div class="fw-semibold mt-1">{{ result.feed_name }}</div>
+                <div class="text-secondary small">File: {{ result.filename }}</div>
+              </td>
+              <td class="page-feed-url-cell">
+                {% if result.feed_url %}
+                <a class="small" href="{{ result.feed_url }}" target="_blank" rel="noreferrer">{{ result.feed_url }}</a>
+                {% else %}
+                <span class="text-danger small">Set Page feeds → Public frontend URL in Settings after hosting.</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if publication.status == "feed_url_ready" %}
+                <span class="badge bg-green-lt">feed URL ready</span>
+                {% elif publication.status == "published" %}
+                <span class="badge bg-green-lt">api published</span>
+                {% elif publication.status == "validated" %}
+                <span class="badge bg-blue-lt">api validated</span>
+                {% elif publication.status == "failed" %}
+                <span class="badge bg-red-lt">failed</span>
+                {% else %}
+                <span class="badge bg-secondary-lt">{{ publication.status }}</span>
+                {% endif %}
+                {% if publication.last_error %}
+                <div class="text-danger small mt-1">{{ publication.last_error|truncate(140, True, "...") }}</div>
+                {% endif %}
+              </td>
+              <td class="text-secondary small">
+                URLs: {{ result.selected_urls or 0 }}<br>
+                API calls: {{ result.api_calls_used or 0 }}<br>
+                {{ publication.updated_at.strftime("%Y-%m-%d %H:%M") if publication.updated_at else "" }}
+                {% if result.custom_labels %}
+                <div class="mt-1">
+                  {% for label in result.custom_labels[:4] %}<span class="badge bg-secondary-lt me-1">{{ label }}</span>{% endfor %}
+                  {% if result.custom_labels|length > 4 %}<span class="badge bg-secondary-lt">+{{ result.custom_labels|length - 4 }}</span>{% endif %}
+                </div>
+                {% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-secondary">No hosted page feeds yet. Generate them from the form on this page.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

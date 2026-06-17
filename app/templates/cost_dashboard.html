@@ -1,0 +1,821 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Cost and revenue</div>
+    <h2 class="page-title">Cost Dashboard</h2>
+  </div>
+  <div class="col-12 col-lg-auto ms-lg-auto d-flex flex-wrap gap-2 justify-content-lg-end">
+    <div class="btn-list">
+      <a class="btn {% if period == 'yesterday' %}btn-primary{% else %}btn-outline-primary{% endif %}" href="/cost-dashboard?days=1&period=yesterday">Yesterday</a>
+      {% for option in [1, 7, 30, 90] %}
+      <a class="btn {% if period != 'yesterday' and days == option %}btn-primary{% else %}btn-outline-primary{% endif %}" href="/cost-dashboard?days={{ option }}">{{ "Daily" if option == 1 else option ~ "d" }}</a>
+      {% endfor %}
+    </div>
+    <form method="post" action="/sync/google-ads">
+      <input type="hidden" name="days" value="{{ days }}">
+      <input type="hidden" name="period" value="{{ period if period == 'yesterday' else '' }}">
+      <button class="btn btn-outline-primary" type="submit"><i class="ti ti-refresh me-2"></i>Sync Google Ads</button>
+    </form>
+    <form method="post" action="/sync/razorpay">
+      <input type="hidden" name="days" value="{{ days }}">
+      <input type="hidden" name="period" value="{{ period if period == 'yesterday' else '' }}">
+      <button class="btn btn-outline-primary" type="submit"><i class="ti ti-refresh me-2"></i>Sync Razorpay</button>
+    </form>
+    <a class="btn btn-outline-secondary" href="/jobs"><i class="ti ti-list-check me-2"></i>Background jobs</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% set filter_accounts = account_filter_rows|default(account_rows|default([], true), true) %}
+{% set google_ads_alert = request.state.google_ads_api_error_alert|default({"manual_action_count": 0, "manual_action_errors": []}) %}
+{% set manual_action_errors = google_ads_alert.manual_action_errors|default([], true) %}
+{% if google_ads_alert.manual_action_count|default(0) %}
+<div class="alert alert-danger" role="alert">
+  <div class="d-flex gap-3">
+    <span class="avatar avatar-sm bg-red text-white"><i class="ti ti-alert-triangle"></i></span>
+    <div class="w-100">
+      <div class="fw-semibold">Manual Google Ads action needed</div>
+      <div class="small mb-2">A budget or critical Google Ads change failed, often because the API quota/limit was hit. Review these accounts directly in Google Ads and apply the blocked action manually if it is still needed.</div>
+      <ul class="mb-2 ps-3">
+        {% for error in manual_action_errors[:4] %}
+        <li>
+          <span class="fw-semibold">{% if error.account %}{{ error.account }}{% else %}Google Ads{% endif %}{% if error.customer_id %} · {{ error.customer_id }}{% endif %}</span>
+          {% if error.action_type %}<span class="text-secondary"> · {{ error.action_type|replace("_", " ") }}</span>{% endif %}
+          {% if error.error_code %}<span class="badge bg-red-lt ms-1">{{ error.error_code }}</span>{% endif %}
+          <div class="small text-secondary">{{ error.message|truncate(180, True, "...") }}</div>
+        </li>
+        {% endfor %}
+      </ul>
+      <div class="btn-list">
+        <a class="btn btn-sm btn-outline-danger" href="/jobs"><i class="ti ti-list-check me-1"></i>Open jobs</a>
+        <form method="post" action="/google-ads-errors/acknowledge" class="mb-0">
+          <input type="hidden" name="next_url" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}">
+          <button class="btn btn-sm btn-danger" type="submit">Mark reviewed</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% if synced %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>
+    Manual sync queued as {% if sync_job_id %}job #{{ sync_job_id }}{% else %}a background job{% endif %}. This page shows the last saved Postgres snapshot until the worker finishes.
+  </div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs{% if sync_job_id %}#job-{{ sync_job_id }}{% endif %}">View jobs</a>
+</div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-body">
+    <div class="row g-3 align-items-center">
+      <div class="col-lg">
+        <div class="subheader">Account filter</div>
+        <div class="h3 mb-1" id="selected-account-count">{{ filter_accounts|length }}/{{ filter_accounts|length }} selected</div>
+        <div class="text-secondary" id="selected-currency-summary">{{ ad_cost }}</div>
+        <div class="text-secondary small mt-1" id="selected-sync-coverage">Showing saved data from the last manual sync.</div>
+        <div class="text-secondary small mt-1" id="selected-rate-status">Exchange rates load from Postgres.</div>
+        <div class="text-secondary small">Saved Google Ads data through {{ metric_end_date or "no synced date" }}. Snapshot: {{ snapshot_generated_at or "not generated yet" }}. Google Ads API runs only when Sync Google Ads is clicked.</div>
+      </div>
+      <div class="col-12 col-lg-auto">
+        <div class="btn-list justify-content-lg-end">
+          <div class="dropdown">
+            <button class="btn btn-outline-primary dropdown-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside">
+              <i class="ti ti-filter me-2"></i>
+              Accounts
+            </button>
+            <div class="dropdown-menu dropdown-menu-end account-filter-menu p-0">
+              <div class="p-2 border-bottom">
+                <input class="form-control form-control-sm" id="account-filter-search" type="search" placeholder="Search accounts">
+              </div>
+              <div class="account-filter-list">
+                {% for row in filter_accounts %}
+                <label class="dropdown-item account-filter-option" data-account-name="{{ row.account_name|lower }} {{ row.customer_id }}">
+                  <input class="form-check-input me-2 account-filter-checkbox" type="checkbox" value="{{ row.account_id }}" checked>
+                  <span>
+                    <span class="d-block">{{ row.account_name }}</span>
+                    <span class="text-secondary small">{{ row.customer_id }} · {{ row.currency_code or "UNKNOWN" }}</span>
+                  </span>
+                </label>
+                {% endfor %}
+              </div>
+              <div class="p-2 border-top">
+                <div class="btn-list">
+                  <button class="btn btn-sm btn-primary" type="button" id="select-all-accounts">Select all</button>
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="clear-all-accounts">Clear</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-outline-secondary" type="button" id="reset-account-filter">
+            <i class="ti ti-refresh me-2"></i>
+            Reset
+          </button>
+          <form id="selected-google-ads-sync-form" method="post" action="/sync/google-ads/accounts">
+            <input type="hidden" name="days" value="{{ days }}">
+            <input type="hidden" name="period" value="{{ period if period == 'yesterday' else '' }}">
+            <span id="selected-sync-account-inputs"></span>
+            <button class="btn btn-outline-primary" id="selected-sync-button" type="submit">
+              <i class="ti ti-cloud-download me-2"></i>
+              Sync selected
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-3">
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Ad cost converted</div>
+        <div class="h1 mb-0 dashboard-money-total" id="metric-ad-cost">{{ ad_cost }}</div>
+        <div class="text-secondary small">INR first, then USD and AUD</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Yesterday cost converted</div>
+        <div class="h1 mb-0 dashboard-money-total" id="metric-yesterday-cost">{{ yesterday_cost|default("0.00", true) }}</div>
+        <div class="text-secondary small" id="metric-yesterday-label">{{ yesterday_date|default("", true) }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="subheader">Conversion value converted</div>
+        <div class="h1 mb-0 dashboard-money-total" id="metric-conversion-value">{{ conversion_value }}</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="card"><div class="card-body"><div class="subheader">ROAS</div><div class="h1 mb-0" id="metric-roas">{{ roas }}</div></div></div>
+  </div>
+  <div class="col-sm-6 col-xl-3">
+    <div class="card"><div class="card-body"><div class="subheader">Conversions</div><div class="h1 mb-0" id="metric-conversions">{{ conversions }}</div></div></div>
+  </div>
+</div>
+
+<div class="row row-cards mb-3">
+  {% for card in action_cards %}
+  <div class="col-md-6 col-xl">
+    <div class="card">
+      <div class="card-body">
+        <div class="d-flex align-items-center mb-2">
+          <span class="avatar avatar-sm me-2 bg-{{ card.tone }}-lt"><i class="ti {{ card.icon }}"></i></span>
+          <div class="fw-semibold">{{ card.title }}</div>
+        </div>
+        <div class="text-secondary small">{{ card.summary }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="row row-cards mb-3">
+  <div class="col-xl-7">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Spend guard snapshots</h3>
+        <div class="card-actions"><a class="btn btn-outline-secondary btn-sm" href="/stores"><i class="ti ti-building-store me-1"></i>Odoo mappings</a></div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Account</th><th>Status</th><th>Sales INR</th><th>Margin INR</th><th>Ad cost INR</th><th>Basis</th><th>Ratio</th></tr></thead>
+          <tbody>
+            {% for guard in spend_guard_rows|default([], true) %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ guard.account_name }}</div>
+                <div class="text-secondary small">{{ guard.customer_id }}{% if guard.priority_account %} · priority{% endif %}</div>
+              </td>
+              <td>
+                {% if guard.status == "red" %}
+                <span class="badge bg-red-lt">Red</span>
+                {% elif guard.status == "amber" %}
+                <span class="badge bg-yellow-lt">Amber</span>
+                {% else %}
+                <span class="badge bg-green-lt">Green</span>
+                {% endif %}
+              </td>
+              <td>{{ "INR {:,.2f}".format(guard.sales_inr or 0) }}</td>
+              <td>{{ "INR {:,.2f}".format(guard.margin_inr or 0) }}</td>
+              <td>{{ "INR {:,.2f}".format(guard.ad_cost_inr or 0) }}</td>
+              <td>
+                {% if guard.basis_mode == "odoo_margin" %}
+                Margin
+                {% else %}
+                Gross sales
+                {% endif %}
+                <div class="text-secondary small">{{ "INR {:,.2f}".format(guard.budget_basis_inr or 0) }}</div>
+                <div class="text-secondary small">
+                  Cap {{ "{:,.0f}%".format((guard.max_ratio or 0) * 100) }}{% if guard.priority_extra_applied %} with priority extra{% endif %}
+                </div>
+                {% if guard.allowed_spend_inr %}
+                <div class="text-secondary small">Allowed {{ "INR {:,.2f}".format(guard.allowed_spend_inr or 0) }}</div>
+                {% endif %}
+              </td>
+              <td>{{ "{:,.1f}%".format((guard.spend_ratio or 0) * 100) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="text-secondary">No spend guard snapshots yet. Run Autopilot after Odoo sales are synced.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-xl-5">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Confirmed Odoo sales, last 12h</h3>
+        <div class="card-actions"><a class="btn btn-outline-primary btn-sm" href="/stores"><i class="ti ti-refresh me-1"></i>Sync stores</a></div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Store</th><th>Website</th><th>Currency</th><th>Orders</th><th>Sales</th><th>Margin</th></tr></thead>
+          <tbody>
+            {% for sale in odoo_sales_rows|default([], true) %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ sale.store_name }}</div>
+                <div class="text-secondary small">{{ sale.last_order_at[:19] if sale.last_order_at else "" }}</div>
+              </td>
+              <td>
+                <div>{{ sale.website_name }}</div>
+                {% if sale.website_id %}<div class="text-secondary small">Website {{ sale.website_id }}</div>{% endif %}
+              </td>
+              <td>{{ sale.currency }}</td>
+              <td>{{ sale.orders }}</td>
+              <td>{{ "{:,.2f}".format(sale.amount or 0) }}</td>
+              <td>{{ "{:,.2f}".format(sale.margin or 0) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No confirmed Odoo sales have been synced yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-3">
+  <div class="col-sm-6 col-lg-3">
+    <div class="card"><div class="card-body"><div class="subheader">Accounts with spend</div><div class="h1 mb-0" id="metric-accounts">{{ synced_accounts_count }}/{{ total_accounts_count }}</div></div></div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card"><div class="card-body"><div class="subheader">Synced campaigns</div><div class="h1 mb-0" id="metric-campaigns">{{ synced_campaign_count }}</div></div></div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card"><div class="card-body"><div class="subheader">Paused spend</div><div class="h1 mb-0 dashboard-money-total" id="metric-paused-spend">{{ paused_cost }}</div></div></div>
+  </div>
+  <div class="col-sm-6 col-lg-3">
+    <div class="card"><div class="card-body"><div class="subheader">Clicks</div><div class="h1 mb-0" id="metric-clicks">{{ clicks }}</div></div></div>
+  </div>
+</div>
+
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Ad cost by currency</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Currency</th><th>Raw cost</th><th>INR cost</th><th>Value</th><th>ROAS</th></tr></thead>
+          <tbody id="ad-breakdown-body">
+            <tr><td colspan="5" class="text-secondary">Loading selected Google Ads cost data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Razorpay totals</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Currency</th><th>Captured</th><th>Fees</th><th>Payments</th></tr></thead>
+          <tbody>
+            {% for row in receipt_rows %}
+            <tr>
+              <td>{{ row.currency }}</td>
+              <td>{{ "{:,.2f}".format((row.amount or 0) / 100) }}</td>
+              <td>{{ "{:,.2f}".format(((row.fee or 0) + (row.tax or 0)) / 100) }}</td>
+              <td>{{ row.count or 0 }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-secondary">No Razorpay sync data yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Daily performance</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Date</th><th>Raw spend</th><th>Cost INR</th><th>ROAS</th></tr></thead>
+          <tbody id="daily-performance-body">
+            <tr><td colspan="4" class="text-secondary">Loading selected daily performance.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mt-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Top accounts by spend</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Account</th><th>Currency</th><th>Cost</th><th>Value</th><th>ROAS</th><th>Conv.</th></tr></thead>
+          <tbody id="account-rows-body">
+            <tr><td colspan="6" class="text-secondary">Loading selected account metrics.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Daily Razorpay received</h3></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Date</th><th>Currency</th><th>Captured</th><th>Payments</th></tr></thead>
+          <tbody>
+            {% for row in receipt_daily_rows %}
+            <tr>
+              <td>{{ row.receipt_date }}</td>
+              <td>{{ row.currency }}</td>
+              <td>{{ "{:,.2f}".format((row.amount or 0) / 100) }}</td>
+              <td>{{ row.count or 0 }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-secondary">No daily Razorpay sync data yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">Daily account drilldown</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Date</th><th>Account</th><th>Currency</th><th>Cost</th><th>Value</th><th>ROAS</th><th>Conv.</th><th>Clicks</th></tr></thead>
+      <tbody id="daily-account-rows-body">
+        <tr><td colspan="8" class="text-secondary">Loading selected daily account metrics.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">Top campaigns by spend</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Account</th><th>Campaign</th><th>Status</th><th>Channel</th><th>Currency</th><th>Cost</th><th>Value</th><th>ROAS</th><th>Conv.</th></tr></thead>
+      <tbody id="campaign-rows-body">
+        <tr><td colspan="9" class="text-secondary">Loading selected campaign metrics.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header"><h3 class="card-title">Strategy recommendations</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Account</th><th>Campaign</th><th>Severity</th><th>Recommendation</th></tr></thead>
+      <tbody>
+        {% for recommendation in recommendations %}
+        <tr>
+          <td>{{ recommendation.account_name }}</td>
+          <td>{{ recommendation.campaign_name or "Account" }}</td>
+          <td>
+            {% if recommendation.severity == "risk" %}
+            <span class="badge bg-red-lt">{{ recommendation.severity }}</span>
+            {% elif recommendation.severity == "opportunity" %}
+            <span class="badge bg-green-lt">{{ recommendation.severity }}</span>
+            {% else %}
+            <span class="badge bg-blue-lt">{{ recommendation.severity }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="fw-semibold">{{ recommendation.title }}</div>
+            <div class="text-secondary">{{ recommendation.summary }}</div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-secondary">No recommendations yet. Sync Google Ads data first.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script id="account-filter-data" type="application/json">{{ {"accounts": filter_accounts, "daily": daily_account_rows|default([], true), "yesterday": yesterday_account_rows|default([], true), "campaigns": campaign_rows|default([], true), "yesterday_campaigns": yesterday_campaign_rows|default([], true), "yesterday_date": yesterday_date|default("", true), "period": period|default("range", true), "currency_rates": currency_rates|default({}, true)}|tojson }}</script>
+<script>
+(function () {
+  const payloadEl = document.getElementById("account-filter-data");
+  if (!payloadEl) return;
+
+  const payload = JSON.parse(payloadEl.textContent || "{}");
+  const accounts = payload.accounts || [];
+  const dailyRows = payload.daily || [];
+  const yesterdayRows = payload.yesterday || [];
+  const campaignRows = payload.campaigns || [];
+  const yesterdayCampaignRows = payload.yesterday_campaigns || [];
+  const yesterdayDate = String(payload.yesterday_date || "");
+  const isYesterdayView = payload.period === "yesterday";
+  const selected = new Set(accounts.map((row) => String(row.account_id)));
+
+  const currencyRates = payload.currency_rates || {};
+  const rates = Object.assign({ USD: 1 }, currencyRates.rates || {});
+  const displayCurrencies = ["INR", "USD", "AUD"];
+
+  const money = (value) => Number(value || 0).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const whole = (value) => Number(value || 0).toLocaleString(undefined, {
+    maximumFractionDigits: 0,
+  });
+  const micros = (value) => Number(value || 0) / 1000000;
+  const roas = (value, cost) => cost > 0 ? money(value / cost) : "n/a";
+  const currency = (value) => String(value || "UNKNOWN").trim().toUpperCase() || "UNKNOWN";
+  const convert = (amount, from, to) => {
+    const source = currency(from);
+    const target = currency(to);
+    if (source === target) return Number(amount || 0);
+    const sourceRate = Number(rates[source] || 0);
+    const targetRate = Number(rates[target] || 0);
+    if (!sourceRate || !targetRate) return null;
+    return (Number(amount || 0) / sourceRate) * targetRate;
+  };
+  const moneyCurrency = (code, value) => `${code} ${money(value)}`;
+  const rawWithConverted = (amount, from, target = "INR") => {
+    const converted = convert(amount, from, target);
+    if (converted === null) return "Rate missing";
+    return moneyCurrency(target, converted);
+  };
+  const hasSignal = (row) => (
+    Number(row.cost_micros || 0) > 0 ||
+    Number(row.value || 0) > 0 ||
+    Number(row.conversions || 0) > 0 ||
+    Number(row.clicks || 0) > 0
+  );
+  const text = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  const setHtml = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = value;
+  };
+  const html = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  }[char]));
+  const selectedAccountRows = () => accounts.filter((row) => selected.has(String(row.account_id)));
+  const selectedDailyRows = () => dailyRows.filter((row) => selected.has(String(row.account_id)));
+  const selectedYesterdayRows = () => yesterdayRows.filter((row) => selected.has(String(row.account_id)));
+  const selectedCampaignRows = () => campaignRows.filter((row) => selected.has(String(row.account_id)));
+  const selectedYesterdayCampaignRows = () => yesterdayCampaignRows.filter((row) => selected.has(String(row.account_id)));
+
+  function byCurrency(rows) {
+    const groups = new Map();
+    rows.forEach((row) => {
+      if (!hasSignal(row)) return;
+      const currency = row.currency_code || row.currency || "UNKNOWN";
+      const current = groups.get(currency) || { currency, cost: 0, value: 0, conversions: 0, clicks: 0 };
+      current.cost += micros(row.cost_micros);
+      current.value += Number(row.value || 0);
+      current.conversions += Number(row.conversions || 0);
+      current.clicks += Number(row.clicks || 0);
+      groups.set(currency, current);
+    });
+    return Array.from(groups.values()).sort((a, b) => b.cost - a.cost || a.currency.localeCompare(b.currency));
+  }
+
+  function convertedTotals(rows) {
+    const totals = {
+      cost: { INR: 0, USD: 0, AUD: 0 },
+      value: { INR: 0, USD: 0, AUD: 0 },
+      conversions: 0,
+      clicks: 0,
+      missing: new Set(),
+    };
+    rows.forEach((row) => {
+      if (!hasSignal(row)) return;
+      const rowCurrency = currency(row.currency_code || row.currency);
+      const rowCost = micros(row.cost_micros);
+      const rowValue = Number(row.value || 0);
+      displayCurrencies.forEach((target) => {
+        const convertedCost = convert(rowCost, rowCurrency, target);
+        const convertedValue = convert(rowValue, rowCurrency, target);
+        if (convertedCost === null || convertedValue === null) {
+          totals.missing.add(rowCurrency);
+          return;
+        }
+        totals.cost[target] += convertedCost;
+        totals.value[target] += convertedValue;
+      });
+      totals.conversions += Number(row.conversions || 0);
+      totals.clicks += Number(row.clicks || 0);
+    });
+    return totals;
+  }
+
+  function rawCurrencyText(groups, field) {
+    if (!groups.length) return "0.00";
+    return groups.map((row) => `${row.currency} ${money(row[field])}`).join(" / ");
+  }
+
+  function convertedRowsHtml(totals) {
+    return displayCurrencies.map((code) => `
+      <div class="dashboard-currency-row">
+        <span class="dashboard-currency-code">${code}</span>
+        <span class="dashboard-currency-value">${money(totals[code] || 0)}</span>
+      </div>
+    `).join("");
+  }
+
+  function rateStatus() {
+    const date = currencyRates.rate_date ? `Rates ${currencyRates.rate_date}` : "Rates not synced";
+    const fetched = currencyRates.fetched_at ? `, fetched ${String(currencyRates.fetched_at).slice(0, 10)}` : "";
+    const error = currencyRates.error ? ` (${currencyRates.error})` : "";
+    return `${date}${fetched}. Source: OpenExchange.${error}`;
+  }
+
+  function updateSelectedSyncInputs() {
+    const container = document.getElementById("selected-sync-account-inputs");
+    const button = document.getElementById("selected-sync-button");
+    if (!container) return;
+    container.innerHTML = Array.from(selected).map((accountId) => (
+      `<input type="hidden" name="account_ids" value="${html(accountId)}">`
+    )).join("");
+    if (button) button.disabled = selected.size === 0;
+  }
+
+  function renderAdBreakdown(groups) {
+    const tbody = document.getElementById("ad-breakdown-body");
+    if (!tbody) return;
+    if (!groups.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="text-secondary">No selected Google Ads cost data.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = groups.map((row) => `
+      <tr>
+        <td>${html(row.currency)}</td>
+        <td>${money(row.cost)}</td>
+        <td>${html(rawWithConverted(row.cost, row.currency, "INR"))}</td>
+        <td>${money(row.value)}</td>
+        <td>${roas(row.value, row.cost)}</td>
+      </tr>
+    `).join("");
+  }
+
+  function renderDailyPerformance() {
+    const tbody = document.getElementById("daily-performance-body");
+    if (!tbody) return;
+    const grouped = new Map();
+    const sourceRows = isYesterdayView ? selectedYesterdayRows() : selectedDailyRows();
+    sourceRows.forEach((row) => {
+      if (!hasSignal(row)) return;
+      const key = String(row.metric_date || "");
+      const current = grouped.get(key) || { date: row.metric_date, rows: [] };
+      current.rows.push(row);
+      grouped.set(key, current);
+    });
+    const rows = Array.from(grouped.values()).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-secondary">No selected Google Ads cost in this saved sync window.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((row) => {
+      const totals = convertedTotals(row.rows);
+      const raw = rawCurrencyText(byCurrency(row.rows), "cost");
+      return `
+        <tr>
+          <td>${html(row.date)}</td>
+          <td class="text-secondary small">${html(raw)}</td>
+          <td>${moneyCurrency("INR", totals.cost.INR)}</td>
+          <td>${roas(totals.value.INR, totals.cost.INR)}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderAccounts(rows) {
+    const tbody = document.getElementById("account-rows-body");
+    if (!tbody) return;
+    const sorted = rows
+      .filter(hasSignal)
+      .sort((a, b) => Number(b.cost_micros || 0) - Number(a.cost_micros || 0) || String(a.account_name).localeCompare(String(b.account_name)));
+    if (!sorted.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="text-secondary">No selected accounts have spend in this saved sync window.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = sorted.map((row) => {
+      const cost = micros(row.cost_micros);
+      const rowCurrency = currency(row.currency_code);
+      const costInr = convert(cost, rowCurrency, "INR");
+      const valueInr = convert(Number(row.value || 0), rowCurrency, "INR");
+      return `
+        <tr>
+          <td>
+            <div class="fw-semibold">${html(row.account_name)}</div>
+            <div class="text-secondary small">${html(row.customer_id)}</div>
+          </td>
+          <td>${html(rowCurrency)}</td>
+          <td>
+            <div>${costInr === null ? "Rate missing" : moneyCurrency("INR", costInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(cost)}</div>
+          </td>
+          <td>
+            <div>${valueInr === null ? "Rate missing" : moneyCurrency("INR", valueInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(row.value)}</div>
+          </td>
+          <td>${roas(valueInr, costInr)}</td>
+          <td>${money(row.conversions)}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderDailyAccounts() {
+    const tbody = document.getElementById("daily-account-rows-body");
+    if (!tbody) return;
+    const rows = (isYesterdayView ? selectedYesterdayRows() : selectedDailyRows())
+      .filter(hasSignal)
+      .slice()
+      .sort((a, b) => String(b.metric_date).localeCompare(String(a.metric_date)) || Number(b.cost_micros || 0) - Number(a.cost_micros || 0))
+      .slice(0, 250);
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="text-secondary">No selected daily account cost in this saved sync window.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((row) => {
+      const cost = micros(row.cost_micros);
+      const rowCurrency = currency(row.currency_code);
+      const costInr = convert(cost, rowCurrency, "INR");
+      const valueInr = convert(Number(row.value || 0), rowCurrency, "INR");
+      return `
+        <tr>
+          <td>${html(row.metric_date)}</td>
+          <td class="fw-semibold">${html(row.account_name)}</td>
+          <td>${html(rowCurrency)}</td>
+          <td>
+            <div>${costInr === null ? "Rate missing" : moneyCurrency("INR", costInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(cost)}</div>
+          </td>
+          <td>
+            <div>${valueInr === null ? "Rate missing" : moneyCurrency("INR", valueInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(row.value)}</div>
+          </td>
+          <td>${roas(valueInr, costInr)}</td>
+          <td>${money(row.conversions)}</td>
+          <td>${whole(row.clicks)}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function renderCampaigns(rows) {
+    const tbody = document.getElementById("campaign-rows-body");
+    if (!tbody) return;
+    const sorted = rows
+      .filter(hasSignal)
+      .slice()
+      .sort((a, b) => Number(b.cost_micros || 0) - Number(a.cost_micros || 0))
+      .slice(0, 200);
+    if (!sorted.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="text-secondary">No selected campaign cost in this saved sync window.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = sorted.map((row) => {
+      const cost = micros(row.cost_micros);
+      const rowCurrency = currency(row.currency_code);
+      const costInr = convert(cost, rowCurrency, "INR");
+      const valueInr = convert(Number(row.value || 0), rowCurrency, "INR");
+      return `
+        <tr>
+          <td>${html(row.account_name)}</td>
+          <td class="fw-semibold">${html(row.campaign_name)}</td>
+          <td><span class="badge bg-secondary-lt">${html(row.campaign_status)}</span></td>
+          <td><span class="badge bg-blue-lt">${html(row.channel_type)}</span></td>
+          <td>${html(rowCurrency)}</td>
+          <td>
+            <div>${costInr === null ? "Rate missing" : moneyCurrency("INR", costInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(cost)}</div>
+          </td>
+          <td>
+            <div>${valueInr === null ? "Rate missing" : moneyCurrency("INR", valueInr)}</div>
+            <div class="text-secondary small">${html(rowCurrency)} ${money(row.value)}</div>
+          </td>
+          <td>${roas(valueInr, costInr)}</td>
+          <td>${money(row.conversions)}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  function render() {
+    const selectedAccounts = selectedAccountRows();
+    const selectedYesterday = selectedYesterdayRows();
+    const selectedDaily = (isYesterdayView ? selectedYesterday : selectedDailyRows()).filter(hasSignal);
+    const selectedMetricRows = isYesterdayView ? selectedYesterday : selectedAccounts;
+    const selectedAccountSignals = selectedMetricRows.filter(hasSignal);
+    const groups = byCurrency(selectedMetricRows);
+    const yesterdaySource = selectedYesterday.length ? selectedYesterday : selectedDaily.filter((row) => String(row.metric_date) === yesterdayDate);
+    const yesterdayGroups = byCurrency(yesterdaySource);
+    const totals = convertedTotals(selectedMetricRows);
+    const yesterdayTotals = convertedTotals(yesterdaySource);
+    const campaigns = isYesterdayView ? selectedYesterdayCampaignRows() : selectedCampaignRows();
+    const pausedRows = campaigns.filter((row) => row.campaign_status === "PAUSED");
+    const pausedGroups = byCurrency(pausedRows);
+    const pausedTotals = convertedTotals(pausedRows);
+
+    text("selected-account-count", `${selectedAccounts.length}/${accounts.length} selected`);
+    setHtml("selected-currency-summary", convertedRowsHtml(totals.cost));
+    text("selected-rate-status", rateStatus());
+    const latestDate = selectedDaily.reduce((latest, row) => String(row.metric_date) > latest ? String(row.metric_date) : latest, "");
+    const accountWord = selectedAccountSignals.length === 1 ? "account" : "accounts";
+    const verb = selectedAccountSignals.length === 1 ? "has" : "have";
+    text(
+      "selected-sync-coverage",
+      `${selectedAccountSignals.length} selected ${accountWord} ${verb} spend in this saved ${isYesterdayView && yesterdayDate ? "yesterday view for " + yesterdayDate : latestDate ? "data through " + latestDate : "sync window"}. Raw spend: ${rawCurrencyText(groups, "cost")}.`
+    );
+    setHtml("metric-ad-cost", convertedRowsHtml(totals.cost));
+    setHtml("metric-yesterday-cost", convertedRowsHtml(yesterdayTotals.cost));
+    text("metric-yesterday-label", yesterdayDate ? `Cost on ${yesterdayDate}` : "");
+    setHtml("metric-conversion-value", convertedRowsHtml(totals.value));
+    text("metric-roas", roas(totals.value.INR, totals.cost.INR));
+    text("metric-conversions", money(totals.conversions));
+    text("metric-clicks", whole(totals.clicks));
+    text("metric-accounts", `${selectedAccountSignals.length}/${selectedAccounts.length}`);
+    text("metric-campaigns", whole(new Set(campaigns.map((row) => row.campaign_id)).size));
+    setHtml("metric-paused-spend", convertedRowsHtml(pausedTotals.cost));
+    updateSelectedSyncInputs();
+
+    renderAdBreakdown(groups);
+    renderDailyPerformance();
+    renderAccounts(isYesterdayView ? selectedYesterday : selectedAccounts);
+    renderDailyAccounts();
+    renderCampaigns(campaigns);
+  }
+
+  document.querySelectorAll(".account-filter-checkbox").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        selected.add(String(checkbox.value));
+      } else {
+        selected.delete(String(checkbox.value));
+      }
+      render();
+    });
+  });
+
+  const search = document.getElementById("account-filter-search");
+  if (search) {
+    search.addEventListener("input", () => {
+      const term = search.value.trim().toLowerCase();
+      document.querySelectorAll(".account-filter-option").forEach((option) => {
+        option.classList.toggle("d-none", term && !String(option.dataset.accountName || "").includes(term));
+      });
+    });
+  }
+
+  const setAll = (checked) => {
+    selected.clear();
+    document.querySelectorAll(".account-filter-checkbox").forEach((checkbox) => {
+      checkbox.checked = checked;
+      if (checked) selected.add(String(checkbox.value));
+    });
+    render();
+  };
+
+  document.getElementById("select-all-accounts")?.addEventListener("click", () => setAll(true));
+  document.getElementById("clear-all-accounts")?.addEventListener("click", () => setAll(false));
+  document.getElementById("reset-account-filter")?.addEventListener("click", () => setAll(true));
+  render();
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,173 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">First-party audiences</div>
+    <h2 class="page-title">Customer Match</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/stores"><i class="ti ti-building-store me-2"></i>Mappings</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Customer Match settings saved.</div>
+{% endif %}
+{% if job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Customer Match sync queued as job #{{ job_id }}.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ job_id }}">View job</a>
+</div>
+{% endif %}
+
+<div class="alert alert-warning" role="alert">
+  Use only first-party customer data collected with proper consent and privacy-policy disclosure. Customers are separated by mapped Odoo website and Google Ads account; all-website mappings are blocked to avoid mixing multisite customer data.
+</div>
+
+<div class="row row-cards">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Website customer feeds</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Website</th>
+              <th>Google Ads account</th>
+              <th class="text-end">Members</th>
+              <th>Status</th>
+              <th>Data Manager API</th>
+              <th class="text-end">Sync</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for publication in publications %}
+            {% set summary = summaries.get(publication.id, {}) %}
+            {% set feed_url = public_customer_match_url(publication) %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ publication.website_name or ("Website " ~ publication.website_id) }}</div>
+                <div class="text-secondary small">{{ publication.store.name if publication.store else "" }} · Website {{ publication.website_id or "all" }}</div>
+              </td>
+              <td>
+                <div class="fw-semibold">{{ publication.account.name if publication.account else publication.account_id }}</div>
+                <div class="text-secondary small">{{ publication.account.customer_id if publication.account else "" }}</div>
+              </td>
+              <td class="text-end">{{ "{:,}".format(summary.member_count or 0) }}</td>
+              <td>
+                {% if publication.website_id == 0 %}
+                <span class="badge bg-red-lt">Blocked</span>
+                {% elif publication.customer_match_policy_accepted %}
+                <span class="badge bg-green-lt">{{ publication.status }}</span>
+                {% else %}
+                <span class="badge bg-yellow-lt">Policy needed</span>
+                {% endif %}
+                {% if publication.last_synced_at %}
+                <div class="text-secondary small">{{ publication.last_synced_at.strftime("%Y-%m-%d %H:%M") }}</div>
+                {% endif %}
+              </td>
+              <td>
+                <div class="d-flex flex-wrap gap-1 mb-1">
+                  <span class="badge bg-blue-lt">{{ publication.data_manager_status or "planned" }}</span>
+                  {% if summary.outbox_pending %}
+                  <span class="badge bg-yellow-lt">{{ "{:,}".format(summary.outbox_pending) }} pending</span>
+                  {% endif %}
+                  {% if summary.outbox_sent %}
+                  <span class="badge bg-green-lt">{{ "{:,}".format(summary.outbox_sent) }} sent</span>
+                  {% endif %}
+                  {% if summary.outbox_failed %}
+                  <span class="badge bg-red-lt">{{ "{:,}".format(summary.outbox_failed) }} failed</span>
+                  {% endif %}
+                </div>
+                {% if publication.data_manager_user_list_id %}
+                <div class="text-secondary small">Audience ID: <span class="font-monospace">{{ publication.data_manager_user_list_id }}</span></div>
+                {% else %}
+                <div class="text-secondary small">Audience will be created on first API push.</div>
+                {% endif %}
+                {% if publication.data_manager_last_request_id %}
+                <div class="text-secondary small">Last request: <span class="font-monospace">{{ publication.data_manager_last_request_id }}</span></div>
+                {% endif %}
+                {% if publication.data_manager_last_error %}
+                <div class="text-danger small">{{ publication.data_manager_last_error[:160] }}</div>
+                {% endif %}
+                <details class="mt-1">
+                  <summary class="text-secondary small">HTTPS fallback</summary>
+                <input class="form-control form-control-sm font-monospace mb-1" value="{{ feed_url }}" readonly onclick="this.select(); navigator.clipboard && navigator.clipboard.writeText(this.value);">
+                <div class="text-secondary small">User: <span class="font-monospace">{{ publication.access_username }}</span></div>
+                <div class="text-secondary small">Password: <span class="font-monospace">{{ publication.access_password }}</span></div>
+                </details>
+              </td>
+              <td class="text-end">
+                <form method="post" action="/customer-match/publications/{{ publication.id }}/policy" class="mb-2">
+                  <label class="form-check form-switch justify-content-end">
+                    <input class="form-check-input" type="checkbox" name="customer_match_policy_accepted" {% if publication.customer_match_policy_accepted %}checked{% endif %} {% if publication.website_id == 0 %}disabled{% endif %}>
+                    <span class="form-check-label">Policy</span>
+                  </label>
+                  {% if publication.website_id != 0 %}
+                  <button class="btn btn-sm btn-outline-primary mt-1" type="submit">Save</button>
+                  {% endif %}
+                </form>
+                <form method="post" action="/customer-match/sync">
+                  <input type="hidden" name="publication_id" value="{{ publication.id }}">
+                  <input type="hidden" name="lookback_days" value="540">
+                  <button class="btn btn-sm btn-primary" type="submit" {% if publication.website_id == 0 or not publication.customer_match_policy_accepted %}disabled{% endif %}>
+                    <i class="ti ti-refresh me-1"></i>Pull + push API
+                  </button>
+                </form>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No Odoo to Google Ads website mappings exist yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Google setup</h3>
+      </div>
+      <div class="list-group list-group-flush">
+        <div class="list-group-item">
+          <div class="fw-semibold">Data source</div>
+          <div class="text-secondary small mt-1">Preferred sync is automatic through Google Data Manager API. The HTTPS feed stays available only as a fallback/manual import path.</div>
+        </div>
+        <div class="list-group-item">
+          <div class="fw-semibold">Field mapping</div>
+          <div class="text-secondary small mt-1">Email, phone, and name identifiers are normalized, SHA-256 hashed, deduped per website/account, then sent as Customer Match contact identifiers.</div>
+        </div>
+        <div class="list-group-item">
+          <div class="fw-semibold">Segmentation</div>
+          <div class="text-secondary small mt-1">Create one Google customer list per Odoo website/account mapping. Do not reuse a CA website feed in another country account.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header">
+        <h3 class="card-title">Recent jobs</h3>
+      </div>
+      <div class="list-group list-group-flush">
+        {% for job in recent_jobs %}
+        <a class="list-group-item list-group-item-action" href="/jobs#job-{{ job.id }}">
+          <div class="d-flex justify-content-between gap-2">
+            <span class="fw-semibold">#{{ job.id }}</span>
+            <span class="badge bg-secondary-lt">{{ job.status.value if job.status.value else job.status }}</span>
+          </div>
+          <div class="text-secondary small">{{ job.label }}</div>
+        </a>
+        {% else %}
+        <div class="list-group-item text-secondary">No Customer Match jobs yet.</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

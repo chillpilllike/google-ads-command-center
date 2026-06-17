@@ -1,0 +1,320 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Postgres source of truth</div>
+    <h2 class="page-title">Settings</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <button class="btn btn-primary" type="submit" form="settings-form">
+      <i class="ti ti-device-floppy me-2"></i>
+      Save settings
+    </button>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Settings saved to Postgres.</div>
+{% endif %}
+{% if google_oauth == "connected" %}
+<div class="alert alert-success" role="alert">Google Ads reconnect completed. Refresh token and connection details were saved to Postgres.</div>
+{% endif %}
+{% if google_oauth == "discovery_queued" %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Google Ads account discovery was queued{% if request.query_params.get("job_id") %} as job #{{ request.query_params.get("job_id") }}{% endif %}. Refresh this page after the worker finishes to see newly linked accounts.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs{% if request.query_params.get("job_id") %}#job-{{ request.query_params.get("job_id") }}{% endif %}">View jobs</a>
+</div>
+{% endif %}
+{% if google_oauth_error %}
+<div class="alert alert-danger" role="alert">
+  {% if google_oauth_error == "missing_client" %}
+  Save the Google Ads OAuth client ID and client secret first, then click reconnect again.
+  {% elif google_oauth_error == "missing_package" %}
+  The google-auth-oauthlib package is not installed in this environment.
+  {% elif google_oauth_error == "state" %}
+  Google reconnect could not be verified. Start reconnect again from this settings page.
+  {% elif google_oauth_error == "token" %}
+  Google returned an OAuth error while generating the token. Add the Google Ads redirect URI shown below to the OAuth client.
+  {% elif google_oauth_error == "no_refresh_token" %}
+  Google did not return a refresh token. Start reconnect again and approve offline access.
+  {% elif google_oauth_error == "connection_missing" %}
+  That Google Ads connection no longer exists.
+  {% else %}
+  Google Ads reconnect could not finish.
+  {% endif %}
+  {% if google_oauth_detail %}
+  <div class="small text-secondary mt-1">Detail: {{ google_oauth_detail }}</div>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="row row-cards mb-3">
+  <div class="col-xl-4">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Google Ads connection</h3>
+        <div class="card-actions">
+          <span class="badge bg-{{ google_ads_status.status_tone }}-lt">{{ google_ads_status.status_label }}</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="datagrid">
+          <div class="datagrid-item">
+            <div class="datagrid-title">Connected Gmail</div>
+            <div class="datagrid-content">{{ google_ads_status.connected_email }}</div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">Gmail connections</div>
+            <div class="datagrid-content">{{ google_ads_status.connection_count }}</div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">Refresh tokens</div>
+            <div class="datagrid-content">
+              {% if google_ads_status.token_saved %}
+              <span class="status status-green">Saved in Postgres</span>
+              {% else %}
+              <span class="status status-red">Missing</span>
+              {% endif %}
+            </div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">OAuth client</div>
+            <div class="datagrid-content">
+              {% if google_ads_status.oauth_client_ready %}
+              <span class="status status-green">Ready</span>
+              {% else %}
+              <span class="status status-yellow">Needs client ID and secret</span>
+              {% endif %}
+            </div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">Accounts</div>
+            <div class="datagrid-content">{{ google_ads_status.account_count }} across {{ google_ads_status.manager_count }} managers</div>
+          </div>
+          <div class="datagrid-item">
+            <div class="datagrid-title">Latest metric date</div>
+            <div class="datagrid-content">{{ google_ads_status.latest_metric_date or "No sync yet" }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-footer">
+        <div class="mb-2 fw-semibold">Add another Gmail</div>
+        <form class="row g-2" method="post" action="/settings/google-ads/reconnect">
+          <input type="hidden" name="connection_id" value="0">
+          <div class="col">
+            <input class="form-control" name="connection_name" placeholder="Connection label">
+          </div>
+          <div class="col-auto">
+            <button class="btn btn-primary" type="submit" {% if not google_ads_status.oauth_client_ready %}disabled{% endif %}>
+              <i class="ti ti-plus me-2"></i>
+              Connect Gmail
+            </button>
+          </div>
+        </form>
+        <div class="text-secondary small mt-2">
+          Use this for each extra Gmail that has access to more Google Ads accounts.
+          <div class="mt-2">Primary Google Ads redirect URI to add in Google Cloud OAuth client:</div>
+          <input class="form-control form-control-sm font-monospace mt-1" value="{{ google_ads_status.redirect_uri }}" readonly onclick="this.select(); navigator.clipboard && navigator.clipboard.writeText(this.value);">
+          <div class="mt-2">Optional local variant:</div>
+          {% for redirect_uri in google_ads_status.redirect_uri_variants %}
+          {% if redirect_uri != google_ads_status.redirect_uri %}
+          <input class="form-control form-control-sm font-monospace mt-1" value="{{ redirect_uri }}" readonly onclick="this.select(); navigator.clipboard && navigator.clipboard.writeText(this.value);">
+          {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-xl-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Google Ads Gmail connections</h3>
+        <div class="card-actions text-secondary small">{{ google_ads_status.connection_count }} saved in Postgres</div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Connection</th>
+              <th>Status</th>
+              <th>Data Manager</th>
+              <th>Linked accounts</th>
+              <th>Last discovery</th>
+              <th class="w-1"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for connection in google_ads_status.connections %}
+            <tr>
+              <td>
+                <div class="fw-semibold">{{ connection.name }}</div>
+                <div class="text-secondary small">{{ connection.email }}</div>
+                {% if connection.client_id %}
+                <div class="text-secondary small">OAuth client: <span class="font-monospace">{{ connection.client_id }}</span></div>
+                {% endif %}
+                {% if connection.last_discovery_error %}
+                <div class="text-danger small">{{ connection.last_discovery_error|truncate(140) }}</div>
+                {% endif %}
+              </td>
+              <td>
+                {% if connection.token_saved and connection.oauth_client_ready and connection.developer_token_saved %}
+                <span class="badge bg-green-lt">Ready</span>
+                {% else %}
+                <span class="badge bg-yellow-lt">Needs setup</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if connection.data_manager_scope_ready %}
+                <span class="badge bg-green-lt">{{ connection.data_manager_scope_label }}</span>
+                {% else %}
+                <span class="badge bg-red-lt">{{ connection.data_manager_scope_label }}</span>
+                <div class="text-secondary small">Needed for API Customer Match uploads.</div>
+                {% endif %}
+              </td>
+              <td>
+                <div>{{ connection.linked_account_count }} accounts</div>
+                <div class="text-secondary small">{{ connection.linked_manager_count }} managers · {{ connection.currency_summary }}</div>
+              </td>
+              <td class="text-secondary">{{ connection.last_discovery_at or "Not synced yet" }}</td>
+              <td>
+                <div class="btn-list flex-nowrap">
+                  <form method="post" action="/settings/google-ads/reconnect">
+                    <input type="hidden" name="connection_id" value="{{ connection.id }}">
+                    <input type="hidden" name="connection_name" value="{{ connection.name }}">
+                    <button class="btn btn-outline-primary btn-sm" type="submit">
+                      <i class="ti ti-plug-connected me-1"></i>
+                      Reconnect
+                    </button>
+                  </form>
+                  <form method="post" action="/settings/google-ads/connections/{{ connection.id }}/discover">
+                    <button class="btn btn-outline-primary btn-sm" type="submit" {% if not connection.token_saved %}disabled{% endif %}>
+                      <i class="ti ti-refresh me-1"></i>
+                      Sync accounts
+                    </button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="text-secondary">No Gmail connections are saved in Postgres yet. Add a Gmail connection from this page.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="card-footer text-secondary small">
+        Connect a Gmail, then use Sync accounts to recursively pull manager accounts, nested manager accounts, account names, customer IDs, and default currencies into Postgres.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row row-cards mb-3">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Connected accounts and default currency</h3>
+        <div class="card-actions text-secondary small">{{ google_ads_status.currency_summary }}</div>
+      </div>
+      <div class="table-responsive settings-account-table">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Gmail connection</th>
+              <th>Manager account</th>
+              <th>Google Ads account</th>
+              <th>Customer ID</th>
+              <th>Currency</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for account in google_ads_status.accounts %}
+            <tr>
+              <td>{{ account.connection_name or "Legacy fallback" }}</td>
+              <td>
+                <div class="fw-semibold">{{ account.manager_name }}</div>
+                <div class="text-secondary small">{{ account.manager_customer_id }}</div>
+              </td>
+              <td>{{ account.name }}</td>
+              <td class="text-secondary">{{ account.customer_id }}</td>
+              <td><span class="badge bg-blue-lt">{{ account.currency_code }}</span></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-secondary">No Google Ads accounts are saved in Postgres yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header">
+    <h3 class="card-title">Manager accounts</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Manager</th><th>Manager customer ID</th><th>Accounts</th><th>Currencies</th></tr></thead>
+      <tbody>
+        {% for manager in google_ads_status.managers %}
+        <tr>
+          <td class="fw-semibold">{{ manager.manager_name }}</td>
+          <td class="text-secondary">{{ manager.manager_customer_id }}</td>
+          <td>{{ manager.account_count }}</td>
+          <td>{{ manager.currency_summary }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-secondary">No manager accounts are saved in Postgres yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<form id="settings-form" method="post" action="/settings">
+  <div class="row row-cards">
+    {% for category, rows in groups.items() %}
+    <div class="col-12">
+      <div class="card">
+        <div class="card-header">
+          <h3 class="card-title">{{ category }}</h3>
+        </div>
+        <div class="card-body">
+          <div class="row g-3">
+            {% for setting in rows %}
+            <div class="col-md-6">
+              {% if setting.input_type == "checkbox" %}
+              <label class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" name="{{ setting.key }}" {% if setting.value %}checked{% endif %}>
+                <span class="form-check-label">{{ setting.label }}</span>
+              </label>
+              <div class="form-hint">{{ setting.help_text }}</div>
+              {% elif setting.input_type == "password" %}
+              <label class="form-label" for="{{ setting.key }}">{{ setting.label }}</label>
+              <input class="form-control" id="{{ setting.key }}" type="password" name="{{ setting.key }}" placeholder="{% if setting.value %}Saved in Postgres; leave blank to keep{% endif %}">
+              <div class="form-hint">{{ setting.help_text }}</div>
+              {% elif setting.input_type == "number" %}
+              <label class="form-label" for="{{ setting.key }}">{{ setting.label }}</label>
+              <input class="form-control" id="{{ setting.key }}" type="number" step="any" name="{{ setting.key }}" value="{{ setting.value }}">
+              <div class="form-hint">{{ setting.help_text }}</div>
+              {% elif setting.input_type == "textarea" %}
+              <label class="form-label" for="{{ setting.key }}">{{ setting.label }}</label>
+              <textarea class="form-control" id="{{ setting.key }}" name="{{ setting.key }}" rows="4">{{ setting.value or "" }}</textarea>
+              <div class="form-hint">{{ setting.help_text }}</div>
+              {% else %}
+              <label class="form-label" for="{{ setting.key }}">{{ setting.label }}</label>
+              <input class="form-control" id="{{ setting.key }}" type="text" name="{{ setting.key }}" value="{{ setting.value or '' }}">
+              <div class="form-hint">{{ setting.help_text }}</div>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</form>
+{% endblock %}

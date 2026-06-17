@@ -1,0 +1,259 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Campaign optimization</div>
+    <h2 class="page-title">Optimize Campaigns</h2>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if optimization_job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Campaign optimization queued as job #{{ optimization_job_id }}{% if optimization_run_id %} and run #{{ optimization_run_id }}{% endif %}. It reuses cached JSON first and records manual actions if Google quota blocks a refresh.</div>
+  <div class="btn-list">
+    <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ optimization_job_id }}">View job</a>
+    {% if optimization_run_id %}<a class="btn btn-sm btn-outline-secondary" href="/optimize-campaigns/runs/{{ optimization_run_id }}.json">View JSON</a>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+{% set default_account = accounts[0] if accounts else none %}
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <form class="card" method="post" action="/optimize-campaigns">
+      <div class="card-header">
+        <h3 class="card-title">Optimize campaign</h3>
+      </div>
+      <div class="card-body">
+        <input type="hidden" id="optimizer_account_id" name="account_id" value="{{ default_account.id if default_account else '' }}">
+        <div class="mb-3">
+          <label class="form-label" for="optimizer-account-search">Account</label>
+          <div class="dropdown ad-account-picker">
+            <button class="form-select text-start ad-account-picker-toggle" type="button" data-bs-toggle="dropdown" data-bs-auto-close="outside" id="selected-optimizer-account-button">
+              {% if default_account %}
+              {{ default_account.name }} · {{ default_account.customer_id }}
+              {% else %}
+              No active accounts
+              {% endif %}
+            </button>
+            <div class="dropdown-menu ad-account-picker-menu p-0">
+              <div class="p-2 border-bottom">
+                <input class="form-control form-control-sm" id="optimizer-account-search" type="search" placeholder="Search name or any account digits">
+              </div>
+              <div class="ad-account-picker-list">
+                {% for account in accounts %}
+                <button
+                  class="dropdown-item optimizer-account-option {% if loop.first %}active{% endif %}"
+                  type="button"
+                  data-account-id="{{ account.id }}"
+                  data-account-label="{{ account.name }} · {{ account.customer_id }}"
+                  data-account-name="{{ account.name|lower }}"
+                  data-account-number="{{ account.customer_id }}"
+                >
+                  <span class="d-block">{{ account.name }}</span>
+                  <span class="text-secondary small">{{ account.customer_id }} · {{ account.currency_code or "UNKNOWN" }}</span>
+                </button>
+                {% endfor %}
+                <div class="dropdown-item text-secondary optimizer-account-empty d-none">No matching accounts.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="optimizer-campaign-type">Campaign type</label>
+          <select class="form-select" id="optimizer-campaign-type" name="campaign_type">
+            {% for key, label in optimization_campaign_types.items() %}
+            <option value="{{ key }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label" for="optimizer-campaign-id">Campaign ID</label>
+          <input class="form-control" id="optimizer-campaign-id" name="campaign_id_text" placeholder="Optional, safest for one campaign">
+          <div class="form-hint">Blank optimizes the selected campaign type from cached or scoped data.</div>
+        </div>
+        <div class="row g-2">
+          <div class="col-6">
+            <label class="form-label" for="optimizer-days">Days</label>
+            <input class="form-control" id="optimizer-days" name="days" type="number" min="1" max="90" value="30">
+          </div>
+          <div class="col-6">
+            <label class="form-label" for="optimizer-max-rows">Max rows</label>
+            <input class="form-control" id="optimizer-max-rows" name="max_rows" type="number" min="50" max="20000" value="3000">
+          </div>
+        </div>
+        <label class="form-check mt-3">
+          <input class="form-check-input" type="checkbox" name="use_openai" checked>
+          <span class="form-check-label">Ask ChatGPT to review decisions</span>
+        </label>
+        <label class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="apply_local_feed_labels">
+          <span class="form-check-label">Allow local page-feed label updates</span>
+        </label>
+        <label class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="force">
+          <span class="form-check-label">Force 30-day Google refresh</span>
+        </label>
+      </div>
+      <div class="card-footer">
+        <button class="btn btn-primary w-100" type="submit" {% if not accounts %}disabled{% endif %}>
+          <i class="ti ti-adjustments-check me-2"></i>
+          Optimize
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card" id="optimization-runs">
+      <div class="card-header">
+        <h3 class="card-title">Recent optimization runs</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Account</th>
+              <th>Campaign</th>
+              <th>Status</th>
+              <th>Actions</th>
+              <th>Data</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for run in optimization_runs %}
+            {% set summary = run.summary_json or {} %}
+            {% set actions = run.actions_json.actions if run.actions_json and run.actions_json.actions else [] %}
+            <tr id="optimization-run-{{ run.id }}">
+              <td>#{{ run.id }}</td>
+              <td>
+                <div class="fw-semibold">{{ run.account.name }}</div>
+                <div class="text-secondary small">{{ run.account.customer_id }}</div>
+              </td>
+              <td>
+                <span class="badge bg-blue-lt">{{ run.campaign_type|upper }}</span>
+                <div class="text-secondary small">
+                  {% if run.campaign_name %}{{ run.campaign_name }}{% elif run.campaign_id %}{{ run.campaign_id }}{% else %}Scoped by type{% endif %}
+                </div>
+              </td>
+              <td>
+                {% if run.status == "succeeded" %}
+                <span class="badge bg-green-lt">succeeded</span>
+                {% elif run.status == "running" %}
+                <span class="badge bg-blue-lt">running</span>
+                {% elif run.status == "failed" %}
+                <span class="badge bg-red-lt">failed</span>
+                {% elif run.status == "needs_data" %}
+                <span class="badge bg-yellow-lt">needs data</span>
+                {% else %}
+                <span class="badge bg-secondary-lt">{{ run.status }}</span>
+                {% endif %}
+              </td>
+              <td>
+                <div class="fw-semibold">{{ summary.action_count or actions|length or 0 }}</div>
+                <div class="text-secondary small">
+                  Google: {{ summary.google_mutation_action_count or 0 }} · Local: {{ (summary.local_feed_updates.promoted if summary.local_feed_updates else 0) + (summary.local_feed_updates.excluded if summary.local_feed_updates else 0) }}
+                </div>
+              </td>
+              <td class="text-secondary small">
+                {% if summary.dataset_statuses %}
+                  {% for item in summary.dataset_statuses[:3] %}
+                  <div>{{ item.dataset_key }}: {{ item.status }}{% if item.rows is not none %} ({{ item.rows }}){% endif %}</div>
+                  {% endfor %}
+                {% else %}
+                  Waiting
+                {% endif %}
+              </td>
+              <td class="text-secondary">{{ run.created_at.strftime("%Y-%m-%d %H:%M") if run.created_at else "" }}</td>
+              <td class="text-end">
+                <a class="btn btn-sm btn-outline-secondary" href="/optimize-campaigns/runs/{{ run.id }}.json">JSON</a>
+              </td>
+            </tr>
+            {% if actions %}
+            <tr>
+              <td colspan="8">
+                <div class="row g-2">
+                  {% for action in actions[:6] %}
+                  {% set action_items = action["items"] if action["items"] is defined else [] %}
+                  <div class="col-md-6">
+                    <div class="border rounded p-2 h-100">
+                      <div class="d-flex align-items-center gap-2 mb-1">
+                        <span class="badge {% if action.priority == 'critical' or action.priority == 'high' %}bg-red-lt{% elif action.priority == 'medium' %}bg-yellow-lt{% else %}bg-secondary-lt{% endif %}">{{ action.priority }}</span>
+                        <span class="fw-semibold">{{ action.title }}</span>
+                      </div>
+                      <div class="text-secondary small">{{ action.summary|truncate(180, True, "...") }}</div>
+                      {% if action_items and action_items is sequence and action_items is not string %}
+                      <div class="text-secondary small mt-1">{{ action_items[:3]|join(", ")|truncate(160, True, "...") }}</div>
+                      {% endif %}
+                    </div>
+                  </div>
+                  {% endfor %}
+                </div>
+              </td>
+            </tr>
+            {% endif %}
+            {% else %}
+            <tr><td colspan="8" class="text-secondary">No optimization runs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const accountInput = document.getElementById("optimizer_account_id");
+  const accountSearch = document.getElementById("optimizer-account-search");
+  const selectedAccountButton = document.getElementById("selected-optimizer-account-button");
+  const accountOptions = Array.from(document.querySelectorAll(".optimizer-account-option"));
+  const emptyAccount = document.querySelector(".optimizer-account-empty");
+  const digitOnly = (value) => String(value || "").replace(/\D+/g, "");
+
+  function selectAccount(option) {
+    if (!option || !accountInput || !selectedAccountButton) return;
+    accountInput.value = option.dataset.accountId || "";
+    selectedAccountButton.textContent = option.dataset.accountLabel || option.textContent.trim();
+    accountOptions.forEach((item) => item.classList.toggle("active", item === option));
+  }
+
+  function filterAccounts() {
+    const term = (accountSearch?.value || "").trim().toLowerCase();
+    const digits = digitOnly(term);
+    let visible = 0;
+    accountOptions.forEach((option) => {
+      const name = option.dataset.accountName || "";
+      const label = (option.dataset.accountLabel || "").toLowerCase();
+      const accountNumber = digitOnly(option.dataset.accountNumber || "");
+      const matchesText = !term || name.includes(term) || label.includes(term);
+      const matchesDigits = digits && accountNumber.includes(digits);
+      const matches = matchesText || Boolean(matchesDigits);
+      option.classList.toggle("d-none", !matches);
+      if (matches) visible += 1;
+    });
+    emptyAccount?.classList.toggle("d-none", visible !== 0);
+  }
+
+  accountOptions.forEach((option) => {
+    option.addEventListener("click", () => {
+      selectAccount(option);
+      if (accountSearch) {
+        accountSearch.value = "";
+        filterAccounts();
+      }
+    });
+  });
+  accountSearch?.addEventListener("input", filterAccounts);
+  document.querySelector(".ad-account-picker")?.addEventListener("shown.bs.dropdown", () => {
+    accountSearch?.focus();
+    accountSearch?.select();
+  });
+})();
+</script>
+{% endblock %}

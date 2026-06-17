@@ -1,0 +1,16 @@
+{
+  "manager_groups": [
+    {
+      "manager": {
+        "name": "Example Manager",
+        "customer_id": "123-456-7890"
+      },
+      "sub_accounts": [
+        {
+          "name": "Example Account",
+          "customer_id": "234-567-8901"
+        }
+      ]
+    }
+  ]
+}

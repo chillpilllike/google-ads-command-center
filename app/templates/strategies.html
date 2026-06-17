@@ -1,0 +1,168 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Automation</div>
+    <h2 class="page-title">Strategies</h2>
+  </div>
+</div>
+
+<div class="card mt-3">
+  <div class="card-header">
+    <h3 class="card-title">Recent Autopilot events</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Account</th>
+          <th>Campaign</th>
+          <th>Action</th>
+          <th>Status</th>
+          <th>Summary</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for event in events %}
+        <tr>
+          <td class="text-secondary">{{ event.created_at.strftime("%Y-%m-%d %H:%M") if event.created_at else "" }}</td>
+          <td>{{ event.account.name }}</td>
+          <td>{{ event.campaign_name or "Account" }}</td>
+          <td><span class="badge bg-blue-lt">{{ event.action_type }}</span></td>
+          <td>
+            {% if event.status == "applied" %}
+            <span class="badge bg-green-lt">applied</span>
+            {% elif event.status == "failed" %}
+            <span class="badge bg-red-lt">failed</span>
+            {% elif event.status == "validated" %}
+            <span class="badge bg-yellow-lt">validated</span>
+            {% else %}
+            <span class="badge bg-secondary-lt">{{ event.status }}</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="text-secondary">{{ event.summary }}</div>
+            {% set goal = (event.evidence or {}).get("purchase_goal_status", {}) %}
+            {% set guard = (event.evidence or {}).get("spend_guard", {}) %}
+            {% if goal %}
+            <div class="mt-1">
+              {% if goal.customer_purchase_active or goal.campaign_purchase_active %}
+              <span class="badge bg-green-lt">Purchase goal active</span>
+              {% elif goal.customer_purchase_seen or goal.campaign_purchase_seen %}
+              <span class="badge bg-yellow-lt">Purchase goal inactive</span>
+              {% else %}
+              <span class="badge bg-red-lt">Purchase goal not detected</span>
+              {% endif %}
+              {% if goal.campaign_add_to_cart_biddable %}
+              <span class="badge bg-yellow-lt">Add to cart still biddable</span>
+              {% endif %}
+              {% if guard.status %}
+              <span class="badge bg-secondary-lt">Spend guard {{ guard.status }}</span>
+              {% endif %}
+            </div>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-secondary">No Autopilot events yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+<div class="card">
+  <div class="card-header">
+    <h3 class="card-title">Available strategies</h3>
+  </div>
+  <div class="accordion strategy-accordion" id="strategy-accordion">
+    {% for strategy in strategies %}
+      {% set details = strategy.details or {} %}
+      {% set collapse_id = "strategy-collapse-" ~ strategy.id %}
+      {% set heading_id = "strategy-heading-" ~ strategy.id %}
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="{{ heading_id }}">
+          <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#{{ collapse_id }}" aria-expanded="false" aria-controls="{{ collapse_id }}">
+            <span class="strategy-accordion-title">
+              <span class="fw-semibold">{{ strategy.name }}</span>
+              <span class="text-secondary small">{{ strategy.description }}</span>
+            </span>
+            <span class="strategy-accordion-badges">
+              <span class="badge bg-blue-lt">{{ strategy.mode }}</span>
+              {% if strategy.is_destructive %}
+              <span class="badge bg-red-lt">Apply</span>
+              {% else %}
+              <span class="badge bg-green-lt">Read-only</span>
+              {% endif %}
+              {% if strategy.is_active %}
+              <span class="status status-green">Active</span>
+              {% else %}
+              <span class="status">Inactive</span>
+              {% endif %}
+            </span>
+          </button>
+        </h2>
+        <div id="{{ collapse_id }}" class="accordion-collapse collapse" aria-labelledby="{{ heading_id }}" data-bs-parent="#strategy-accordion">
+          <div class="accordion-body">
+            <div class="row g-4">
+              <div class="col-lg-5">
+                <div class="subheader">What it does</div>
+                <p class="mb-0 text-secondary">{{ details.overview or strategy.description }}</p>
+              </div>
+              <div class="col-lg-7">
+                <div class="row g-3">
+                  <div class="col-md-6">
+                    <div class="subheader">Points covered</div>
+                    <ul class="strategy-detail-list">
+                      {% for item in details.covers or [] %}
+                      <li>{{ item }}</li>
+                      {% else %}
+                      <li>{{ strategy.description }}</li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="subheader">Mechanism</div>
+                    <ul class="strategy-detail-list">
+                      {% for item in details.mechanism or [] %}
+                      <li>{{ item }}</li>
+                      {% else %}
+                      <li>Runs through the background worker and saves the result to Postgres.</li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="subheader">Safety gates</div>
+                    <ul class="strategy-detail-list">
+                      {% for item in details.safety or [] %}
+                      <li>{{ item }}</li>
+                      {% else %}
+                      <li>Records outcome and errors for review.</li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="subheader">Settings used</div>
+                    <ul class="strategy-detail-list">
+                      {% for item in details.settings or [] %}
+                      <li>{{ item }}</li>
+                      {% else %}
+                      <li>Uses saved account and app settings from Postgres.</li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% else %}
+      <div class="card-body text-secondary">No strategies configured.</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

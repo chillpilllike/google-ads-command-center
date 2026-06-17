@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="page-pretitle">Run #{{ run.id }}</div>
+<h2 class="page-title">Status: {{ run.status.value }}</h2>
+{% endblock %}
+
+{% block page_body %}
+<div class="card">
+  <div class="card-header"><h3 class="card-title">Account work items</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Account</th><th>Strategy</th><th>Status</th><th>Error</th></tr></thead>
+      <tbody>
+        {% for item in run.accounts %}
+        <tr>
+          <td>{{ item.account.name }} <span class="text-secondary">{{ item.account.customer_id }}</span></td>
+          <td>{{ item.strategy_key }}</td>
+          <td><span class="badge bg-blue-lt">{{ item.status.value }}</span></td>
+          <td class="text-danger">{{ item.error or "" }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-secondary">Worker has not started this run yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<script>
+  if (!["succeeded", "failed"].includes("{{ run.status.value }}")) {
+    setTimeout(() => window.location.reload(), 3000);
+  }
+</script>
+{% endblock %}

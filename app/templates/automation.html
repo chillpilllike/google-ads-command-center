@@ -1,0 +1,533 @@
+{% extends "layout.html" %}
+{% block page_header %}
+<div class="row g-2 align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Account control</div>
+    <h2 class="page-title">Automation</h2>
+  </div>
+  <div class="col-auto ms-auto">
+    <a class="btn btn-outline-primary" href="/jobs"><i class="ti ti-list-check me-2"></i>Jobs</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if saved %}
+<div class="alert alert-success" role="alert">Automation settings saved.</div>
+{% endif %}
+{% if job_id %}
+<div class="alert alert-info d-flex align-items-center justify-content-between gap-3" role="alert">
+  <div>Automation monitor queued as job #{{ job_id }}.</div>
+  <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ job_id }}">View job</a>
+</div>
+{% endif %}
+
+{% if not accounts %}
+<div class="alert alert-warning" role="alert">No active Google Ads accounts are saved yet.</div>
+{% else %}
+<div class="row row-cards">
+  <div class="col-lg-3">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Accounts</h3>
+      </div>
+      <div class="list-group list-group-flush keyword-account-list">
+        {% for item in account_summaries %}
+        {% set account = item.account %}
+        {% set pref = item.preference %}
+        {% set keyword = item.keyword %}
+        {% set negative = item.negative %}
+        <a class="list-group-item list-group-item-action {% if selected_account and selected_account.id == account.id %}active{% endif %}" href="/automation?account_id={{ account.id }}">
+          <div class="d-flex w-100 justify-content-between gap-2">
+            <span class="fw-semibold text-truncate">{{ account.name }}</span>
+            {% if pref and pref.automation_enabled %}
+            <span class="badge bg-green-lt">On</span>
+            {% else %}
+            <span class="badge bg-secondary-lt">Off</span>
+            {% endif %}
+          </div>
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">{{ account.customer_id }} - {{ account.currency_code or "UNKNOWN" }}</div>
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">{{ keyword.keyword_count }} saved keywords</div>
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">{{ negative.negative_count }} negative candidates</div>
+          {% if pref and pref.last_run_at %}
+          <div class="{% if selected_account and selected_account.id == account.id %}text-white-50{% else %}text-secondary{% endif %} small">Last run {{ pref.last_run_at.strftime("%Y-%m-%d %H:%M") }}</div>
+          {% endif %}
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-9">
+    {% if selected_account and preference %}
+    <div class="row row-cards">
+      <div class="col-xl-7">
+        <form class="card" method="post" action="/automation/preferences">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">{{ selected_account.name }}</h3>
+              <div class="text-secondary small">{{ selected_account.customer_id }} - {{ selected_account.currency_code or "UNKNOWN" }}</div>
+            </div>
+            <div class="card-actions">
+              {% if preference.automation_enabled %}
+              <span class="badge bg-green-lt">Enabled</span>
+              {% else %}
+              <span class="badge bg-secondary-lt">Disabled</span>
+              {% endif %}
+              {% if preference.monitor_only %}
+              <span class="badge bg-blue-lt">Monitor only</span>
+              {% else %}
+              <span class="badge bg-yellow-lt">Live guarded</span>
+              {% endif %}
+            </div>
+          </div>
+          <div class="card-body">
+            <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="automation_enabled" {% if preference.automation_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Automation enabled</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="monitor_only" {% if preference.monitor_only %}checked{% endif %}>
+                  <span class="form-check-label">Monitor only</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="keyword_discovery_enabled" {% if preference.keyword_discovery_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Keyword discovery</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="negative_keyword_enabled" {% if preference.negative_keyword_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Negative keyword detection</span>
+                </label>
+              </div>
+              <div class="col-md-6">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="audience_signal_enabled" {% if preference.audience_signal_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Audience signals</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="landing_page_enabled" {% if preference.landing_page_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Landing page signals</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="auction_monitor_enabled" {% if preference.auction_monitor_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auction pressure monitor</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="odoo_sales_guard_enabled" {% if preference.odoo_sales_guard_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Odoo sales guard</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="hr-text">Audience signal inputs</div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label" for="manual-similar-urls">Similar website URLs</label>
+                <textarea class="form-control" id="manual-similar-urls" name="manual_similar_urls" rows="5" placeholder="amazon.ca&#10;iherb.com">{{ (audience_signal_inputs.manual_similar_urls or [])|join('\n') }}</textarea>
+                <div class="form-hint">Used as PMax custom-segment similar-website hints with GA4 and Ads-derived domains.</div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="manual-interests">Interest and purchase-intent terms</label>
+                <textarea class="form-control" id="manual-interests" name="manual_interests" rows="5" placeholder="makeup and cosmetics&#10;organic supplements">{{ (audience_signal_inputs.manual_interests or [])|join('\n') }}</textarea>
+                <div class="form-hint">Merged with saved Scale search themes, GA4 search terms, and ecommerce item keywords.</div>
+              </div>
+            </div>
+
+            <div class="hr-text">Odoo sales spend guard</div>
+            <div class="row g-3">
+              <div class="col-md-3">
+                <label class="form-label" for="odoo-sales-max-spend">Max spend %</label>
+                <input class="form-control" id="odoo-sales-max-spend" name="odoo_sales_max_spend_pct" type="number" min="1" max="100" step="0.1" value="{{ '%.1f'|format((preference.odoo_sales_max_spend_ratio or 0.15) * 100) }}">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="odoo-sales-window-days">Rolling days</label>
+                <input class="form-control" id="odoo-sales-window-days" name="odoo_sales_guard_window_days" type="number" min="1" max="90" value="{{ preference.odoo_sales_guard_window_days or 7 }}">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="budget-guard-check-interval">Check hours</label>
+                <input class="form-control" id="budget-guard-check-interval" name="budget_guard_check_interval_hours" type="number" min="1" max="24" value="{{ preference.budget_guard_check_interval_hours or 6 }}">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="minimum-daily-budget">Min daily budget</label>
+                <input class="form-control" id="minimum-daily-budget" name="minimum_daily_budget_amount" type="number" min="0" max="100000" step="0.01" value="{{ preference.minimum_daily_budget_amount if preference.minimum_daily_budget_amount is not none else 1 }}">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label" for="budget-reduce-pct">Reduce %</label>
+                <input class="form-control" id="budget-reduce-pct" name="underperforming_budget_reduce_pct" type="number" min="1" max="90" step="1" value="{{ '%.0f'|format((preference.underperforming_budget_reduce_pct or 0.2) * 100) }}">
+              </div>
+            </div>
+
+            <div class="hr-text">Live action switches</div>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="auto_apply_keywords_enabled" {% if preference.auto_apply_keywords_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto add keywords</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="auto_apply_negatives_enabled" {% if preference.auto_apply_negatives_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto add negatives</span>
+                </label>
+              </div>
+              <div class="col-md-6">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="auto_create_campaigns_enabled" {% if preference.auto_create_campaigns_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto create campaigns</span>
+                </label>
+                <label class="form-check form-switch mt-2">
+                  <input class="form-check-input" type="checkbox" name="auto_pause_campaigns_enabled" {% if preference.auto_pause_campaigns_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto pause underperformers</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="hr-text">Testing bootstrap</div>
+            <div class="row g-3">
+              <div class="col-md-12">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="testing_bootstrap_enabled" {% if preference.testing_bootstrap_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto plan RSA/DSA before PMax</span>
+                </label>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="testing-bootstrap-days">Bootstrap days</label>
+                <input class="form-control" id="testing-bootstrap-days" name="testing_bootstrap_days" type="number" min="1" max="60" value="{{ preference.testing_bootstrap_days or 15 }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="pmax-min-7d-conversions">PMax min 7d conversions</label>
+                <input class="form-control" id="pmax-min-7d-conversions" name="pmax_min_7d_conversions" type="number" min="1" max="1000" step="0.1" value="{{ preference.pmax_min_7d_conversions if preference.pmax_min_7d_conversions is not none else 15 }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="testing-sales-budget">Testing sales %</label>
+                <input class="form-control" id="testing-sales-budget" name="testing_sales_budget_pct" type="number" min="0.1" max="100" step="0.1" value="{{ '%.1f'|format((preference.testing_sales_budget_ratio or 0.05) * 100) }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="testing-keyword-limit">Keyword limit</label>
+                <input class="form-control" id="testing-keyword-limit" name="testing_keyword_limit" type="number" min="1" max="200" value="{{ preference.testing_keyword_limit or 30 }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="testing-landing-page-limit">Page limit</label>
+                <input class="form-control" id="testing-landing-page-limit" name="testing_landing_page_limit" type="number" min="1" max="500" value="{{ preference.testing_landing_page_limit or 25 }}">
+              </div>
+            </div>
+
+            <div class="hr-text">Peak conversion budget</div>
+            {% set peak_decision = preference.peak_budget_decision_json if preference.peak_budget_decision_json else {} %}
+            <div class="row g-3">
+              <div class="col-md-12">
+                <label class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="auto_peak_budget_enabled" {% if preference.auto_peak_budget_enabled %}checked{% endif %}>
+                  <span class="form-check-label">Auto boost peak budgets</span>
+                </label>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="peak-budget-increase">Increase %</label>
+                <input class="form-control" id="peak-budget-increase" name="peak_budget_increase_pct" type="number" min="1" max="200" step="1" value="{{ '%.0f'|format((preference.peak_budget_increase_pct or 0.5) * 100) }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="peak-budget-warmup">Warmup minutes</label>
+                <input class="form-control" id="peak-budget-warmup" name="peak_budget_warmup_minutes" type="number" min="15" max="240" step="15" value="{{ preference.peak_budget_warmup_minutes or 60 }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="peak-budget-restore-delay">Restore delay</label>
+                <input class="form-control" id="peak-budget-restore-delay" name="peak_budget_restore_delay_minutes" type="number" min="0" max="240" step="15" value="{{ preference.peak_budget_restore_delay_minutes or 0 }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="peak-budget-extra-spend">Peak extra spend %</label>
+                <input class="form-control" id="peak-budget-extra-spend" name="peak_budget_extra_spend_pct" type="number" min="0" max="100" step="0.1" value="{{ '%.1f'|format((preference.peak_budget_extra_spend_ratio or 0.05) * 100) }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="peak-budget-check-interval">Peak check minutes</label>
+                <input class="form-control" id="peak-budget-check-interval" name="peak_budget_check_interval_minutes" type="number" min="15" max="240" step="15" value="{{ preference.peak_budget_check_interval_minutes or 60 }}">
+              </div>
+            </div>
+            {% if peak_decision.status %}
+            <div class="alert alert-info mt-3 mb-0 automation-live-warning" role="alert">
+              Conversion peak: {{ peak_decision.peak_time or "not decided" }} {{ peak_decision.time_zone or preference.schedule_timezone or "UTC" }}.
+              Boost: {{ peak_decision.boost_start_time or "not decided" }}.
+              Restore: {{ peak_decision.restore_time or "not decided" }}.
+              {% if peak_decision.peak_hour_conversions is not none %}
+              Peak conversions: {{ "%.2f"|format(peak_decision.peak_hour_conversions) }}.
+              {% endif %}
+            </div>
+            {% endif %}
+
+            <div class="hr-text">Runtime</div>
+            {% set schedule_decision = preference.schedule_decision_json if preference.schedule_decision_json else {} %}
+            <div class="row g-3">
+              <div class="col-md-4">
+                <label class="form-label" for="schedule-mode">Schedule mode</label>
+                <select class="form-select" id="schedule-mode" name="schedule_mode">
+                  <option value="dynamic_low_traffic" {% if preference.schedule_mode != "manual" %}selected{% endif %}>Lowest traffic</option>
+                  <option value="manual" {% if preference.schedule_mode == "manual" %}selected{% endif %}>Manual</option>
+                </select>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="scheduled-hour">Hour</label>
+                <input class="form-control" id="scheduled-hour" name="scheduled_hour" type="number" min="0" max="23" value="{{ preference.scheduled_hour }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="scheduled-minute">Minute</label>
+                <input class="form-control" id="scheduled-minute" name="scheduled_minute" type="number" min="0" max="59" value="{{ preference.scheduled_minute }}">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="schedule-timezone">Timezone</label>
+                <input class="form-control" id="schedule-timezone" name="schedule_timezone" value="{{ preference.schedule_timezone or 'UTC' }}">
+              </div>
+              <div class="col-md-6">
+                <div class="form-label">Current runtime</div>
+                <div class="form-control-plaintext fw-semibold">
+                  {{ "%02d:%02d"|format(preference.scheduled_hour, preference.scheduled_minute) }} {{ preference.schedule_timezone or "UTC" }}
+                </div>
+              </div>
+            </div>
+            {% if schedule_decision.status %}
+            <div class="alert alert-info mt-3 mb-0 automation-live-warning" role="alert">
+              Low-traffic runtime: {{ schedule_decision.recommended_time }} {{ schedule_decision.time_zone }}.
+              {% if schedule_decision.low_hour_impressions is not none %}
+              Lowest hour had {{ "{:,}".format(schedule_decision.low_hour_impressions) }} impressions; peak hour {{ schedule_decision.peak_hour }} had {{ "{:,}".format(schedule_decision.peak_hour_impressions) }}.
+              {% endif %}
+            </div>
+            {% endif %}
+
+            <div class="hr-text">Limits</div>
+            <div class="row g-3">
+              <div class="col-md-4">
+                <label class="form-label" for="daily-keyword-lookback">Daily lookback</label>
+                <input class="form-control" id="daily-keyword-lookback" name="daily_keyword_lookback_days" type="number" min="1" max="365" value="{{ preference.daily_keyword_lookback_days }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="all-time-refresh">All-time refresh</label>
+                <input class="form-control" id="all-time-refresh" name="all_time_refresh_interval_days" type="number" min="1" max="90" value="{{ preference.all_time_refresh_interval_days }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="mutation-cooldown">Cooldown days</label>
+                <input class="form-control" id="mutation-cooldown" name="mutation_cooldown_days" type="number" min="1" max="60" value="{{ preference.mutation_cooldown_days }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="api-budget">API budget</label>
+                <input class="form-control" id="api-budget" name="api_call_budget_per_day" type="number" min="10" max="100000" value="{{ preference.api_call_budget_per_day }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="max-api-rows">Max rows</label>
+                <input class="form-control" id="max-api-rows" name="max_daily_api_rows" type="number" min="50" max="250000" value="{{ preference.max_daily_api_rows }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="target-cpa">Target CPA</label>
+                <input class="form-control" id="target-cpa" name="target_cost_per_conversion" type="number" step="0.01" value="{{ preference.target_cost_per_conversion if preference.target_cost_per_conversion is not none else '' }}">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label" for="target-roas">Target ROAS</label>
+                <input class="form-control" id="target-roas" name="target_roas" type="number" step="0.01" value="{{ preference.target_roas if preference.target_roas is not none else '' }}">
+              </div>
+            </div>
+          </div>
+          <div class="card-footer d-flex flex-wrap justify-content-between gap-2">
+            <button class="btn btn-outline-primary" type="submit">
+              <i class="ti ti-device-floppy me-2"></i>
+              Save settings
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div class="col-xl-5">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Strategy</h3>
+            <div class="card-actions"><span class="badge bg-blue-lt">{{ strategy.mode }}</span></div>
+          </div>
+          <div class="list-group list-group-flush">
+            {% for item in strategy.intervals %}
+            <div class="list-group-item">
+              <div class="d-flex justify-content-between gap-2">
+                <div class="fw-semibold">{{ item.name }}</div>
+                <span class="badge bg-secondary-lt">{{ item.cadence }}</span>
+              </div>
+              <div class="text-secondary small mt-1">{{ item.detail }}</div>
+            </div>
+            {% endfor %}
+            {% if strategy.campaign_categories %}
+            <div class="list-group-item">
+              <div class="fw-semibold">Campaign categories</div>
+            </div>
+            {% for category in strategy.campaign_categories %}
+            <div class="list-group-item">
+              <div class="d-flex justify-content-between gap-2">
+                <div class="fw-semibold">{{ category.name }}</div>
+                {% if category.target_roas_pct is not none %}
+                <span class="badge bg-green-lt">{{ category.target_roas_pct }}% ROAS</span>
+                {% else %}
+                <span class="badge bg-secondary-lt">{{ category.badge or "No ROAS target" }}</span>
+                {% endif %}
+              </div>
+              <div class="text-secondary small mt-1">{{ category.budget }}</div>
+              <div class="text-secondary small mt-1">{{ category.campaign_types }}</div>
+              <div class="text-secondary small mt-1">{{ category.rule }}</div>
+            </div>
+            {% endfor %}
+            {% endif %}
+          </div>
+          <div class="card-body border-top">
+            <div class="datagrid">
+              <div class="datagrid-item">
+                <div class="datagrid-title">Runtime</div>
+                <div class="datagrid-content">{{ "%02d:%02d"|format(preference.scheduled_hour, preference.scheduled_minute) }} {{ preference.schedule_timezone or "UTC" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">API budget</div>
+                <div class="datagrid-content">{{ strategy.quota.api_call_budget_per_day }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Max rows</div>
+                <div class="datagrid-content">{{ strategy.quota.max_daily_api_rows }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Snapshots</div>
+                <div class="datagrid-content">{{ "Reuse" if strategy.quota.reuse_saved_snapshots else "Refresh" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Sales window</div>
+                <div class="datagrid-content">{{ strategy.quota.sales_guard_window_type|title }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Spend cap</div>
+                <div class="datagrid-content">{{ "%.1f"|format(strategy.quota.odoo_sales_max_spend_ratio) }}% / {{ "%.1f"|format(strategy.quota.odoo_sales_max_spend_ratio + strategy.quota.peak_budget_extra_spend_ratio) }}% peak</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Bootstrap</div>
+                <div class="datagrid-content">{{ strategy.quota.testing_bootstrap_days }}d · PMax after {{ "%.0f"|format(strategy.quota.pmax_min_7d_conversions) }} conv</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Testing budget</div>
+                <div class="datagrid-content">{{ "%.1f"|format(strategy.quota.testing_sales_budget_ratio) }}% sales</div>
+              </div>
+            </div>
+          </div>
+          <div class="card-footer">
+            <form class="d-flex flex-wrap gap-2" method="post" action="/automation/run">
+              <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+              <label class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" name="force">
+                <span class="form-check-label">Force refresh</span>
+              </label>
+              <a class="btn btn-outline-secondary" href="/automation/google-ads-editor-export?account_id={{ selected_account.id }}">
+                <i class="ti ti-file-spreadsheet me-2"></i>
+                Editor export
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/google-ads-editor-export?account_id={{ selected_account.id }}&kind=dynamic_search">
+                <i class="ti ti-list-search me-2"></i>
+                AI Max URL export
+              </a>
+              <a class="btn btn-outline-primary" href="/negative-keywords?account_id={{ selected_account.id }}">
+                <i class="ti ti-shield-search me-2"></i>
+                Review negatives
+              </a>
+              <button class="btn btn-primary ms-auto" type="submit">
+                <i class="ti ti-player-play me-2"></i>
+                Run monitor now
+              </button>
+            </form>
+          </div>
+        </div>
+
+        <div class="card mt-3">
+          <div class="card-header">
+            <h3 class="card-title">Last state</h3>
+          </div>
+          <div class="card-body">
+            <div class="datagrid">
+              <div class="datagrid-item">
+                <div class="datagrid-title">Daily keywords</div>
+                <div class="datagrid-content">{{ preference.last_keyword_pull_at.strftime("%Y-%m-%d %H:%M") if preference.last_keyword_pull_at else "Never" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">All-time keywords</div>
+                <div class="datagrid-content">{{ preference.last_all_time_pull_at.strftime("%Y-%m-%d %H:%M") if preference.last_all_time_pull_at else "Never" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Analysis</div>
+                <div class="datagrid-content">{{ preference.last_analysis_at.strftime("%Y-%m-%d %H:%M") if preference.last_analysis_at else "Never" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Runtime decision</div>
+                <div class="datagrid-content">{{ preference.last_schedule_decision_at.strftime("%Y-%m-%d %H:%M") if preference.last_schedule_decision_at else "Never" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Peak budget decision</div>
+                <div class="datagrid-content">{{ preference.last_peak_budget_decision_at.strftime("%Y-%m-%d %H:%M") if preference.last_peak_budget_decision_at else "Never" }}</div>
+              </div>
+              <div class="datagrid-item">
+                <div class="datagrid-title">Last error</div>
+                <div class="datagrid-content">{{ preference.last_error|truncate(80, True, "...") if preference.last_error else "None" }}</div>
+              </div>
+            </div>
+          </div>
+          {% set last_summary = preference.strategy_summary_json if preference.strategy_summary_json else {} %}
+          {% if last_summary.steps %}
+          <div class="table-responsive">
+            <table class="table table-vcenter card-table">
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Status</th>
+                  <th class="text-end">Keywords</th>
+                  <th class="text-end">Negatives</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for step in last_summary.steps %}
+                <tr>
+                  <td>{{ step.name|replace("_", " ") }}</td>
+                  <td><span class="badge bg-secondary-lt">{{ step.status }}</span></td>
+                  <td class="text-end">{{ step.keywords_saved if step.keywords_saved is defined else "" }}</td>
+                  <td class="text-end">{{ step.negative_keywords_saved if step.negative_keywords_saved is defined else "" }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header">
+        <h3 class="card-title">Recent automation jobs</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Progress</th>
+              <th>Created</th>
+              <th>Error</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for job in recent_jobs %}
+            <tr>
+              <td><a href="/jobs#job-{{ job.id }}">#{{ job.id }} {{ job.label }}</a></td>
+              <td><span class="badge bg-secondary-lt">{{ job.status.value if job.status.value else job.status }}</span></td>
+              <td>{{ job.progress_current }} / {{ job.progress_total }}</td>
+              <td>{{ job.created_at.strftime("%Y-%m-%d %H:%M") if job.created_at else "" }}</td>
+              <td class="text-secondary small">{{ job.error|truncate(100, True, "...") if job.error else "" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-secondary">No automation monitor jobs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+{% endblock %}

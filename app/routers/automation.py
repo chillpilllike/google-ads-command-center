@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from sqlalchemy import desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.dependencies import require_user, settings, templates
+from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
+from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
+from app.services.google_ads_automation import (
+    automation_strategy_summary,
+    budget_guard_due_now,
+    clamp_int,
+    load_audience_signal_inputs,
+    peak_budget_due_now,
+    preference_due_now,
+    refresh_low_traffic_schedule,
+    refresh_peak_budget_decision,
+    save_audience_signal_inputs,
+)
+
+
+router = APIRouter()
+STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
+
+
+def _checked(value: Optional[str]) -> bool:
+    return value == "on"
+
+
+def _optional_float(value: str) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _clamp_float(value: Optional[float], default: float, low: float, high: float) -> float:
+    if value is None:
+        parsed = default
+    else:
+        parsed = float(value)
+    return min(max(parsed, low), high)
+
+
+async def _active_accounts(session: AsyncSession) -> list[GoogleAdsAccount]:
+    return list(
+        (
+            await session.scalars(
+                select(GoogleAdsAccount)
+                .where(GoogleAdsAccount.is_active.is_(True))
+                .order_by(GoogleAdsAccount.name)
+            )
+        ).all()
+    )
+
+
+async def _preference_for(session: AsyncSession, account: GoogleAdsAccount) -> GoogleAdsAutomationPreference:
+    preference = await session.scalar(
+        select(GoogleAdsAutomationPreference).where(GoogleAdsAutomationPreference.account_id == account.id)
+    )
+    if preference is not None:
+        return preference
+    preference = GoogleAdsAutomationPreference(account_id=account.id)
+    session.add(preference)
+    await session.commit()
+    await session.refresh(preference)
+    return preference
+
+
+@router.get("/automation", response_class=HTMLResponse)
+async def automation_page(
+    request: Request,
+    account_id: Optional[int] = None,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(require_user),
+) -> HTMLResponse:
+    accounts = await _active_accounts(session)
+    selected = None
+    if account_id:
+        selected = next((account for account in accounts if account.id == int(account_id)), None)
+    if selected is None and accounts:
+        selected = accounts[0]
+    preference = await _preference_for(session, selected) if selected is not None else None
+    audience_signal_inputs = (
+        await session.run_sync(lambda sync_session: load_audience_signal_inputs(sync_session, selected))
+        if selected is not None
+        else {"manual_similar_urls": [], "manual_interests": []}
+    )
+
+    preference_rows = (
+        await session.scalars(
+            select(GoogleAdsAutomationPreference).where(
+                GoogleAdsAutomationPreference.account_id.in_([account.id for account in accounts] or [0])
+            )
+        )
+    ).all()
+    preference_by_account = {row.account_id: row for row in preference_rows}
+
+    keyword_summary_subq = (
+        select(
+            GoogleAdsKeywordCandidate.account_id.label("account_id"),
+            func.count(GoogleAdsKeywordCandidate.id).label("keyword_count"),
+            func.max(GoogleAdsKeywordCandidate.last_pulled_at).label("last_pulled_at"),
+        )
+        .group_by(GoogleAdsKeywordCandidate.account_id)
+        .subquery()
+    )
+    keyword_rows = (
+        await session.execute(
+            select(
+                GoogleAdsAccount.id,
+                keyword_summary_subq.c.keyword_count,
+                keyword_summary_subq.c.last_pulled_at,
+            )
+            .outerjoin(keyword_summary_subq, keyword_summary_subq.c.account_id == GoogleAdsAccount.id)
+            .where(GoogleAdsAccount.id.in_([account.id for account in accounts] or [0]))
+        )
+    ).all()
+    keyword_by_account = {
+        int(row[0]): {"keyword_count": int(row[1] or 0), "last_pulled_at": row[2]}
+        for row in keyword_rows
+    }
+    negative_summary_subq = (
+        select(
+            GoogleAdsNegativeKeywordCandidate.account_id.label("account_id"),
+            func.count(GoogleAdsNegativeKeywordCandidate.id).label("negative_count"),
+            func.max(GoogleAdsNegativeKeywordCandidate.last_pulled_at).label("last_pulled_at"),
+        )
+        .group_by(GoogleAdsNegativeKeywordCandidate.account_id)
+        .subquery()
+    )
+    negative_rows = (
+        await session.execute(
+            select(
+                GoogleAdsAccount.id,
+                negative_summary_subq.c.negative_count,
+                negative_summary_subq.c.last_pulled_at,
+            )
+            .outerjoin(negative_summary_subq, negative_summary_subq.c.account_id == GoogleAdsAccount.id)
+            .where(GoogleAdsAccount.id.in_([account.id for account in accounts] or [0]))
+        )
+    ).all()
+    negative_by_account = {
+        int(row[0]): {"negative_count": int(row[1] or 0), "last_pulled_at": row[2]}
+        for row in negative_rows
+    }
+    account_summaries = [
+        {
+            "account": account,
+            "preference": preference_by_account.get(account.id),
+            "keyword": keyword_by_account.get(account.id, {"keyword_count": 0, "last_pulled_at": None}),
+            "negative": negative_by_account.get(account.id, {"negative_count": 0, "last_pulled_at": None}),
+        }
+        for account in accounts
+    ]
+    recent_jobs = (
+        await session.scalars(
+            select(BackgroundJob)
+            .where(BackgroundJob.job_type == "google_ads_automation_monitor")
+            .order_by(desc(BackgroundJob.created_at), desc(BackgroundJob.id))
+            .limit(8)
+        )
+    ).all()
+    return templates.TemplateResponse(
+        "automation.html",
+        {
+            "request": request,
+            "user": user,
+            "app_name": settings.app_name,
+            "accounts": accounts,
+            "account_summaries": account_summaries,
+            "selected_account": selected,
+            "preference": preference,
+            "strategy": automation_strategy_summary(preference),
+            "audience_signal_inputs": audience_signal_inputs,
+            "recent_jobs": recent_jobs,
+            "saved": request.query_params.get("saved") == "1",
+            "job_id": request.query_params.get("job_id", ""),
+        },
+    )
+
+
+@router.post("/automation/preferences")
+async def save_automation_preferences(
+    account_id: int = Form(...),
+    automation_enabled: Optional[str] = Form(None),
+    monitor_only: Optional[str] = Form(None),
+    keyword_discovery_enabled: Optional[str] = Form(None),
+    negative_keyword_enabled: Optional[str] = Form(None),
+    audience_signal_enabled: Optional[str] = Form(None),
+    landing_page_enabled: Optional[str] = Form(None),
+    auction_monitor_enabled: Optional[str] = Form(None),
+    odoo_sales_guard_enabled: Optional[str] = Form(None),
+    auto_apply_keywords_enabled: Optional[str] = Form(None),
+    auto_apply_negatives_enabled: Optional[str] = Form(None),
+    auto_create_campaigns_enabled: Optional[str] = Form(None),
+    auto_pause_campaigns_enabled: Optional[str] = Form(None),
+    auto_peak_budget_enabled: Optional[str] = Form(None),
+    testing_bootstrap_enabled: Optional[str] = Form(None),
+    testing_bootstrap_days: int = Form(15),
+    pmax_min_7d_conversions: str = Form("15"),
+    testing_sales_budget_pct: str = Form("5"),
+    testing_keyword_limit: int = Form(30),
+    testing_landing_page_limit: int = Form(25),
+    peak_budget_increase_pct: str = Form("50"),
+    peak_budget_warmup_minutes: int = Form(60),
+    peak_budget_restore_delay_minutes: int = Form(0),
+    daily_keyword_lookback_days: int = Form(60),
+    all_time_refresh_interval_days: int = Form(7),
+    api_call_budget_per_day: int = Form(750),
+    max_daily_api_rows: int = Form(10000),
+    mutation_cooldown_days: int = Form(3),
+    schedule_mode: str = Form("dynamic_low_traffic"),
+    scheduled_hour: int = Form(4),
+    scheduled_minute: int = Form(20),
+    schedule_timezone: str = Form("UTC"),
+    odoo_sales_max_spend_pct: str = Form("15"),
+    odoo_sales_guard_window_days: int = Form(7),
+    budget_guard_check_interval_hours: int = Form(6),
+    minimum_daily_budget_amount: str = Form("1"),
+    underperforming_budget_reduce_pct: str = Form("20"),
+    peak_budget_extra_spend_pct: str = Form("5"),
+    peak_budget_check_interval_minutes: int = Form(60),
+    target_cost_per_conversion: str = Form(""),
+    target_roas: str = Form(""),
+    manual_similar_urls: str = Form(""),
+    manual_interests: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(require_user),
+) -> RedirectResponse:
+    account = await session.get(GoogleAdsAccount, int(account_id))
+    if account is None or not account.is_active:
+        raise HTTPException(status_code=400, detail="Select an active Google Ads account.")
+    preference = await _preference_for(session, account)
+    preference.automation_enabled = _checked(automation_enabled)
+    preference.monitor_only = _checked(monitor_only)
+    preference.keyword_discovery_enabled = _checked(keyword_discovery_enabled)
+    preference.negative_keyword_enabled = _checked(negative_keyword_enabled)
+    preference.audience_signal_enabled = _checked(audience_signal_enabled)
+    preference.landing_page_enabled = _checked(landing_page_enabled)
+    preference.auction_monitor_enabled = _checked(auction_monitor_enabled)
+    preference.odoo_sales_guard_enabled = _checked(odoo_sales_guard_enabled)
+    preference.auto_apply_keywords_enabled = _checked(auto_apply_keywords_enabled)
+    preference.auto_apply_negatives_enabled = _checked(auto_apply_negatives_enabled)
+    preference.auto_create_campaigns_enabled = _checked(auto_create_campaigns_enabled)
+    preference.auto_pause_campaigns_enabled = _checked(auto_pause_campaigns_enabled)
+    preference.auto_peak_budget_enabled = _checked(auto_peak_budget_enabled)
+    preference.testing_bootstrap_enabled = _checked(testing_bootstrap_enabled)
+    preference.testing_bootstrap_days = clamp_int(testing_bootstrap_days, 15, 1, 60)
+    preference.pmax_min_7d_conversions = _clamp_float(_optional_float(pmax_min_7d_conversions), 15, 1, 1000)
+    preference.testing_sales_budget_ratio = _clamp_float(_optional_float(testing_sales_budget_pct), 5, 0.1, 100) / 100
+    preference.testing_keyword_limit = clamp_int(testing_keyword_limit, 30, 1, 200)
+    preference.testing_landing_page_limit = clamp_int(testing_landing_page_limit, 25, 1, 500)
+    preference.peak_budget_increase_pct = _clamp_float(_optional_float(peak_budget_increase_pct), 50, 1, 200) / 100
+    preference.peak_budget_warmup_minutes = clamp_int(peak_budget_warmup_minutes, 60, 15, 240)
+    preference.peak_budget_restore_delay_minutes = clamp_int(peak_budget_restore_delay_minutes, 0, 0, 240)
+    preference.daily_keyword_lookback_days = clamp_int(daily_keyword_lookback_days, 60, 1, 365)
+    preference.all_time_refresh_interval_days = clamp_int(all_time_refresh_interval_days, 7, 1, 90)
+    preference.api_call_budget_per_day = clamp_int(api_call_budget_per_day, 750, 10, 100000)
+    preference.max_daily_api_rows = clamp_int(max_daily_api_rows, 10000, 50, 250000)
+    preference.mutation_cooldown_days = clamp_int(mutation_cooldown_days, 3, 1, 60)
+    preference.schedule_mode = "manual" if str(schedule_mode or "").strip() == "manual" else "dynamic_low_traffic"
+    preference.scheduled_hour = clamp_int(scheduled_hour, 4, 0, 23)
+    preference.scheduled_minute = clamp_int(scheduled_minute, 20, 0, 59)
+    preference.schedule_timezone = str(schedule_timezone or "UTC").strip()[:80] or "UTC"
+    preference.odoo_sales_max_spend_ratio = _clamp_float(_optional_float(odoo_sales_max_spend_pct), 15, 1, 100) / 100
+    preference.odoo_sales_guard_window_days = clamp_int(odoo_sales_guard_window_days, 7, 1, 90)
+    preference.budget_guard_check_interval_hours = clamp_int(budget_guard_check_interval_hours, 6, 1, 24)
+    preference.minimum_daily_budget_amount = _clamp_float(_optional_float(minimum_daily_budget_amount), 1, 0, 100000)
+    preference.underperforming_budget_reduce_pct = _clamp_float(_optional_float(underperforming_budget_reduce_pct), 20, 1, 90) / 100
+    preference.peak_budget_extra_spend_ratio = _clamp_float(_optional_float(peak_budget_extra_spend_pct), 5, 0, 100) / 100
+    preference.peak_budget_check_interval_minutes = clamp_int(peak_budget_check_interval_minutes, 60, 15, 240)
+    preference.target_cost_per_conversion = _optional_float(target_cost_per_conversion)
+    preference.target_roas = _optional_float(target_roas)
+    await session.run_sync(
+        lambda sync_session: save_audience_signal_inputs(
+            sync_session,
+            sync_session.get(GoogleAdsAccount, int(account_id)),
+            manual_similar_urls=manual_similar_urls,
+            manual_interests=manual_interests,
+        )
+    )
+    await session.commit()
+    if preference.schedule_mode == "dynamic_low_traffic":
+        await session.run_sync(
+            lambda sync_session: refresh_low_traffic_schedule(
+                sync_session,
+                sync_session.get(GoogleAdsAutomationPreference, preference.id),
+                fetch_time_zone=False,
+            )
+        )
+    if preference.auto_peak_budget_enabled:
+        await session.run_sync(
+            lambda sync_session: refresh_peak_budget_decision(
+                sync_session,
+                sync_session.get(GoogleAdsAutomationPreference, preference.id),
+                fetch_time_zone=False,
+            )
+        )
+    return RedirectResponse(f"/automation?account_id={account.id}&saved=1", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@router.post("/automation/run")
+async def queue_automation_monitor(
+    account_id: int = Form(...),
+    force: Optional[str] = Form(None),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(require_user),
+) -> RedirectResponse:
+    account = await session.get(GoogleAdsAccount, int(account_id))
+    if account is None or not account.is_active:
+        raise HTTPException(status_code=400, detail="Select an active Google Ads account.")
+    preference = await _preference_for(session, account)
+    if not preference.automation_enabled:
+        preference.automation_enabled = True
+        await session.commit()
+    job = await create_background_job(
+        session,
+        job_type="google_ads_automation_monitor",
+        label=f"Automation monitor: {account.name}",
+        requested_by_id=user.id,
+        payload={
+            "account_ids": [account.id],
+            "customer_id": account.customer_id,
+            "force": _checked(force),
+            "monitor_only": preference.monitor_only,
+        },
+    )
+    try:
+        from app.tasks import run_google_ads_automation_monitor
+
+        message = run_google_ads_automation_monitor.send(job.id, [account.id], _checked(force))
+        await save_job_message_id(session, job, str(message.message_id))
+    except Exception as exc:  # noqa: BLE001
+        await mark_job_dispatch_failed(session, job, str(exc))
+    return RedirectResponse(
+        f"/automation?account_id={account.id}&job_id={job.id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/api/automation/scheduler/tick")
+async def automation_scheduler_tick(
+    request: Request,
+    recompute: int = 1,
+    force: int = 0,
+    session: AsyncSession = Depends(get_session),
+) -> JSONResponse:
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="Automation scheduler tick is local-only.")
+    preferences = (
+        await session.scalars(
+            select(GoogleAdsAutomationPreference)
+            .join(GoogleAdsAccount, GoogleAdsAccount.id == GoogleAdsAutomationPreference.account_id)
+            .where(
+                GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                GoogleAdsAccount.is_active.is_(True),
+            )
+            .order_by(GoogleAdsAccount.name)
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    due_account_ids: list[int] = []
+    due_reasons: dict[int, list[str]] = {}
+    decisions: list[dict] = []
+    for preference in preferences:
+        if recompute:
+            schedule_decision = await session.run_sync(
+                lambda sync_session, preference_id=preference.id: refresh_low_traffic_schedule(
+                    sync_session,
+                    sync_session.get(GoogleAdsAutomationPreference, preference_id),
+                    fetch_time_zone=False,
+                )
+            )
+            peak_decision = await session.run_sync(
+                lambda sync_session, preference_id=preference.id: refresh_peak_budget_decision(
+                    sync_session,
+                    sync_session.get(GoogleAdsAutomationPreference, preference_id),
+                    fetch_time_zone=False,
+                )
+            )
+            decisions.append(
+                {
+                    "account_id": preference.account_id,
+                    "time": schedule_decision.get("recommended_time"),
+                    "time_zone": schedule_decision.get("time_zone"),
+                    "low_hour_impressions": schedule_decision.get("low_hour_impressions"),
+                    "traffic_peak_hour": schedule_decision.get("peak_hour"),
+                    "traffic_peak_hour_impressions": schedule_decision.get("peak_hour_impressions"),
+                    "conversion_peak_time": peak_decision.get("peak_time"),
+                    "conversion_peak_conversions": peak_decision.get("peak_hour_conversions"),
+                    "budget_boost_start_time": peak_decision.get("boost_start_time"),
+                }
+            )
+            await session.refresh(preference)
+        schedule_due = preference_due_now(preference, now=now)
+        budget_guard_due = budget_guard_due_now(preference, now=now)
+        peak_due = await session.run_sync(
+            lambda sync_session, preference_id=preference.id: peak_budget_due_now(
+                sync_session,
+                sync_session.get(GoogleAdsAutomationPreference, preference_id),
+                now=now,
+            )
+        )
+        reasons = []
+        if schedule_due:
+            reasons.append("daily_low_traffic")
+        if budget_guard_due:
+            reasons.append("budget_guard")
+        if peak_due:
+            reasons.append("peak_budget")
+        if force and not reasons:
+            reasons.append("manual_force")
+        if reasons:
+            due_account_ids.append(preference.account_id)
+            due_reasons[preference.account_id] = reasons
+    due_account_ids = list(dict.fromkeys(due_account_ids))
+    budget_only_reasons = {"budget_guard", "peak_budget"}
+    budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(budget_only_reasons) for account_id in due_account_ids)
+    if not due_account_ids:
+        return JSONResponse({"queued": False, "reason": "not_due", "schedule_decisions": decisions})
+    stale_before = now - STALE_QUEUED_AUTOMATION_JOB_AFTER
+    stale_jobs = (
+        await session.scalars(
+            select(BackgroundJob).where(
+                BackgroundJob.job_type == "google_ads_automation_monitor",
+                BackgroundJob.status == BackgroundJobStatus.queued,
+                BackgroundJob.started_at.is_(None),
+                BackgroundJob.created_at < stale_before,
+            )
+        )
+    ).all()
+    for stale_job in stale_jobs:
+        stale_job.status = BackgroundJobStatus.failed
+        stale_job.finished_at = now
+        stale_job.error = "Stale queued automation job never started; marked failed so scheduler can resume."
+    if stale_jobs:
+        await session.commit()
+    active_job = await session.scalar(
+        select(BackgroundJob)
+        .where(
+            BackgroundJob.job_type == "google_ads_automation_monitor",
+            BackgroundJob.status.in_(
+                [
+                    BackgroundJobStatus.queued,
+                    BackgroundJobStatus.running,
+                    BackgroundJobStatus.cancel_requested,
+                ]
+            ),
+        )
+        .order_by(desc(BackgroundJob.created_at), desc(BackgroundJob.id))
+        .limit(1)
+    )
+    if active_job is not None:
+        return JSONResponse(
+            {
+                "queued": False,
+                "reason": "active_job_exists",
+                "active_job_id": active_job.id,
+                "active_status": active_job.status.value,
+                "due_account_ids": due_account_ids,
+                "due_reasons": due_reasons,
+                "budget_only": budget_only,
+                "schedule_decisions": decisions,
+            }
+        )
+    job = await create_background_job(
+        session,
+        job_type="google_ads_automation_monitor",
+        label=f"Automation monitor: {len(due_account_ids)} due account(s)",
+        requested_by_id=None,
+        payload={
+            "account_ids": due_account_ids,
+            "force": bool(force),
+            "budget_only": budget_only,
+            "queued_by": "local_scheduler_tick",
+            "due_reasons": due_reasons,
+            "schedule_decisions": decisions,
+        },
+    )
+    try:
+        from app.tasks import run_google_ads_automation_monitor
+
+        message = run_google_ads_automation_monitor.send(job.id, due_account_ids, bool(force), budget_only)
+        await save_job_message_id(session, job, str(message.message_id))
+    except Exception as exc:  # noqa: BLE001
+        await mark_job_dispatch_failed(session, job, str(exc))
+        return JSONResponse({"queued": False, "reason": "dispatch_failed", "job_id": job.id, "error": str(exc)})
+    return JSONResponse(
+        {
+            "queued": True,
+            "job_id": job.id,
+            "due_account_ids": due_account_ids,
+            "due_reasons": due_reasons,
+            "budget_only": budget_only,
+            "schedule_decisions": decisions,
+        }
+    )
