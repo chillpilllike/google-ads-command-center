@@ -137,13 +137,21 @@ async def get_google_ads_connection_status(
 
     values = await setting_values(session)
     connections = (
-        await session.scalars(select(GoogleAdsConnection).order_by(GoogleAdsConnection.name, GoogleAdsConnection.id))
+        await session.scalars(
+            select(GoogleAdsConnection)
+            .where(GoogleAdsConnection.is_active.is_(True))
+            .order_by(GoogleAdsConnection.name, GoogleAdsConnection.id)
+        )
     ).all()
     if not connections:
         await ensure_default_google_ads_connection(session)
         await session.flush()
         connections = (
-            await session.scalars(select(GoogleAdsConnection).order_by(GoogleAdsConnection.name, GoogleAdsConnection.id))
+            await session.scalars(
+                select(GoogleAdsConnection)
+                .where(GoogleAdsConnection.is_active.is_(True))
+                .order_by(GoogleAdsConnection.name, GoogleAdsConnection.id)
+            )
         ).all()
     flags = {
         "developer_token": _has_value(values.get("google_ads.developer_token")),
