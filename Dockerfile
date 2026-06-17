@@ -1,4 +1,20 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS source
+
+ARG REPO_URL=https://github.com/chillpilllike/google-ads-command-center.git
+ARG GIT_BRANCH=main
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bust Docker cache whenever the public GitHub main branch changes.
+ADD https://api.github.com/repos/chillpilllike/google-ads-command-center/commits/main /tmp/github-version.json
+
+WORKDIR /src
+RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" .
+
+
+FROM python:3.12-slim AS app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -21,13 +37,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
+COPY --from=source /src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
-COPY scripts ./scripts
-COPY config ./config
-COPY README.md ./
+COPY --from=source /src/app ./app
+COPY --from=source /src/scripts ./scripts
+COPY --from=source /src/config ./config
+COPY --from=source /src/README.md ./
 
 RUN chmod +x scripts/docker_start.sh scripts/run_automation_scheduler_loop.sh
 
