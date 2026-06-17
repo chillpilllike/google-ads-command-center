@@ -13,6 +13,14 @@ from app.services.google_ads_connection import clean_customer_id
 from app.services.google_ads_sync import enum_name
 
 
+def _is_inactive_customer_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "CUSTOMER_NOT_ENABLED" in message
+        or "not yet enabled or has been deactivated" in message
+    )
+
+
 def _client_for_connection(
     connection: GoogleAdsConnection,
     *,
@@ -107,6 +115,7 @@ def discover_accounts_for_connection(session: Session, connection_id: int) -> di
     visited_managers: set[str] = set()
     queued_managers: set[str] = set()
     errors: list[str] = []
+    skipped: list[str] = []
     root_client = _client_for_connection(connection)
     customer_service = root_client.get_service("CustomerService")
     accessible = customer_service.list_accessible_customers()
@@ -121,6 +130,9 @@ def discover_accounts_for_connection(session: Session, connection_id: int) -> di
             direct_client = _client_for_connection(connection, login_customer_id=accessible_customer_id)
             info = _customer_info(direct_client, accessible_customer_id)
         except Exception as exc:  # noqa: BLE001 - keep discovery moving across accessible customers.
+            if _is_inactive_customer_error(exc):
+                skipped.append(f"{accessible_customer_id}: inactive or deactivated")
+                continue
             errors.append(f"{accessible_customer_id}: {exc}")
             continue
 
@@ -196,6 +208,9 @@ def discover_accounts_for_connection(session: Session, connection_id: int) -> di
                     discovered_accounts += 1
                     seen_accounts.add(child_id)
         except Exception as exc:  # noqa: BLE001
+            if _is_inactive_customer_error(exc):
+                skipped.append(f"{info['id']}: inactive or deactivated")
+                continue
             errors.append(f"{info['id']}: {exc}")
 
     connection.last_discovery_at = datetime.now(timezone.utc)
@@ -210,4 +225,5 @@ def discover_accounts_for_connection(session: Session, connection_id: int) -> di
         "manager_count": len(discovered_managers),
         "account_count": discovered_accounts,
         "errors": errors,
+        "skipped": skipped,
     }
