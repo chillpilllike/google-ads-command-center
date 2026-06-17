@@ -8,51 +8,63 @@
       "sub_accounts": [
         {
           "name": "Nutricity Austria",
-          "customer_id": "264-019-8743"
+          "customer_id": "264-019-8743",
+          "currency_code": "INR"
         },
         {
           "name": "NutriCity Czech Republic",
-          "customer_id": "915-308-3949"
+          "customer_id": "915-308-3949",
+          "currency_code": "INR"
         },
         {
           "name": "NutriCity Denmark",
-          "customer_id": "510-797-1093"
+          "customer_id": "510-797-1093",
+          "currency_code": "INR"
         },
         {
           "name": "NutriCity Finland",
-          "customer_id": "636-309-8182"
+          "customer_id": "636-309-8182",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity France",
-          "customer_id": "467-860-1329"
+          "customer_id": "467-860-1329",
+          "currency_code": "INR"
         },
         {
           "name": "NutriCity Lithuania",
-          "customer_id": "462-140-7235"
+          "customer_id": "462-140-7235",
+          "currency_code": "INR"
         },
         {
           "name": "NutriCity NZ (co.nz)",
-          "customer_id": "359-962-1343"
+          "customer_id": "359-962-1343",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Spain",
-          "customer_id": "300-277-5588"
+          "customer_id": "300-277-5588",
+          "currency_code": "INR"
         },
         {
           "name": "Nutrihub CA",
-          "customer_id": "483-890-3197"
+          "customer_id": "483-890-3197",
+          "currency_code": "INR"
         },
         {
           "name": "Prime Supps - INR Account",
-          "customer_id": "351-357-2068"
+          "customer_id": "351-357-2068",
+          "currency_code": "INR"
         },
         {
           "name": "SuppCity INR Account",
-          "customer_id": "207-351-3329"
+          "customer_id": "207-351-3329",
+          "currency_code": "INR"
         },
         {
           "name": "Vitagen Australia",
-          "customer_id": "492-481-8196"
+          "customer_id": "492-481-8196",
+          "currency_code": "INR"
         }
       ]
     },
@@ -64,91 +76,113 @@
       "sub_accounts": [
         {
           "name": "Nutricity Brazil",
-          "customer_id": "560-925-3788"
+          "customer_id": "560-925-3788",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Chile",
-          "customer_id": "526-843-0892"
+          "customer_id": "526-843-0892",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity China",
-          "customer_id": "221-584-4896"
+          "customer_id": "221-584-4896",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Cyprus",
-          "customer_id": "440-538-0825"
+          "customer_id": "440-538-0825",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Estonia",
-          "customer_id": "498-908-0417"
+          "customer_id": "498-908-0417",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Germany",
-          "customer_id": "354-651-9270"
+          "customer_id": "354-651-9270",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Greece",
-          "customer_id": "410-253-4425"
+          "customer_id": "410-253-4425",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Indonesia",
-          "customer_id": "519-933-0448"
+          "customer_id": "519-933-0448",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Israel",
-          "customer_id": "984-523-6431"
+          "customer_id": "984-523-6431",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Italy",
-          "customer_id": "680-196-9372"
+          "customer_id": "680-196-9372",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Japan",
-          "customer_id": "283-074-8821"
+          "customer_id": "283-074-8821",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Latvia",
-          "customer_id": "819-791-2209"
+          "customer_id": "819-791-2209",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Malaysia",
-          "customer_id": "724-814-6142"
+          "customer_id": "724-814-6142",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Mexico",
-          "customer_id": "494-612-9541"
+          "customer_id": "494-612-9541",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Netherlands",
-          "customer_id": "723-792-8790"
+          "customer_id": "723-792-8790",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Norway",
-          "customer_id": "247-139-8707"
+          "customer_id": "247-139-8707",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Singapore",
-          "customer_id": "616-912-4564"
+          "customer_id": "616-912-4564",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity South Africa",
-          "customer_id": "209-019-9131"
+          "customer_id": "209-019-9131",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Sweden",
-          "customer_id": "443-080-6933"
+          "customer_id": "443-080-6933",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Taiwan",
-          "customer_id": "933-780-4745"
+          "customer_id": "933-780-4745",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Turkey",
-          "customer_id": "724-243-7894"
+          "customer_id": "724-243-7894",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Uruguay",
-          "customer_id": "865-869-0594"
+          "customer_id": "865-869-0594",
+          "currency_code": "INR"
         }
       ]
     },
@@ -160,47 +194,58 @@
       "sub_accounts": [
         {
           "name": "Nutricity Argentina",
-          "customer_id": "216-343-1327"
+          "customer_id": "216-343-1327",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity AU",
-          "customer_id": "484-711-5629"
+          "customer_id": "484-711-5629",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Laos",
-          "customer_id": "405-815-6472"
+          "customer_id": "405-815-6472",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Luxembourg",
-          "customer_id": "150-314-0398"
+          "customer_id": "150-314-0398",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity New Zealand(.nz)",
-          "customer_id": "601-307-9244"
+          "customer_id": "601-307-9244",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Poland",
-          "customer_id": "416-248-8043"
+          "customer_id": "416-248-8043",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Romania",
-          "customer_id": "865-607-0999"
+          "customer_id": "865-607-0999",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Slovenia",
-          "customer_id": "193-416-9882"
+          "customer_id": "193-416-9882",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity South Korea",
-          "customer_id": "746-839-8829"
+          "customer_id": "746-839-8829",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity Switzerland",
-          "customer_id": "143-467-1688"
+          "customer_id": "143-467-1688",
+          "currency_code": "INR"
         },
         {
           "name": "Nutricity USA",
-          "customer_id": "256-545-2394"
+          "customer_id": "256-545-2394",
+          "currency_code": "INR"
         }
       ]
     },
@@ -212,23 +257,28 @@
       "sub_accounts": [
         {
           "name": "Nutricity CA",
-          "customer_id": "349-546-3031"
+          "customer_id": "349-546-3031",
+          "currency_code": "AUD"
         },
         {
           "name": "BoostGo - AUD Account",
-          "customer_id": "985-690-5758"
+          "customer_id": "985-690-5758",
+          "currency_code": "AUD"
         },
         {
           "name": "Espot - AUD Account",
-          "customer_id": "168-532-5188"
+          "customer_id": "168-532-5188",
+          "currency_code": "AUD"
         },
         {
           "name": "NutriCity - AUD Account",
-          "customer_id": "897-616-2539"
+          "customer_id": "897-616-2539",
+          "currency_code": "AUD"
         },
         {
           "name": "NutriCity - UK Account",
-          "customer_id": "582-036-5427"
+          "customer_id": "582-036-5427",
+          "currency_code": "AUD"
         }
       ]
     }

@@ -179,6 +179,7 @@ def load_account_rows(path: Path) -> list[dict[str, str]]:
                     "manager_customer_id": clean_customer_id(str(manager["customer_id"])),
                     "name": str(account["name"]),
                     "customer_id": clean_customer_id(str(account["customer_id"])),
+                    "currency_code": str(account.get("currency_code") or ""),
                     "is_active": True,
                 }
             )
@@ -231,6 +232,7 @@ async def seed_database(session: AsyncSession, settings: Settings) -> None:
                     "manager_name": stmt.excluded.manager_name,
                     "manager_customer_id": stmt.excluded.manager_customer_id,
                     "name": stmt.excluded.name,
+                    "currency_code": stmt.excluded.currency_code,
                 },
             )
             await session.execute(stmt)
