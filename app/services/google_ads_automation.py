@@ -71,6 +71,11 @@ from app.services.google_search_console import (
     sync_search_console_search_analytics,
 )
 from app.services.openai_ad_copy import generate_ad_copy
+from app.services.page_feed_restrictions import (
+    get_restricted_title_terms_sync,
+    normalize_restricted_text,
+    restricted_title_match,
+)
 from app.services.spend_guard import odoo_sales_budget_guard_for_account
 
 
@@ -108,6 +113,23 @@ PMAX_SEARCH_THEME_LIMIT = 50
 PMAX_ASSET_GROUP_LIMIT = 100
 PMAX_SEARCH_THEME_BANK_LIMIT = 25000
 PMAX_SEARCH_THEME_TEXT_LIMIT = 80
+PMAX_POLICY_SENSITIVE_FALLBACK_TERMS = (
+    "alli",
+    "orlistat",
+    "melatonin",
+    "yohimbe",
+    "yohimbine",
+    "brimonidine",
+    "lumify",
+    "enterosgel",
+    "akkermansia",
+    "dhea",
+    "soursop",
+    "graviola",
+    "zhong gan ling",
+    "lipo rush",
+    "liporush",
+)
 SCALE_NEGATIVE_MIGRATION_HOLD_DAYS = 3
 SCALE_PAGE_MIGRATION_HOLD_DAYS = 3
 WASTE_RECOVERY_HOLD_DAYS = 7
@@ -2571,6 +2593,84 @@ def _url_inclusion_targets_from_page_items(
     return targets
 
 
+def _pmax_policy_terms(session: Session) -> list[str]:
+    terms = list(get_restricted_title_terms_sync(session) or [])
+    terms.extend(PMAX_POLICY_SENSITIVE_FALLBACK_TERMS)
+    normalized: list[str] = []
+    for term in terms:
+        cleaned = normalize_restricted_text(term)
+        if cleaned:
+            normalized.append(cleaned)
+    return list(dict.fromkeys(normalized))
+
+
+def _pmax_policy_match(value: Any, policy_terms: list[str] | None) -> str:
+    if not policy_terms:
+        return ""
+    return restricted_title_match(value, policy_terms)
+
+
+def _keyword_row_policy_text(row: GoogleAdsKeywordCandidate) -> str:
+    parts = [
+        getattr(row, "keyword", ""),
+        getattr(row, "normalized_keyword", ""),
+        getattr(row, "quality_label", ""),
+        " ".join(str(item or "") for item in (getattr(row, "campaign_names", None) or [])),
+    ]
+    source_json = getattr(row, "source_json", None)
+    if isinstance(source_json, dict):
+        for key in ("product_name", "item_name", "page_title", "landing_page", "final_url", "raw_url"):
+            parts.append(source_json.get(key) or "")
+    return " ".join(str(part or "") for part in parts)
+
+
+def _url_target_policy_text(item: dict[str, Any]) -> str:
+    parts = [
+        item.get("url"),
+        item.get("page_url"),
+        item.get("normalized_url"),
+        item.get("source"),
+        item.get("quality_label"),
+        item.get("page_title"),
+        item.get("product_name"),
+        item.get("keyword"),
+    ]
+    return " ".join(str(part or "") for part in parts)
+
+
+def _pmax_safe_url_targets(
+    targets: list[dict[str, Any]],
+    policy_terms: list[str],
+    *,
+    limit: int = 500,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    safe: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for item in targets:
+        if not isinstance(item, dict):
+            continue
+        match = _pmax_policy_match(_url_target_policy_text(item), policy_terms)
+        if match:
+            blocked.append(
+                {
+                    "url": item.get("url"),
+                    "page_key": item.get("page_key"),
+                    "matched_term": match,
+                    "source": item.get("source"),
+                }
+            )
+            continue
+        safe.append(item)
+        if len(safe) >= limit:
+            break
+    return safe, {
+        "mode": "pmax_policy_safe_subset",
+        "restricted_term_count": len(policy_terms),
+        "blocked_url_count": len(blocked),
+        "blocked_urls": blocked[:100],
+    }
+
+
 def _primary_url_from_targets(targets: list[dict[str, Any]], fallback_url: str) -> str:
     for item in targets:
         if not isinstance(item, dict):
@@ -3138,6 +3238,7 @@ def pmax_search_theme_plan(
     limit: int = PMAX_SEARCH_THEME_LIMIT,
     asset_group_limit: int = PMAX_ASSET_GROUP_LIMIT,
     overflow_limit: int = PMAX_SEARCH_THEME_BANK_LIMIT,
+    policy_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     limit = clamp_int(limit, PMAX_SEARCH_THEME_LIMIT, 1, PMAX_SEARCH_THEME_LIMIT)
     asset_group_limit = clamp_int(asset_group_limit, PMAX_ASSET_GROUP_LIMIT, 1, PMAX_ASSET_GROUP_LIMIT)
@@ -3155,11 +3256,25 @@ def pmax_search_theme_plan(
         reverse=True,
     )
     candidates: list[dict[str, Any]] = []
+    policy_filtered: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in ranked_rows:
         term = _clean_pmax_search_theme(getattr(row, "keyword", ""))
         key = _theme_key(term)
         if len(term) < 3 or key in seen:
+            continue
+        policy_match = _pmax_policy_match(_keyword_row_policy_text(row) or term, policy_terms)
+        if policy_match:
+            policy_filtered.append(
+                {
+                    "search_theme": term,
+                    "theme_key": key,
+                    "candidate_id": getattr(row, "id", None),
+                    "matched_term": policy_match,
+                    "source_account_id": getattr(row, "account_id", None),
+                }
+            )
+            seen.add(key)
             continue
         seen.add(key)
         scale_evidence = _scale_search_theme_evidence(row)
@@ -3239,6 +3354,12 @@ def pmax_search_theme_plan(
         "campaign_count": len(campaign_plans),
         "campaign_plans": campaign_plans,
         "new_campaign_required": len(campaign_plans) > 1,
+        "pmax_policy_filter": {
+            "mode": "search_theme_policy_safe_subset",
+            "restricted_term_count": len(policy_terms or []),
+            "blocked_search_theme_count": len(policy_filtered),
+            "blocked_search_themes": policy_filtered[:100],
+        },
         "basis": (
             "Top saved Google Ads keyword-bank terms ranked by conversions, conversion value, "
             "score, clicks, and impressions. Terms are sharded into 50 search themes per asset group, "
@@ -3819,9 +3940,10 @@ def run_testing_campaign_automation(
             for row in page_rows
             if _page_key(getattr(row, "normalized_url", "") or getattr(row, "url", "")) not in active_waste_page_keys
         ]
+    pmax_policy_terms = _pmax_policy_terms(session)
     term_ledger_keys: set[str] = set()
     pmax_source_rows = [row for row in keyword_rows if getattr(row, "account_id", None) == account.id] or list(keyword_rows)
-    pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows)
+    pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(pmax_theme_plan))
     pmax_search_themes = list(pmax_theme_plan["active_terms"])
     core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
@@ -3847,7 +3969,7 @@ def run_testing_campaign_automation(
     fill_with_search_console_terms(testing_max_clicks_terms, limit=keyword_limit)
     fill_with_search_console_terms(fix_watch_terms, limit=keyword_limit)
     testing_pmax_source_rows = available_keyword_rows_for_terms(keyword_rows, term_ledger_keys)
-    testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows)
+    testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(testing_pmax_theme_plan))
     waste_recovery_keyword_items = (
         list(waste_negative_plan.get("scale_recovery_keywords") or [])
@@ -3941,8 +4063,18 @@ def run_testing_campaign_automation(
         (governance_categories.get("Testing / Discovery") or {}).get("candidate_pages") or [],
         source="testing_discovery_governance",
     )
+    core_scale_pmax_url_targets, core_scale_pmax_policy_filter = _pmax_safe_url_targets(
+        core_scale_url_targets,
+        pmax_policy_terms,
+    )
+    testing_pmax_url_targets, testing_pmax_policy_filter = _pmax_safe_url_targets(
+        testing_discovery_url_targets,
+        pmax_policy_terms,
+    )
     core_scale_final_url = _primary_url_from_targets(core_scale_url_targets, website_url)
     testing_final_url = _primary_url_from_targets(testing_discovery_url_targets, website_url)
+    core_scale_pmax_final_url = _primary_url_from_targets(core_scale_pmax_url_targets, website_url)
+    testing_pmax_final_url = _primary_url_from_targets(testing_pmax_url_targets, website_url)
     audience_signal_plan = (
         build_audience_signal_plan(
             session,
@@ -4892,18 +5024,23 @@ def run_testing_campaign_automation(
                     "audience_signal_plan": audience_signal_plan,
                     "waste_management_plan": draft_waste_plan,
                     "ga4_ads_signal_matrix": ga4_matrix,
-                    "page_targets": core_scale_url_targets,
+                    "page_targets": core_scale_pmax_url_targets,
+                    "pmax_policy_filter": {
+                        "search_themes": pmax_theme_plan.get("pmax_policy_filter") or {},
+                        "url_targets": core_scale_pmax_policy_filter,
+                    },
                     "page_targeting": {
                         "mode": "core_scale_url_inclusions",
                         "website_url": website_url,
-                        "final_url": core_scale_final_url,
+                        "final_url": core_scale_pmax_final_url,
                         "final_url_expansion": "restricted_to_core_scale_urls",
                         "url_expansion_opt_out": True,
-                        "url_inclusions": core_scale_url_targets,
+                        "url_inclusions": core_scale_pmax_url_targets,
                         "url_exclusions": [item["url"] for item in core_scale_page_exclusions],
                         "best_landing_pages_are_evidence_only": False,
                         "best_landing_page_source": page_source,
-                        "best_landing_pages": core_scale_url_targets,
+                        "best_landing_pages": core_scale_pmax_url_targets,
+                        "all_governance_url_inclusions": core_scale_url_targets,
                     },
                     "created_by": "automation_monitor",
                     "source_job_id": source_job_id,
@@ -4931,11 +5068,12 @@ def run_testing_campaign_automation(
                     "target_roas": pmax_roas,
                     "target_roas_percent": round(pmax_roas * 100, 2),
                 },
-                "final_url": core_scale_final_url,
+                "final_url": core_scale_pmax_final_url,
                 "page_targeting": automation["page_targeting"],
-                "page_feed_targets": core_scale_url_targets,
+                "page_feed_targets": core_scale_pmax_url_targets,
                 "landing_page_candidates": _landing_page_payload(page_rows),
-                "url_inclusion_targets": core_scale_url_targets,
+                "url_inclusion_targets": core_scale_pmax_url_targets,
+                "all_governance_url_inclusions": core_scale_url_targets,
                 "scale_landing_page_plan": scale_page_plan,
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "audience_signal_plan": audience_signal_plan,
@@ -4949,6 +5087,7 @@ def run_testing_campaign_automation(
                 "pmax_campaign_plan": campaign_plan,
                 "pmax_asset_groups": campaign_asset_groups,
                 "pmax_search_themes": copy_terms,
+                "pmax_policy_filter": automation["pmax_policy_filter"],
                 "source_terms": copy_terms,
                 "copy_strategy": {
                     "mode": "pmax_scale_openai_copy_core_scale_url_inclusions_search_themes",
@@ -4966,7 +5105,7 @@ def run_testing_campaign_automation(
                     ad_type="pmax",
                     source_key=automation["source_key"],
                     website_url=website_url,
-                    final_url=core_scale_final_url,
+                    final_url=core_scale_pmax_final_url,
                     business_name=account.name,
                     generated_assets=assets,
                     validation_json=_automation_validation(validation, warnings),
@@ -5031,18 +5170,23 @@ def run_testing_campaign_automation(
                     "audience_signal_plan": audience_signal_plan,
                     "waste_management_plan": draft_waste_plan,
                     "ga4_ads_signal_matrix": ga4_matrix,
-                    "page_targets": testing_discovery_url_targets,
+                    "page_targets": testing_pmax_url_targets,
+                    "pmax_policy_filter": {
+                        "search_themes": testing_pmax_theme_plan.get("pmax_policy_filter") or {},
+                        "url_targets": testing_pmax_policy_filter,
+                    },
                     "page_targeting": {
                         "mode": "testing_discovery_url_inclusions",
                         "website_url": website_url,
-                        "final_url": testing_final_url,
+                        "final_url": testing_pmax_final_url,
                         "final_url_expansion": "enabled",
                         "url_expansion_opt_out": False,
-                        "url_inclusions": testing_discovery_url_targets,
+                        "url_inclusions": testing_pmax_url_targets,
                         "url_exclusions": [item["url"] for item in testing_page_exclusions],
                         "best_landing_pages_are_evidence_only": True,
                         "best_landing_page_source": page_source,
-                        "best_landing_pages": testing_discovery_url_targets,
+                        "best_landing_pages": testing_pmax_url_targets,
+                        "all_governance_url_inclusions": testing_discovery_url_targets,
                     },
                     "created_by": "automation_monitor",
                     "source_job_id": source_job_id,
@@ -5070,11 +5214,12 @@ def run_testing_campaign_automation(
                     "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
                     "target_roas_percent": round(TESTING_DISCOVERY_TARGET_ROAS * 100, 2),
                 },
-                "final_url": testing_final_url,
+                "final_url": testing_pmax_final_url,
                 "page_targeting": automation["page_targeting"],
-                "page_feed_targets": testing_discovery_url_targets,
+                "page_feed_targets": testing_pmax_url_targets,
                 "landing_page_candidates": _landing_page_payload(page_rows),
-                "url_inclusion_targets": testing_discovery_url_targets,
+                "url_inclusion_targets": testing_pmax_url_targets,
+                "all_governance_url_inclusions": testing_discovery_url_targets,
                 "scale_negative_keyword_plan": scale_negative_plan,
                 "scale_page_exclusion_plan": scale_page_exclusion_plan,
                 "landing_page_governance_plan": draft_landing_page_governance,
@@ -5089,6 +5234,7 @@ def run_testing_campaign_automation(
                 "pmax_campaign_plan": campaign_plan,
                 "pmax_asset_groups": campaign_asset_groups,
                 "pmax_search_themes": copy_terms,
+                "pmax_policy_filter": automation["pmax_policy_filter"],
                 "source_terms": copy_terms,
                 "copy_strategy": {
                     "mode": "testing_pmax_discovery_non_duplicate_search_themes",
@@ -5105,7 +5251,7 @@ def run_testing_campaign_automation(
                     ad_type="pmax",
                     source_key=automation["source_key"],
                     website_url=website_url,
-                    final_url=testing_final_url,
+                    final_url=testing_pmax_final_url,
                     business_name=account.name,
                     generated_assets=assets,
                     validation_json=_automation_validation(validation, warnings),

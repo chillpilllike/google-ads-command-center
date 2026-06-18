@@ -2705,10 +2705,28 @@ def discover_google_search_console_connection(connection_id: int, job_id: Option
                     mark_job_finished(session, job_id, BackgroundJobStatus.canceled, current=0)
                     return
                 result = discover_search_console_connection(session, connection_id)
+                sync_result = sync_search_console_search_analytics(
+                    session,
+                    mode="recent",
+                    days=28,
+                    max_rows=25_000,
+                    force=True,
+                    source_job_id=job_id,
+                    connection_ids=[int(connection_id)],
+                )
                 job = _job(session, job_id)
                 if job is not None:
                     payload = dict(job.payload or {})
                     payload["result"] = result
+                    payload["sync_result"] = {
+                        "mode": sync_result.get("mode"),
+                        "scope_key": sync_result.get("scope_key"),
+                        "target_count": sync_result.get("target_count"),
+                        "dataset_count": sync_result.get("dataset_count"),
+                        "snapshot_count": sync_result.get("snapshot_count"),
+                        "error_count": sync_result.get("error_count"),
+                        "query_candidates_imported": sync_result.get("query_candidates_imported"),
+                    }
                     job.payload = payload
                     session.commit()
                 update_job_progress(session, job_id, current=1)
