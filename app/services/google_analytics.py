@@ -436,7 +436,7 @@ def ensure_account_ga4_mapping(
     for mapping in mappings:
         website = session.scalar(
             select(OdooWebsite).where(
-                OdooWebsite.id == int(mapping.website_id or 0),
+                OdooWebsite.website_id == int(mapping.website_id or 0),
                 OdooWebsite.store_id == mapping.store_id,
                 OdooWebsite.is_active.is_(True),
             )
