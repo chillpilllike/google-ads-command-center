@@ -133,7 +133,14 @@ def sync_store_websites(session: Session, store: OdooStore) -> int:
     return saved
 
 
-def sync_store_confirmed_orders(session: Session, store: OdooStore, *, hours: int = 12) -> int:
+def sync_store_confirmed_orders(
+    session: Session,
+    store: OdooStore,
+    *,
+    hours: int = 12,
+    website_ids: list[int] | None = None,
+    commit_every: int = 250,
+) -> int:
     _base_url, uid, models = _authenticate_store(store)
     since = datetime.now(timezone.utc) - timedelta(hours=max(int(hours or 12), 1))
 
@@ -141,7 +148,10 @@ def sync_store_confirmed_orders(session: Session, store: OdooStore, *, hours: in
         ["state", "in", list(CONFIRMED_STATES)],
         ["date_order", ">=", since.strftime("%Y-%m-%d %H:%M:%S")],
     ]
-    if store.website_id:
+    selected_website_ids = [int(item) for item in (website_ids or []) if item]
+    if selected_website_ids:
+        domain.append(["website_id", "in", selected_website_ids])
+    elif store.website_id:
         domain.append(["website_id", "=", int(store.website_id)])
 
     field_meta = models.execute_kw(
@@ -168,6 +178,7 @@ def sync_store_confirmed_orders(session: Session, store: OdooStore, *, hours: in
     )
 
     saved = 0
+    batch_size = max(int(commit_every or 250), 1)
     for row in rows:
         order_dt = _parse_odoo_datetime(row.get("date_order"))
         currency_code = _many2one_name(row.get("currency_id")).split(" ")[0].upper()
@@ -207,6 +218,10 @@ def sync_store_confirmed_orders(session: Session, store: OdooStore, *, hours: in
         )
         session.execute(stmt)
         saved += 1
+        if saved % batch_size == 0:
+            store.last_sync_at = datetime.now(timezone.utc)
+            store.last_sync_error = None
+            session.commit()
 
     store.last_sync_at = datetime.now(timezone.utc)
     store.last_sync_error = None

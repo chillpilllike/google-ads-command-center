@@ -1053,6 +1053,7 @@ def sync_mapping_product_page_feed(
     rates = rate_payload.get("rates") or {}
     matched_urls: set[str] = set()
     counters = {"winner": 0, "watch": 0, "exclude": 0, "fallback": 0}
+    upserted = 0
 
     for product in products:
         metrics = _match_google_metrics(
@@ -1151,6 +1152,9 @@ def sync_mapping_product_page_feed(
             },
         )
         counters[label] += 1
+        upserted += 1
+        if upserted % 100 == 0:
+            session.commit()
 
     if not products:
         for row in _fallback_rows(
@@ -1165,6 +1169,9 @@ def sync_mapping_product_page_feed(
         ):
             _upsert_signal(session, row)
             counters["fallback"] += 1
+            upserted += 1
+            if upserted % 100 == 0:
+                session.commit()
 
     for row in _google_only_exclusions(
         account=account,
@@ -1177,6 +1184,9 @@ def sync_mapping_product_page_feed(
     ):
         _upsert_signal(session, row)
         counters["exclude"] += 1
+        upserted += 1
+        if upserted % 100 == 0:
+            session.commit()
 
     session.commit()
     return {
