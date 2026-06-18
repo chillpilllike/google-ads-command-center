@@ -26,6 +26,7 @@ async def store_google_ads_oauth_state(
     connection_id: int,
     connection_name: str,
     redirect_uri: str,
+    flow_type: str = "google_ads",
 ) -> None:
     now = datetime.now(timezone.utc)
     key = _state_key(state)
@@ -36,6 +37,7 @@ async def store_google_ads_oauth_state(
         "connection_id": int(connection_id or 0),
         "connection_name": str(connection_name or "")[:160],
         "redirect_uri": redirect_uri,
+        "flow_type": str(flow_type or "google_ads")[:80],
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(minutes=STATE_TTL_MINUTES)).isoformat(),
     }

@@ -68,6 +68,10 @@ def google_ads_redirect_uri(request: Request) -> str:
 
 
 def search_console_redirect_uri(request: Request) -> str:
+    # Reuse the existing Google Ads OAuth callback because that URI is already
+    # authorized on older Google Cloud OAuth clients. The stored OAuth state
+    # carries flow_type=search_console, so the callback dispatches correctly.
+    return google_ads_redirect_uri(request)
     if settings.public_base_url:
         return f"{settings.public_base_url.rstrip('/')}/settings/search-console/oauth/callback"
     if settings.app_env != "production":
@@ -324,6 +328,7 @@ async def _start_google_ads_oauth_redirect(
         connection_id=int(connection.id) if connection else 0,
         connection_name=connection_name.strip()[:160],
         redirect_uri=redirect_uri,
+        flow_type="google_ads",
     )
     return RedirectResponse(authorization_url, status_code=status.HTTP_303_SEE_OTHER)
 
@@ -361,6 +366,105 @@ async def start_google_ads_oauth_from_link(
     )
 
 
+async def _complete_search_console_oauth_callback(
+    request: Request,
+    *,
+    code: str,
+    state: str,
+    session: AsyncSession,
+    expected_state: str | None = None,
+    stored_oauth_state: dict[str, Any] | None = None,
+    code_verifier: str | None = None,
+    connection_id: int = 0,
+    connection_name: str = "",
+) -> RedirectResponse:
+    if stored_oauth_state and expected_state != state:
+        code_verifier = str(stored_oauth_state.get("code_verifier") or "")
+        connection_id = int(stored_oauth_state.get("connection_id") or 0)
+        connection_name = str(stored_oauth_state.get("connection_name") or "").strip()
+    if not code or not state or (expected_state != state and stored_oauth_state is None):
+        return RedirectResponse(
+            "/settings?search_console_oauth_error=state",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    values = await _google_ads_setting_values(session)
+    connection = await session.get(GoogleSearchConsoleConnection, connection_id) if connection_id else None
+    client_id = (connection.client_id if connection else "") or values.get("google_ads.client_id")
+    client_secret = (connection.client_secret if connection else "") or values.get("google_ads.client_secret")
+    oauth_values = dict(values)
+    oauth_values["google_ads.client_id"] = client_id
+    oauth_values["google_ads.client_secret"] = client_secret
+    try:
+        from google_auth_oauthlib.flow import Flow
+    except ImportError:
+        return RedirectResponse(
+            "/settings?search_console_oauth_error=missing_package",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    redirect_uri = str((stored_oauth_state or {}).get("redirect_uri") or search_console_redirect_uri(request))
+    if redirect_uri.startswith("http://") and settings.app_env != "production":
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+    flow = Flow.from_client_config(
+        _google_ads_client_config(oauth_values),
+        scopes=list(GOOGLE_SEARCH_CONSOLE_SCOPES),
+        redirect_uri=redirect_uri,
+    )
+    if code_verifier:
+        flow.code_verifier = str(code_verifier)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        detail = f"{exc.__class__.__name__}: {exc}"
+        await store_google_ads_oauth_error(session, state=state, connection_id=connection_id, message=detail)
+        return RedirectResponse(
+            f"/settings?search_console_oauth_error=token&search_console_oauth_detail={quote(detail[:300], safe='')}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    credentials = flow.credentials
+    if not credentials or not credentials.refresh_token:
+        return RedirectResponse(
+            "/settings?search_console_oauth_error=no_refresh_token",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    email = _fetch_google_email(credentials.token or "")
+    if connection is None:
+        connection = GoogleSearchConsoleConnection(name=connection_name or email or "Search Console Gmail")
+        session.add(connection)
+        await session.flush()
+
+    connection.name = connection_name or connection.name or email or "Search Console Gmail"
+    connection.email = email or connection.email or ""
+    connection.client_id = str(client_id or connection.client_id or "")
+    connection.client_secret = str(client_secret or connection.client_secret or "")
+    connection.refresh_token = credentials.refresh_token
+    connection.is_active = True
+    connection.last_oauth_at = datetime.now(timezone.utc)
+    connection.last_discovery_error = None
+
+    await delete_google_ads_oauth_state(session, state)
+    await session.commit()
+
+    job = await create_background_job(
+        session,
+        job_type="google_search_console_discovery",
+        label=f"Discover Search Console sites for {connection.name}",
+        requested_by_id=None,
+        payload={"connection_id": connection.id, "first_sync": True},
+    )
+    try:
+        message = discover_google_search_console_connection.send(connection.id, job.id)
+        await save_job_message_id(session, job, str(message.message_id))
+    except Exception as exc:  # noqa: BLE001
+        await mark_job_dispatch_failed(session, job, str(exc))
+    return RedirectResponse(
+        f"/settings?search_console_oauth=connected&search_console_job_id={job.id}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.get("/settings/google-ads/oauth/callback", name="google_ads_oauth_callback")
 async def google_ads_oauth_callback(
     request: Request,
@@ -377,6 +481,18 @@ async def google_ads_oauth_callback(
         code_verifier = str(stored_oauth_state.get("code_verifier") or "")
         connection_id = int(stored_oauth_state.get("connection_id") or 0)
         connection_name = str(stored_oauth_state.get("connection_name") or "").strip()
+    if str((stored_oauth_state or {}).get("flow_type") or "") == "search_console":
+        return await _complete_search_console_oauth_callback(
+            request,
+            code=code,
+            state=state,
+            session=session,
+            expected_state=expected_state,
+            stored_oauth_state=stored_oauth_state,
+            code_verifier=code_verifier,
+            connection_id=connection_id,
+            connection_name=connection_name,
+        )
     if not code or not state or (expected_state != state and stored_oauth_state is None):
         return RedirectResponse(
             "/settings?google_oauth_error=state",
@@ -523,6 +639,7 @@ async def _start_search_console_oauth_redirect(
         connection_id=int(connection.id) if connection else 0,
         connection_name=connection_name.strip()[:160],
         redirect_uri=redirect_uri,
+        flow_type="search_console",
     )
     return RedirectResponse(authorization_url, status_code=status.HTTP_303_SEE_OTHER)
 
