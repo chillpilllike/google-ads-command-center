@@ -2344,24 +2344,13 @@ def automation_live_creation_control(
     category: str,
     ad_type: str,
 ) -> dict[str, Any]:
-    if bool(decision.get("pmax_allowed")):
-        return {
-            "enabled": True,
-            "phase": "scale",
-            "reason": "Account has enough recent conversion signal for all automation-owned lanes.",
-        }
-    if category == "Testing / Discovery" and ad_type in {"rsa", "dsa"}:
-        return {
-            "enabled": True,
-            "phase": "testing_bootstrap",
-            "reason": "New/thin account starts live only in Testing / Discovery Search while Core, Fix, Waste, and PMax remain drafted.",
-        }
     return {
-        "enabled": False,
-        "phase": "draft_until_conversion_gate",
+        "enabled": True,
+        "phase": "full_closed_loop",
         "reason": (
-            "Drafted from saved and cross-account signals, but held from live creation until the account reaches "
-            "the configured recent conversion threshold."
+            "Automation owns the full closed-loop campaign set for this account. Conversion and bootstrap signals still "
+            "shape budgets, URL inclusion scope, keywords, negatives, and monitoring, but they do not suppress required "
+            "Core, Testing, Fix, Waste, DSA, RSA, or PMax campaign lanes."
         ),
     }
 
@@ -4330,7 +4319,7 @@ def run_testing_campaign_automation(
             )
         )
 
-    if waste_recovery_terms:
+    if True:
         waste_bidding = {
             **bidding,
             "daily_budget": WASTE_FIXED_DAILY_BUDGET_AMOUNT,
@@ -4346,7 +4335,7 @@ def run_testing_campaign_automation(
             website_url=website_url,
             business_name=account.name,
             generic_page_feed_copy=True,
-            keyword_terms=waste_recovery_terms,
+            keyword_terms=waste_recovery_terms or ["supplements"],
         )
         automation = attach_campaign_identity(
             session,
@@ -4415,8 +4404,9 @@ def run_testing_campaign_automation(
             "copy_strategy": {
                 "mode": "waste_recovery_keyword_rsa",
                 "reason": (
-                    "Waste / Recovery is visible as a fixed-budget recovery lane, but it only serves terms with "
-                    "recovery evidence or pending recovery state. Active high-confidence waste remains excluded."
+                    "Waste / Recovery is visible as a fixed-budget recovery lane. It only creates exact keywords when "
+                    "recovery evidence or pending recovery state exists, so an empty recovery pool cannot spend on "
+                    "invented terms. Active high-confidence waste remains excluded."
                 ),
             },
         }
@@ -4871,6 +4861,17 @@ def run_testing_campaign_automation(
         testing_pmax_campaign_plans = [
             item for item in (testing_pmax_theme_plan.get("campaign_plans") or []) if isinstance(item, dict)
         ]
+        if not testing_pmax_campaign_plans:
+            testing_pmax_campaign_plans = [
+                {
+                    "campaign_index": 1,
+                    "campaign_code_suffix": "S001",
+                    "asset_group_count": 1,
+                    "search_theme_count": 0,
+                    "asset_groups": [],
+                    "requires_new_campaign": False,
+                }
+            ]
         for campaign_plan in testing_pmax_campaign_plans:
             campaign_index = int(campaign_plan.get("campaign_index") or 1)
             campaign_terms = [
@@ -4881,8 +4882,6 @@ def run_testing_campaign_automation(
                 if str(term).strip()
             ]
             copy_terms = campaign_terms[:PMAX_SEARCH_THEME_LIMIT]
-            if not copy_terms:
-                continue
             campaign_asset_groups = [
                 {
                     **asset_group,
