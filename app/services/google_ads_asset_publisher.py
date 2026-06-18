@@ -33,6 +33,12 @@ ASSET_FIELD_TYPES = {
     "promotion": "PROMOTION",
     "business_message": "BUSINESS_MESSAGE",
 }
+PRE_MUTATE_LINK_LIMITS = {
+    "callout": 20,
+    "sitelink": 20,
+    "structured_snippet": 20,
+    "price": 20,
+}
 INTERNAL_AD_COPY_TERMS = {
     "conversion signal",
     "google conversion signal",
@@ -283,6 +289,49 @@ def _asset_link_exists(
     else:
         return False
     return any(_google_ads_search(service, account, query))
+
+
+def _asset_link_count(
+    client: Any,
+    account: GoogleAdsAccount,
+    *,
+    scope_level: str,
+    scope_resource_name: str,
+    field_type_name: str,
+    limit: int,
+) -> int:
+    service = client.get_service("GoogleAdsService")
+    row_limit = max(int(limit or 1), 1) + 1
+    if scope_level == "account":
+        query = f"""
+            SELECT customer_asset.resource_name
+            FROM customer_asset
+            WHERE customer_asset.field_type = {field_type_name}
+              AND customer_asset.status != REMOVED
+            LIMIT {row_limit}
+        """
+        return sum(1 for _ in _google_ads_search(service, account, query))
+    if scope_level == "campaign":
+        query = f"""
+            SELECT campaign_asset.resource_name
+            FROM campaign_asset
+            WHERE campaign_asset.campaign = {_gaql_string(scope_resource_name)}
+              AND campaign_asset.field_type = {field_type_name}
+              AND campaign_asset.status != REMOVED
+            LIMIT {row_limit}
+        """
+        return sum(1 for _ in _google_ads_search(service, account, query))
+    if scope_level == "ad_group":
+        query = f"""
+            SELECT ad_group_asset.resource_name
+            FROM ad_group_asset
+            WHERE ad_group_asset.ad_group = {_gaql_string(scope_resource_name)}
+              AND ad_group_asset.field_type = {field_type_name}
+              AND ad_group_asset.status != REMOVED
+            LIMIT {row_limit}
+        """
+        return sum(1 for _ in _google_ads_search(service, account, query))
+    return 0
 
 
 def _asset_link_resource_names(
@@ -549,6 +598,7 @@ def publish_generated_assets(
     campaign_resource_cache: dict[str, str] = {}
     ad_group_resource_cache: dict[tuple[str, str], str] = {}
     capped_link_scopes: set[tuple[str, str, str]] = set()
+    link_count_cache: dict[tuple[str, str, str], int] = {}
     for row in rows:
         result["by_type"][row.asset_type] = int(result["by_type"].get(row.asset_type, 0)) + 1
         try:
@@ -591,6 +641,25 @@ def publish_generated_assets(
                 result["skipped"] += 1
                 continue
             field_type_name = ASSET_FIELD_TYPES[row.asset_type]
+            pre_limit = PRE_MUTATE_LINK_LIMITS.get(row.asset_type)
+            if pre_limit and row.status not in REMOVE_READY_STATUSES:
+                if scope_key not in link_count_cache:
+                    link_count_cache[scope_key] = _asset_link_count(
+                        client,
+                        account,
+                        scope_level=scope_level,
+                        scope_resource_name=scope_resource,
+                        field_type_name=field_type_name,
+                        limit=pre_limit,
+                    )
+                if link_count_cache[scope_key] >= pre_limit:
+                    capped_link_scopes.add(scope_key)
+                    row.status = "publish_limited"
+                    row.last_error = f"Skipped before mutation because Google Ads already has {link_count_cache[scope_key]} active {scope_level} {row.asset_type} links; local limit is {pre_limit}."
+                    row.updated_at = _utcnow()
+                    session.commit()
+                    result["skipped"] += 1
+                    continue
             replaced_resource = str(payload.get("replaced_google_resource_name") or "").strip()
             if replaced_resource:
                 for link_resource in _asset_link_resource_names(
@@ -658,6 +727,8 @@ def publish_generated_assets(
                 result["existing_links"] += 1
             else:
                 result["linked"] += 1
+                if pre_limit:
+                    link_count_cache[scope_key] = int(link_count_cache.get(scope_key, 0)) + 1
             row.status = "published" if not validate_only else "validated"
             row.last_error = ""
             row.updated_at = _utcnow()

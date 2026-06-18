@@ -158,6 +158,7 @@ def main() -> int:
                 {
                     "status": "waiting_for_firefox_oauth",
                     "redirect_uri": REDIRECT_URI,
+                    "authorization_url": authorization_url,
                     "timeout_seconds": httpd.timeout,
                     "note": "Complete Google sign-in/passkey/consent in Firefox. Tokens will not be printed.",
                 },
