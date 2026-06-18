@@ -2306,23 +2306,28 @@ def attach_campaign_identity(
         channel_label=channel_label,
         website_url=website_url,
     )
-    existing = existing_google_campaign_for_identity(session, account, identity)
-    if existing is None:
-        existing = existing_google_campaign_for_lane(session, account, identity)
-        adopted_code = str(existing.get("campaign_code") or "") if existing else ""
-        if adopted_code and adopted_code != str(identity.get("campaign_code") or ""):
-            identity = {
-                **identity,
-                "generated_campaign_code": str(identity.get("campaign_code") or ""),
-                "campaign_code": adopted_code,
-                "campaign_name": str(existing.get("campaign_name") or identity.get("campaign_name") or "")[:255],
-                "resume_key": adopted_code,
-                "lookup": {
-                    **(identity.get("lookup") if isinstance(identity.get("lookup"), dict) else {}),
-                    "name_contains": adopted_code,
-                    "adopted_lane_fallback": True,
-                },
-            }
+    exact_existing = existing_google_campaign_for_identity(session, account, identity)
+    lane_existing = existing_google_campaign_for_lane(session, account, identity)
+    existing = exact_existing
+    if lane_existing and (
+        exact_existing is None
+        or int(lane_existing.get("campaign_id") or 0) < int(exact_existing.get("campaign_id") or 0)
+    ):
+        existing = lane_existing
+    adopted_code = str(existing.get("campaign_code") or "") if existing else ""
+    if adopted_code and adopted_code != str(identity.get("campaign_code") or ""):
+        identity = {
+            **identity,
+            "generated_campaign_code": str(identity.get("campaign_code") or ""),
+            "campaign_code": adopted_code,
+            "campaign_name": str(existing.get("campaign_name") or identity.get("campaign_name") or "")[:255],
+            "resume_key": adopted_code,
+            "lookup": {
+                **(identity.get("lookup") if isinstance(identity.get("lookup"), dict) else {}),
+                "name_contains": adopted_code,
+                "adopted_lane_fallback": True,
+            },
+        }
     return {
         **automation,
         "category": category,
