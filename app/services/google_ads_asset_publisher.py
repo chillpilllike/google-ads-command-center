@@ -548,6 +548,7 @@ def publish_generated_assets(
     }
     campaign_resource_cache: dict[str, str] = {}
     ad_group_resource_cache: dict[tuple[str, str], str] = {}
+    capped_link_scopes: set[tuple[str, str, str]] = set()
     for row in rows:
         result["by_type"][row.asset_type] = int(result["by_type"].get(row.asset_type, 0)) + 1
         try:
@@ -560,6 +561,13 @@ def publish_generated_assets(
             scope_resource = ""
             if scope_level == "campaign":
                 campaign_name = str(scope.get("campaign_name") or row.campaign_name or "").strip()
+                if row.asset_type == "business_name" and "pmax" in campaign_name.lower():
+                    row.status = "publish_limited"
+                    row.last_error = "Skipped campaign-level PMax business-name link; Google requires PMax business assets at asset-group level unless Brand Guidelines is enabled."
+                    row.updated_at = _utcnow()
+                    session.commit()
+                    result["skipped"] += 1
+                    continue
                 if campaign_name not in campaign_resource_cache:
                     campaign_resource_cache[campaign_name] = _campaign_resource_by_name(client, account, campaign_name)
                 scope_resource = campaign_resource_cache[campaign_name]
@@ -574,6 +582,14 @@ def publish_generated_assets(
                 scope_resource = ad_group_resource_cache[key]
                 if not scope_resource:
                     raise ValueError(f"Ad group not found for asset scope: {campaign_name} / {ad_group_name}")
+            scope_key = (scope_level, row.asset_type, scope_resource or "account")
+            if scope_key in capped_link_scopes and row.status not in REMOVE_READY_STATUSES:
+                row.status = "publish_limited"
+                row.last_error = f"Skipped because Google Ads reported the {scope_level} {row.asset_type} asset-link limit is already reached."
+                row.updated_at = _utcnow()
+                session.commit()
+                result["skipped"] += 1
+                continue
             field_type_name = ASSET_FIELD_TYPES[row.asset_type]
             replaced_resource = str(payload.get("replaced_google_resource_name") or "").strip()
             if replaced_resource:
@@ -666,6 +682,15 @@ def publish_generated_assets(
                     result["quota_exhausted"] = True
                     result["quota_retry_after_seconds"] = max(result.get("quota_retry_after_seconds") or 0, _retry_after_seconds(exc))
                     break
+                payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+                scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {"level": "account"}
+                capped_scope_level = str(scope.get("level") or "account").strip()
+                capped_scope_resource = ""
+                if capped_scope_level == "campaign":
+                    capped_scope_resource = str(scope.get("campaign_name") or row.campaign_name or "").strip()
+                elif capped_scope_level == "ad_group":
+                    capped_scope_resource = f"{str(scope.get('campaign_name') or row.campaign_name or '').strip()}::{str(scope.get('ad_group_name') or '').strip()}"
+                capped_link_scopes.add((capped_scope_level, row.asset_type, capped_scope_resource or "account"))
             elif row is not None:
                 row.last_error = str(exc)[:2000]
                 row.status = "publish_failed"
