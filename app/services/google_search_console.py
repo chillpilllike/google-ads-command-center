@@ -39,7 +39,9 @@ SEARCH_CONSOLE_API_BASE = "https://www.googleapis.com/webmasters/v3"
 DATASET_GSC_SEARCH_ANALYTICS = "gsc_search_analytics_query_page"
 GSC_SNAPSHOT_TTL_HOURS = 24
 GSC_RECENT_DAYS = 28
+GSC_DAILY_DAYS = 3
 GSC_ROW_LIMIT = 25_000
+GSC_DAILY_ROW_LIMIT = 10_000
 
 
 def utcnow() -> datetime:
@@ -316,17 +318,26 @@ def ensure_account_search_console_mapping(session: Session, account: GoogleAdsAc
 
 
 def gsc_date_window(mode: str, days: int = GSC_RECENT_DAYS) -> tuple[str, date, date]:
-    mode = "all_time" if str(mode or "").strip().lower() == "all_time" else "recent"
+    raw_mode = str(mode or "").strip().lower()
+    if raw_mode == "all_time":
+        mode = "all_time"
+    elif raw_mode in {"daily", "incremental"}:
+        mode = "daily"
+    else:
+        mode = "recent"
     end_date = date.today()
     if mode == "all_time":
         return mode, date(2020, 1, 1), end_date
-    days = min(max(int(days or GSC_RECENT_DAYS), 1), 365)
+    max_days = 14 if mode == "daily" else 365
+    days = min(max(int(days or (GSC_DAILY_DAYS if mode == "daily" else GSC_RECENT_DAYS)), 1), max_days)
     return mode, end_date - timedelta(days=days - 1), end_date
 
 
 def gsc_scope(mode: str, start_date: date, end_date: date, days: int = GSC_RECENT_DAYS) -> str:
     if mode == "all_time":
         return f"all_time:{start_date.isoformat()}:{end_date.isoformat()}"
+    if mode == "daily":
+        return f"daily_last_{int(days)}d:{start_date.isoformat()}:{end_date.isoformat()}"
     return f"last_{int(days)}d:{start_date.isoformat()}:{end_date.isoformat()}"
 
 

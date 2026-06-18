@@ -65,6 +65,8 @@ from app.services.google_analytics import (
     sync_ga4_search_term_snapshots,
 )
 from app.services.google_search_console import (
+    GSC_DAILY_DAYS,
+    GSC_DAILY_ROW_LIMIT,
     ensure_account_search_console_mapping,
     search_console_ads_signal_matrix,
     search_console_keyword_terms,
@@ -7373,9 +7375,9 @@ def run_account_automation_monitor(
         checkpoint("search_console_query_page_pull")
         search_console_refresh = sync_search_console_search_analytics(
             session,
-            mode="recent",
-            days=min(max(days, 7), 90),
-            max_rows=min(rows, 25_000),
+            mode="daily",
+            days=GSC_DAILY_DAYS,
+            max_rows=min(rows, GSC_DAILY_ROW_LIMIT),
             force=force,
             source_job_id=source_job_id,
             account_ids=[account.id],

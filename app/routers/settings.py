@@ -30,7 +30,7 @@ from app.services.google_ads_oauth_state import (
     store_google_ads_oauth_error,
     store_google_ads_oauth_state,
 )
-from app.services.google_search_console import GOOGLE_SEARCH_CONSOLE_SCOPES
+from app.services.google_search_console import GOOGLE_SEARCH_CONSOLE_SCOPES, GSC_DAILY_DAYS, GSC_DAILY_ROW_LIMIT
 from app.services.page_feed_restrictions import SETTING_KEY as RESTRICTED_WORDS_SETTING_KEY, restricted_term_count
 from app.tasks import (
     discover_google_ads_connection_accounts,
@@ -813,10 +813,19 @@ async def sync_search_console_now(
         job_type="google_search_console_search_analytics",
         label="Sync Search Console search analytics",
         requested_by_id=user.id,
-        payload={"mode": "recent", "days": 28, "force": True},
+        payload={"mode": "daily", "days": GSC_DAILY_DAYS, "force": False},
     )
     try:
-        message = sync_google_search_console_search_analytics.send("recent", 28, job.id, None, None, None, 25_000, True)
+        message = sync_google_search_console_search_analytics.send(
+            "daily",
+            GSC_DAILY_DAYS,
+            job.id,
+            None,
+            None,
+            None,
+            GSC_DAILY_ROW_LIMIT,
+            False,
+        )
         await save_job_message_id(session, job, str(message.message_id))
     except Exception as exc:  # noqa: BLE001
         await mark_job_dispatch_failed(session, job, str(exc))
