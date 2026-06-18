@@ -592,7 +592,7 @@ async def init_app_db() -> None:
                 "auto_apply_negatives_enabled BOOLEAN NOT NULL DEFAULT false, "
                 "auto_create_campaigns_enabled BOOLEAN NOT NULL DEFAULT false, "
                 "auto_pause_campaigns_enabled BOOLEAN NOT NULL DEFAULT false, "
-                "auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT false, "
+                "auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT true, "
                 "testing_bootstrap_enabled BOOLEAN NOT NULL DEFAULT true, "
                 "testing_bootstrap_days INTEGER NOT NULL DEFAULT 14, "
                 "pmax_min_7d_conversions DOUBLE PRECISION NOT NULL DEFAULT 5, "
@@ -730,7 +730,10 @@ async def init_app_db() -> None:
             text("CREATE INDEX IF NOT EXISTS ix_google_ads_automation_preferences_auto_pause_campaigns_enabled ON google_ads_automation_preferences (auto_pause_campaigns_enabled)")
         )
         await conn.execute(
-            text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT false")
+            text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT true")
+        )
+        await conn.execute(
+            text("ALTER TABLE google_ads_automation_preferences ALTER COLUMN auto_peak_budget_enabled SET DEFAULT true")
         )
         await conn.execute(
             text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS testing_bootstrap_enabled BOOLEAN NOT NULL DEFAULT true")
