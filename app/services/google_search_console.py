@@ -240,8 +240,8 @@ def ensure_account_search_console_mapping(session: Session, account: GoogleAdsAc
     for mapping in mappings:
         website = session.scalar(
             select(OdooWebsite).where(
+                OdooWebsite.id == int(mapping.website_id or 0),
                 OdooWebsite.store_id == mapping.store_id,
-                OdooWebsite.website_id == int(mapping.website_id or 0),
                 OdooWebsite.is_active.is_(True),
             )
         )
@@ -265,14 +265,14 @@ def ensure_account_search_console_mapping(session: Session, account: GoogleAdsAc
                 session,
                 site_id=site.id,
                 store_id=mapping.store_id,
-                website_id=int(mapping.website_id or website.website_id or 0),
+                website_id=int(website.website_id or 0),
                 account_id=account.id,
             )
             if row is None:
                 row = GoogleSearchConsoleWebsiteMapping(
                     search_console_site_id=site.id,
                     store_id=mapping.store_id,
-                    website_id=int(mapping.website_id or website.website_id or 0),
+                    website_id=int(website.website_id or 0),
                     account_id=account.id,
                     match_source="domain_auto_account_guard",
                     match_confidence=0.99,
