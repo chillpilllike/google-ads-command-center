@@ -96,10 +96,15 @@ def sales_and_margin_inr_for_account(
         store_sales_inr = 0.0
         store_margin_inr = 0.0
         for currency_code, website_name, amount, margin, margin_count, count in rows:
-            converted_sales = convert_amount(float(amount or 0), currency_code or "UNKNOWN", "INR", rates)
-            converted_margin = convert_amount(float(margin or 0), currency_code or "UNKNOWN", "INR", rates)
+            raw_sales = float(amount or 0)
+            raw_margin = float(margin or 0)
+            converted_sales = convert_amount(raw_sales, currency_code or "UNKNOWN", "INR", rates)
+            converted_margin = convert_amount(raw_margin, currency_code or "UNKNOWN", "INR", rates)
+            conversion_fallback = False
             if converted_sales is None:
-                continue
+                converted_sales = raw_sales
+                converted_margin = raw_margin
+                conversion_fallback = True
             allocated_sales = converted_sales * allocation
             allocated_margin = (converted_margin or 0.0) * allocation
             store_sales_inr += allocated_sales
@@ -111,8 +116,9 @@ def sales_and_margin_inr_for_account(
                     "website_id": website_id,
                     "website_name": website_name or ("All websites" if not website_id else f"Website {website_id}"),
                     "currency": currency_code or "UNKNOWN",
-                    "raw_sales": float(amount or 0),
-                    "raw_margin": float(margin or 0),
+                    "raw_sales": raw_sales,
+                    "raw_margin": raw_margin,
+                    "conversion_fallback": conversion_fallback,
                     "margin_order_count": int(margin_count or 0),
                     "order_count": int(count or 0),
                     "allocation": allocation,
@@ -324,9 +330,9 @@ def odoo_sales_budget_guard_for_account(
         raw_cost = int(cost_micros or 0) / 1_000_000
         converted = convert_amount(raw_cost, currency_code, "INR", rates)
         if converted is None:
-            continue
+            converted = raw_cost
         ad_cost_inr += converted
-        cost_details.append({"currency": currency_code, "raw_cost": raw_cost, "cost_inr": converted})
+        cost_details.append({"currency": currency_code, "raw_cost": raw_cost, "cost_inr": converted, "conversion_fallback": converted == raw_cost})
 
     ratio = (ad_cost_inr / sales_inr) if sales_inr > 0 else (max_spend_ratio + 1.0 if ad_cost_inr > 0 else 0.0)
     status = guard_status_for_ratio(ratio, target_ratio, max_spend_ratio)
