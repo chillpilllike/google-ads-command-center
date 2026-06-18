@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlparse
@@ -148,8 +149,9 @@ class TextExtractor(HTMLParser):
                 self.parts.append(text)
 
 
+@lru_cache(maxsize=128)
 def fetch_website_text(url: str) -> str:
-    response = requests.get(url, timeout=12, headers={"User-Agent": "AdsManagerBot/1.0"})
+    response = requests.get(url, timeout=(3, 4), headers={"User-Agent": "AdsManagerBot/1.0"})
     response.raise_for_status()
     parser = TextExtractor()
     parser.feed(response.text[:300000])

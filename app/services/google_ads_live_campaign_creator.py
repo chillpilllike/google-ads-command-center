@@ -1730,8 +1730,8 @@ def _create_dsa_ad(
     request.customer_id = account.customer_id
     request.operations.append(operation)
     request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("AdGroupAdService"), "mutate_ad_group_ads", request)
-    return str(response.results[0].resource_name or "")
+    _google_ads_mutate(client.get_service("AdGroupAdService"), "mutate_ad_group_ads", request)
+    return ""
 
 
 def _create_rsa_ad(
@@ -1764,8 +1764,8 @@ def _create_rsa_ad(
     request.customer_id = account.customer_id
     request.operations.append(operation)
     request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("AdGroupAdService"), "mutate_ad_group_ads", request)
-    return str(response.results[0].resource_name or "")
+    _google_ads_mutate(client.get_service("AdGroupAdService"), "mutate_ad_group_ads", request)
+    return ""
 
 
 def _create_all_pages_webpage_criterion(

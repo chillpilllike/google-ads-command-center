@@ -2193,6 +2193,50 @@ def automation_campaign_identity(
     }
 
 
+def _latest_auto_inventory_campaign_rows(session: Session, account: GoogleAdsAccount) -> list[dict[str, Any]]:
+    cache_key = f"auto_live_inventory_campaign_rows:{account.id}"
+    cached = session.info.get(cache_key)
+    if isinstance(cached, list):
+        return cached
+    payload = session.scalar(
+        select(GoogleAdsDataSnapshot.payload_json)
+        .where(
+            GoogleAdsDataSnapshot.account_id == account.id,
+            GoogleAdsDataSnapshot.dataset_key == "auto_live_inventory",
+        )
+        .order_by(GoogleAdsDataSnapshot.id.desc())
+        .limit(1)
+    )
+    payload = payload if isinstance(payload, dict) else {}
+    rows = [
+        row
+        for row in (((payload.get("datasets") or {}).get("campaigns") or {}).get("rows") or [])
+        if isinstance(row, dict)
+    ]
+    session.info[cache_key] = rows
+    return rows
+
+
+def _campaign_match_from_inventory_row(
+    row: dict[str, Any],
+    *,
+    matched_by: str,
+    campaign_code: str,
+    generated_campaign_code: str = "",
+) -> dict[str, Any]:
+    return {
+        "campaign_id": int(row.get("campaign_id") or row.get("id") or 0),
+        "campaign_name": str(row.get("campaign_name") or row.get("name") or ""),
+        "campaign_status": str(row.get("campaign_status") or row.get("status") or ""),
+        "channel_type": str(row.get("channel_type") or row.get("advertising_channel_type") or ""),
+        "latest_metric_date": None,
+        "latest_synced_at": None,
+        "matched_by": matched_by,
+        "campaign_code": campaign_code,
+        "generated_campaign_code": generated_campaign_code,
+    }
+
+
 def existing_google_campaign_for_identity(
     session: Session,
     account: GoogleAdsAccount,
@@ -2201,6 +2245,14 @@ def existing_google_campaign_for_identity(
     code = str(identity.get("campaign_code") or "").strip()
     if not code:
         return None
+    for inventory_row in _latest_auto_inventory_campaign_rows(session, account):
+        campaign_name = str(inventory_row.get("campaign_name") or inventory_row.get("name") or "")
+        if code in campaign_name:
+            return _campaign_match_from_inventory_row(
+                inventory_row,
+                matched_by="automation_campaign_code",
+                campaign_code=code,
+            )
     row = session.execute(
         select(
             GoogleAdsCampaignMetric.campaign_id,
@@ -2247,6 +2299,25 @@ def existing_google_campaign_for_lane(
     if not category or not channel_label:
         return None
     lane_prefix = f"AUTO | {category} | {channel_label} | AUTO-"
+    inventory_candidates: list[dict[str, Any]] = []
+    for inventory_row in _latest_auto_inventory_campaign_rows(session, account):
+        campaign_name = str(inventory_row.get("campaign_name") or inventory_row.get("name") or "")
+        if not campaign_name.lower().startswith(lane_prefix.lower()):
+            continue
+        campaign_code = _automation_code_from_campaign_name(campaign_name)
+        if not campaign_code:
+            continue
+        inventory_candidates.append(
+            _campaign_match_from_inventory_row(
+                inventory_row,
+                matched_by="automation_lane_fallback",
+                campaign_code=campaign_code,
+                generated_campaign_code=str(identity.get("campaign_code") or ""),
+            )
+        )
+    if inventory_candidates:
+        inventory_candidates.sort(key=lambda item: (int(item.get("campaign_id") or 0), str(item.get("campaign_name") or "")))
+        return inventory_candidates[0]
     rows = list(
         session.execute(
             select(
@@ -3375,6 +3446,50 @@ def testing_scale_negative_keyword_plan(
     }
 
 
+def _compact_list(value: Any, *, limit: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return value[: max(int(limit or 0), 0)]
+
+
+def _compact_generated_assets_for_storage(generated_assets: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(generated_assets, dict):
+        return {}
+    compact = dict(generated_assets)
+    evidence_limits = {
+        "landing_page_candidates": 50,
+        "landing_page_candidate_rows": 50,
+        "keyword_candidates": 100,
+        "negative_keyword_candidates": 100,
+        "page_feed_targets": 500,
+        "url_inclusion_targets": 500,
+        "blocked_final_urls": 200,
+        "negative_page_targets": 200,
+    }
+    for key, limit in evidence_limits.items():
+        if isinstance(compact.get(key), list):
+            compact[key] = _compact_list(compact.get(key), limit=limit)
+    automation = compact.get("automation") if isinstance(compact.get("automation"), dict) else None
+    if automation:
+        compact_automation = dict(automation)
+        for key in (
+            "ga4_ads_signal_matrix",
+            "search_console_ads_signal_matrix",
+            "landing_page_governance_plan",
+            "waste_management_plan",
+        ):
+            value = compact_automation.get(key)
+            if isinstance(value, dict):
+                compact_automation[key] = {
+                    "status": value.get("status"),
+                    "summary": value.get("summary") if isinstance(value.get("summary"), dict) else {},
+                    "basis": value.get("basis"),
+                    "compacted": True,
+                }
+        compact["automation"] = compact_automation
+    return compact
+
+
 def upsert_automation_ad_draft(
     session: Session,
     *,
@@ -3394,6 +3509,7 @@ def upsert_automation_ad_draft(
         ad_type=ad_type,
         source_key=source_key,
     )
+    generated_assets = _compact_generated_assets_for_storage(generated_assets)
     status = "ready_for_review" if validation_json.get("ok") else "needs_review"
     if existing is None:
         draft = AdDraft(
@@ -4319,7 +4435,7 @@ def run_testing_campaign_automation(
             )
         )
 
-    if True:
+    if True:  # Always keep the automation-owned Waste / Recovery lane visible.
         waste_bidding = {
             **bidding,
             "daily_budget": WASTE_FIXED_DAILY_BUDGET_AMOUNT,
