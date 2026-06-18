@@ -622,7 +622,12 @@ def publish_generated_assets(
                     campaign_resource_cache[campaign_name] = _campaign_resource_by_name(client, account, campaign_name)
                 scope_resource = campaign_resource_cache[campaign_name]
                 if not scope_resource:
-                    raise ValueError(f"Campaign not found for asset scope: {campaign_name}")
+                    row.status = "source_removed"
+                    row.last_error = f"Skipped stale asset scope because campaign no longer exists: {campaign_name}"
+                    row.updated_at = _utcnow()
+                    session.commit()
+                    result["skipped"] += 1
+                    continue
             elif scope_level == "ad_group":
                 campaign_name = str(scope.get("campaign_name") or row.campaign_name or "").strip()
                 ad_group_name = str(scope.get("ad_group_name") or "").strip()
@@ -631,7 +636,12 @@ def publish_generated_assets(
                     ad_group_resource_cache[key] = _ad_group_resource_by_name(client, account, campaign_name, ad_group_name)
                 scope_resource = ad_group_resource_cache[key]
                 if not scope_resource:
-                    raise ValueError(f"Ad group not found for asset scope: {campaign_name} / {ad_group_name}")
+                    row.status = "source_removed"
+                    row.last_error = f"Skipped stale asset scope because campaign/ad group no longer exists: {campaign_name} / {ad_group_name}"
+                    row.updated_at = _utcnow()
+                    session.commit()
+                    result["skipped"] += 1
+                    continue
             scope_key = (scope_level, row.asset_type, scope_resource or "account")
             if scope_key in capped_link_scopes and row.status not in REMOVE_READY_STATUSES:
                 row.status = "publish_limited"
