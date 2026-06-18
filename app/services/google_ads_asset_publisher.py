@@ -232,12 +232,12 @@ def _is_limit_exceeded_error(exc: GoogleAdsException) -> bool:
     )
 
 
-def _is_quota_exhausted_error(exc: GoogleAdsException) -> bool:
+def _is_quota_exhausted_error(exc: Any) -> bool:
     text = str(exc).lower()
     return "too many requests" in text or "resource has been exhausted" in text or "retry in" in text
 
 
-def _retry_after_seconds(exc: GoogleAdsException) -> int:
+def _retry_after_seconds(exc: Any) -> int:
     match = re.search(r"retry in\s+(\d+)\s+seconds", str(exc), flags=re.I)
     if not match:
         return 0
@@ -779,14 +779,31 @@ def publish_generated_assets(
                 session.commit()
                 result["failed"] += 1
                 result["errors"].append({"asset_id": row.id if row else None, "asset_type": row.asset_type if row else "", "error": str(exc)[:500]})
-        except Exception as exc:  # noqa: BLE001 - publish remaining assets.
+        except Exception as exc:  # noqa: BLE001 - publish remaining assets unless Google says quota is exhausted.
             session.rollback()
             row = session.get(GoogleAdsGeneratedAsset, row.id)
+            quota_exhausted = _is_quota_exhausted_error(exc)
             if row is not None:
                 row.last_error = str(exc)[:2000]
-                row.status = "publish_failed"
+                row.status = "publish_limited" if quota_exhausted else "publish_failed"
                 row.updated_at = _utcnow()
                 session.commit()
+            if quota_exhausted:
+                result["quota_exhausted"] = True
+                result["quota_retry_after_seconds"] = max(
+                    result.get("quota_retry_after_seconds") or 0,
+                    _retry_after_seconds(exc),
+                )
+                result["skipped"] += 1
+                result["errors"].append(
+                    {
+                        "asset_id": row.id if row else None,
+                        "asset_type": row.asset_type if row else "",
+                        "status": "publish_limited",
+                        "error": str(exc)[:500],
+                    }
+                )
+                break
             result["failed"] += 1
             result["errors"].append({"asset_id": row.id if row else None, "asset_type": row.asset_type if row else "", "error": str(exc)[:500]})
     return result
