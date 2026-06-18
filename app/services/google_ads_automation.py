@@ -2205,6 +2205,7 @@ def existing_google_campaign_for_identity(
         select(
             GoogleAdsCampaignMetric.campaign_id,
             func.max(GoogleAdsCampaignMetric.campaign_name),
+            func.max(GoogleAdsCampaignMetric.campaign_status),
             func.max(GoogleAdsCampaignMetric.channel_type),
             func.max(GoogleAdsCampaignMetric.metric_date),
             func.max(GoogleAdsCampaignMetric.synced_at),
@@ -2222,12 +2223,70 @@ def existing_google_campaign_for_identity(
     return {
         "campaign_id": int(row[0] or 0),
         "campaign_name": str(row[1] or ""),
-        "channel_type": str(row[2] or ""),
-        "latest_metric_date": row[3].isoformat() if row[3] else None,
-        "latest_synced_at": row[4].isoformat() if row[4] else None,
+        "campaign_status": str(row[2] or ""),
+        "channel_type": str(row[3] or ""),
+        "latest_metric_date": row[4].isoformat() if row[4] else None,
+        "latest_synced_at": row[5].isoformat() if row[5] else None,
         "matched_by": "automation_campaign_code",
         "campaign_code": code,
     }
+
+
+def _automation_code_from_campaign_name(campaign_name: str) -> str:
+    match = re.search(r"\bAUTO-[A-F0-9]{10}\b", str(campaign_name or "").upper())
+    return match.group(0) if match else ""
+
+
+def existing_google_campaign_for_lane(
+    session: Session,
+    account: GoogleAdsAccount,
+    identity: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    category = str(identity.get("category") or "").strip()
+    channel_label = str(identity.get("channel_label") or "").strip()
+    if not category or not channel_label:
+        return None
+    lane_prefix = f"AUTO | {category} | {channel_label} | AUTO-"
+    rows = list(
+        session.execute(
+            select(
+                GoogleAdsCampaignMetric.campaign_id,
+                func.max(GoogleAdsCampaignMetric.campaign_name),
+                func.max(GoogleAdsCampaignMetric.campaign_status),
+                func.max(GoogleAdsCampaignMetric.channel_type),
+                func.max(GoogleAdsCampaignMetric.metric_date),
+                func.max(GoogleAdsCampaignMetric.synced_at),
+            )
+            .where(
+                GoogleAdsCampaignMetric.account_id == account.id,
+                GoogleAdsCampaignMetric.campaign_name.ilike(f"{lane_prefix}%"),
+            )
+            .group_by(GoogleAdsCampaignMetric.campaign_id)
+        ).all()
+    )
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        campaign_name = str(row[1] or "")
+        campaign_code = _automation_code_from_campaign_name(campaign_name)
+        if not campaign_code:
+            continue
+        candidates.append(
+            {
+                "campaign_id": int(row[0] or 0),
+                "campaign_name": campaign_name,
+                "campaign_status": str(row[2] or ""),
+                "channel_type": str(row[3] or ""),
+                "latest_metric_date": row[4].isoformat() if row[4] else None,
+                "latest_synced_at": row[5].isoformat() if row[5] else None,
+                "matched_by": "automation_lane_fallback",
+                "campaign_code": campaign_code,
+                "generated_campaign_code": str(identity.get("campaign_code") or ""),
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (int(item.get("campaign_id") or 0), str(item.get("campaign_name") or "")))
+    return candidates[0]
 
 
 def attach_campaign_identity(
@@ -2248,6 +2307,22 @@ def attach_campaign_identity(
         website_url=website_url,
     )
     existing = existing_google_campaign_for_identity(session, account, identity)
+    if existing is None:
+        existing = existing_google_campaign_for_lane(session, account, identity)
+        adopted_code = str(existing.get("campaign_code") or "") if existing else ""
+        if adopted_code and adopted_code != str(identity.get("campaign_code") or ""):
+            identity = {
+                **identity,
+                "generated_campaign_code": str(identity.get("campaign_code") or ""),
+                "campaign_code": adopted_code,
+                "campaign_name": str(existing.get("campaign_name") or identity.get("campaign_name") or "")[:255],
+                "resume_key": adopted_code,
+                "lookup": {
+                    **(identity.get("lookup") if isinstance(identity.get("lookup"), dict) else {}),
+                    "name_contains": adopted_code,
+                    "adopted_lane_fallback": True,
+                },
+            }
     return {
         **automation,
         "category": category,
