@@ -144,6 +144,16 @@ async function runOneStep() {
     const currentTab = await chrome.tabs.get(tab.id);
     const currentUrl = String(currentTab.url || "");
     const currentTitle = String(currentTab.title || "");
+    if (currentUrl.includes("accounts.google.com/")) {
+      const result = {
+        reason: "Google account sign-in or account chooser is required before the worker can continue.",
+        current_url: currentUrl,
+        title: currentTitle,
+      };
+      await sendResult(task, "needs_manual_attention", result);
+      await updateStatus(`Task #${task.id}: needs_manual_attention\nGoogle account sign-in/account chooser is open.`);
+      return { ok: true, message: `Task #${task.id}: needs_manual_attention` };
+    }
     if (currentUrl.includes("/nav/selectaccount")) {
       const result = {
         reason: "Google Ads account selection is required before the worker can continue.",
