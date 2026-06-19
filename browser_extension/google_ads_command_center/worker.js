@@ -76,9 +76,11 @@ async function updateStatus(message) {
 async function findOrCreateAdsTab(targetUrl) {
   const tabs = await chrome.tabs.query({ url: "https://ads.google.com/*" });
   let tab = tabs.find((item) => item.active) || tabs[0];
+  const normalizedTarget = String(targetUrl || "").split("#")[0];
+  const normalizedCurrent = String(tab?.url || "").split("#")[0];
   if (!tab) {
     tab = await chrome.tabs.create({ url: targetUrl || "https://ads.google.com/aw/overview", active: true });
-  } else if (targetUrl && !String(tab.url || "").startsWith(targetUrl.split("?")[0])) {
+  } else if (targetUrl && normalizedCurrent !== normalizedTarget) {
     tab = await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
   } else {
     await chrome.tabs.update(tab.id, { active: true });
@@ -141,6 +143,7 @@ async function runOneStep() {
     const tab = await findOrCreateAdsTab(payload.target_url || "https://ads.google.com/aw/overview");
     const currentTab = await chrome.tabs.get(tab.id);
     const currentUrl = String(currentTab.url || "");
+    const currentTitle = String(currentTab.title || "");
     if (currentUrl.includes("/nav/selectaccount")) {
       const result = {
         reason: "Google Ads account selection is required before the worker can continue.",
@@ -148,6 +151,16 @@ async function runOneStep() {
       };
       await sendResult(task, "needs_manual_attention", result);
       await updateStatus(`Task #${task.id}: needs_manual_attention\nSelect the correct Google Ads manager/account tab, then retry.`);
+      return { ok: true, message: `Task #${task.id}: needs_manual_attention` };
+    }
+    if (/404|not found/i.test(currentTitle) || /\/404\b/i.test(currentUrl)) {
+      const result = {
+        reason: "Google Ads opened an error page. The account context or route must be corrected before retrying.",
+        current_url: currentUrl,
+        title: currentTitle,
+      };
+      await sendResult(task, "needs_manual_attention", result);
+      await updateStatus(`Task #${task.id}: needs_manual_attention\nGoogle Ads opened an error page.`);
       return { ok: true, message: `Task #${task.id}: needs_manual_attention` };
     }
     await withTimeout(ensureContentScript(tab.id), 15000, "Timed out injecting the Google Ads worker content script.");
