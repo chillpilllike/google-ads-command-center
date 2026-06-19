@@ -7,6 +7,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
 function storageGet(keys) {
   return chrome.storage.local.get(keys);
 }
@@ -121,24 +128,43 @@ async function sendResult(task, status, result) {
 async function runOneStep() {
   if (runningStep) return { ok: false, message: "A step is already running." };
   runningStep = true;
+  let task = null;
   try {
     const id = await workerId();
     const next = await apiFetch(`/api/browser-automation/next?worker_id=${encodeURIComponent(id)}`);
-    const task = next.task;
+    task = next.task;
     if (!task) {
       await updateStatus("No queued browser automation tasks.");
       return { ok: true, message: "No queued tasks." };
     }
     const payload = task.payload || {};
     const tab = await findOrCreateAdsTab(payload.target_url || "https://ads.google.com/aw/overview");
-    await ensureContentScript(tab.id);
+    const currentTab = await chrome.tabs.get(tab.id);
+    const currentUrl = String(currentTab.url || "");
+    if (currentUrl.includes("/nav/selectaccount")) {
+      const result = {
+        reason: "Google Ads account selection is required before the worker can continue.",
+        current_url: currentUrl,
+      };
+      await sendResult(task, "needs_manual_attention", result);
+      await updateStatus(`Task #${task.id}: needs_manual_attention\nSelect the correct Google Ads manager/account tab, then retry.`);
+      return { ok: true, message: `Task #${task.id}: needs_manual_attention` };
+    }
+    await withTimeout(ensureContentScript(tab.id), 15000, "Timed out injecting the Google Ads worker content script.");
     await sleep(1500);
-    const response = await chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_BROWSER_AUTOMATION_TASK", task });
+    const response = await withTimeout(
+      chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_BROWSER_AUTOMATION_TASK", task }),
+      30000,
+      "Timed out waiting for the Google Ads page worker response."
+    );
     const status = response?.status || "needs_manual_attention";
     await sendResult(task, status, response || {});
     await updateStatus(`Task #${task.id}: ${status}\n${task.action_type}\n${payload.campaign || ""}`);
     return { ok: true, message: `Task #${task.id}: ${status}` };
   } catch (error) {
+    if (task) {
+      await sendResult(task, "retry", { reason: error.message }).catch(() => {});
+    }
     await updateStatus(`Worker error: ${error.message}`);
     return { ok: false, message: error.message };
   } finally {

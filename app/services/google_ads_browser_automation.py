@@ -4,10 +4,10 @@ import hashlib
 import hmac
 import secrets
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import AdDraft, AppSetting, AutoPilotEvent, BrowserAutomationTask, GoogleAdsAccount, GoogleAdsGeneratedAsset
@@ -17,6 +17,7 @@ from app.services.google_ads_editor_export import _iter_dynamic_search_editor_ro
 BROWSER_AUTOMATION_TOKEN_KEY = "browser_automation.extension_token"
 BROWSER_TASK_FINAL_STATUSES = {"done", "skipped", "cancelled"}
 BROWSER_TASK_CLAIMABLE_STATUSES = {"queued", "retry"}
+BROWSER_TASK_STALE_CLAIM_MINUTES = 15
 
 
 def _clean(value: Any, *, max_len: int = 255) -> str:
@@ -299,6 +300,18 @@ def claim_next_browser_automation_task(
     worker_id: str,
     account_id: Optional[int] = None,
 ) -> Optional[BrowserAutomationTask]:
+    stale_before = datetime.utcnow() - timedelta(minutes=BROWSER_TASK_STALE_CLAIM_MINUTES)
+    stale_statement = (
+        update(BrowserAutomationTask)
+        .where(BrowserAutomationTask.status == "claimed")
+        .where(BrowserAutomationTask.claimed_at.is_not(None))
+        .where(BrowserAutomationTask.claimed_at < stale_before)
+        .values(status="retry", claimed_by="", claimed_at=None)
+    )
+    if account_id:
+        stale_statement = stale_statement.where(BrowserAutomationTask.account_id == int(account_id))
+    session.execute(stale_statement)
+
     statement = (
         select(BrowserAutomationTask.id)
         .where(BrowserAutomationTask.status.in_(BROWSER_TASK_CLAIMABLE_STATUSES))
