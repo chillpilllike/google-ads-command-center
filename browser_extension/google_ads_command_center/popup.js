@@ -8,7 +8,7 @@ function setStatus(message) {
 async function loadConfig() {
   const saved = await chrome.storage.local.get([...fields, "running", "lastStatus"]);
   for (const field of fields) {
-    document.getElementById(field).value = saved[field] || "";
+    document.getElementById(field).value = saved[field] || (field === "appBaseUrl" ? "https://googleads.gofinch.com" : "");
   }
   setStatus(saved.lastStatus || (saved.running ? "Running." : "Stopped."));
 }

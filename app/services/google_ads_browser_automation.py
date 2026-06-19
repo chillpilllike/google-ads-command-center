@@ -300,7 +300,7 @@ def claim_next_browser_automation_task(
     account_id: Optional[int] = None,
 ) -> Optional[BrowserAutomationTask]:
     statement = (
-        select(BrowserAutomationTask)
+        select(BrowserAutomationTask.id)
         .where(BrowserAutomationTask.status.in_(BROWSER_TASK_CLAIMABLE_STATUSES))
         .order_by(BrowserAutomationTask.priority.asc(), BrowserAutomationTask.step_order.asc(), BrowserAutomationTask.id.asc())
         .limit(1)
@@ -308,7 +308,10 @@ def claim_next_browser_automation_task(
     )
     if account_id:
         statement = statement.where(BrowserAutomationTask.account_id == int(account_id))
-    task = session.scalar(statement)
+    task_id = session.scalar(statement)
+    if task_id is None:
+        return None
+    task = session.get(BrowserAutomationTask, int(task_id))
     if task is None:
         return None
     task.status = "claimed"
