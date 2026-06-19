@@ -21,6 +21,11 @@
   <a class="btn btn-sm btn-outline-primary" href="/jobs#job-{{ job_id }}">View job</a>
 </div>
 {% endif %}
+{% if manual_confirmed %}
+<div class="alert alert-success" role="alert">
+  Manual Google Ads Editor upload confirmed for {{ manual_confirmed }} automation draft{{ "" if manual_confirmed == "1" else "s" }}. Future API runs will reconcile from the uploaded campaigns instead of treating those drafts as new.
+</div>
+{% endif %}
 
 {% if not accounts %}
 <div class="alert alert-warning" role="alert">No active Google Ads accounts are saved yet.</div>
@@ -197,8 +202,8 @@
                 <input class="form-control" id="testing-bootstrap-days" name="testing_bootstrap_days" type="number" min="1" max="60" value="{{ preference.testing_bootstrap_days or 15 }}">
               </div>
               <div class="col-md-4">
-                <label class="form-label" for="pmax-min-7d-conversions">PMax min 7d conversions</label>
-                <input class="form-control" id="pmax-min-7d-conversions" name="pmax_min_7d_conversions" type="number" min="1" max="1000" step="0.1" value="{{ preference.pmax_min_7d_conversions if preference.pmax_min_7d_conversions is not none else 15 }}">
+                <label class="form-label" for="pmax-min-7d-conversions">PMax min auto Search conversions</label>
+                <input class="form-control" id="pmax-min-7d-conversions" name="pmax_min_7d_conversions" type="number" min="15" max="1000" step="0.1" value="{{ 15 if preference.pmax_min_7d_conversions is none or preference.pmax_min_7d_conversions < 15 else preference.pmax_min_7d_conversions }}">
               </div>
               <div class="col-md-4">
                 <label class="form-label" for="testing-sales-budget">Testing sales %</label>
@@ -206,11 +211,11 @@
               </div>
               <div class="col-md-4">
                 <label class="form-label" for="testing-keyword-limit">Keyword limit</label>
-                <input class="form-control" id="testing-keyword-limit" name="testing_keyword_limit" type="number" min="1" max="200" value="{{ preference.testing_keyword_limit or 30 }}">
+                <input class="form-control" id="testing-keyword-limit" name="testing_keyword_limit" type="number" min="0" value="{{ preference.testing_keyword_limit if preference.testing_keyword_limit is not none else 0 }}">
               </div>
               <div class="col-md-4">
                 <label class="form-label" for="testing-landing-page-limit">Page limit</label>
-                <input class="form-control" id="testing-landing-page-limit" name="testing_landing_page_limit" type="number" min="1" max="500" value="{{ preference.testing_landing_page_limit or 25 }}">
+                <input class="form-control" id="testing-landing-page-limit" name="testing_landing_page_limit" type="number" min="0" value="{{ preference.testing_landing_page_limit if preference.testing_landing_page_limit is not none else 0 }}">
               </div>
             </div>
 
@@ -399,7 +404,7 @@
               </div>
               <div class="datagrid-item">
                 <div class="datagrid-title">Bootstrap</div>
-                <div class="datagrid-content">{{ strategy.quota.testing_bootstrap_days }}d · PMax after {{ "%.0f"|format(strategy.quota.pmax_min_7d_conversions) }} conv</div>
+                <div class="datagrid-content">{{ strategy.quota.testing_bootstrap_days }}d · PMax after {{ "%.0f"|format(strategy.quota.pmax_min_7d_conversions) }} auto Search conv</div>
               </div>
               <div class="datagrid-item">
                 <div class="datagrid-title">Testing budget</div>
@@ -416,11 +421,31 @@
               </label>
               <a class="btn btn-outline-secondary" href="/automation/google-ads-editor-export?account_id={{ selected_account.id }}">
                 <i class="ti ti-file-spreadsheet me-2"></i>
-                Editor export
+                Editor ZIP
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/google-ads-editor-export?account_id={{ selected_account.id }}&file=main">
+                <i class="ti ti-file-upload me-2"></i>
+                Full import file
               </a>
               <a class="btn btn-outline-secondary" href="/automation/google-ads-editor-export?account_id={{ selected_account.id }}&kind=dynamic_search">
                 <i class="ti ti-list-search me-2"></i>
                 AI Max URL export
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/manual-export?account_id={{ selected_account.id }}&kind=keywords">
+                <i class="ti ti-key me-2"></i>
+                Keywords CSV
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/manual-export?account_id={{ selected_account.id }}&kind=negative_keywords">
+                <i class="ti ti-shield-minus me-2"></i>
+                Negative CSV
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/manual-export?account_id={{ selected_account.id }}&kind=url_inclusions">
+                <i class="ti ti-link-plus me-2"></i>
+                URL include CSV
+              </a>
+              <a class="btn btn-outline-secondary" href="/automation/manual-export?account_id={{ selected_account.id }}&kind=url_exclusions">
+                <i class="ti ti-link-off me-2"></i>
+                URL exclude CSV
               </a>
               <a class="btn btn-outline-primary" href="/negative-keywords?account_id={{ selected_account.id }}">
                 <i class="ti ti-shield-search me-2"></i>
@@ -429,6 +454,14 @@
               <button class="btn btn-primary ms-auto" type="submit">
                 <i class="ti ti-player-play me-2"></i>
                 Run monitor now
+              </button>
+            </form>
+            <form class="d-flex flex-wrap gap-2 align-items-center mt-2" method="post" action="/automation/manual-upload-confirm">
+              <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+              <input class="form-control form-control-sm flex-fill" name="note" type="text" placeholder="Optional note after uploading the latest Editor export">
+              <button class="btn btn-outline-success" type="submit">
+                <i class="ti ti-check me-2"></i>
+                Confirm manual upload
               </button>
             </form>
           </div>

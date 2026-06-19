@@ -186,6 +186,7 @@ async def automation_page(
             "recent_jobs": recent_jobs,
             "saved": request.query_params.get("saved") == "1",
             "job_id": request.query_params.get("job_id", ""),
+            "manual_confirmed": request.query_params.get("manual_confirmed", ""),
         },
     )
 
@@ -210,12 +211,12 @@ async def save_automation_preferences(
     testing_bootstrap_days: int = Form(15),
     pmax_min_7d_conversions: str = Form("15"),
     testing_sales_budget_pct: str = Form("5"),
-    testing_keyword_limit: int = Form(30),
-    testing_landing_page_limit: int = Form(25),
+    testing_keyword_limit: int = Form(0),
+    testing_landing_page_limit: int = Form(0),
     peak_budget_increase_pct: str = Form("50"),
     peak_budget_warmup_minutes: int = Form(60),
     peak_budget_restore_delay_minutes: int = Form(0),
-    daily_keyword_lookback_days: int = Form(60),
+    daily_keyword_lookback_days: int = Form(120),
     all_time_refresh_interval_days: int = Form(7),
     api_call_budget_per_day: int = Form(750),
     max_daily_api_rows: int = Form(10000),
@@ -242,6 +243,7 @@ async def save_automation_preferences(
     if account is None or not account.is_active:
         raise HTTPException(status_code=400, detail="Select an active Google Ads account.")
     preference = await _preference_for(session, account)
+    was_enabled = bool(preference.automation_enabled)
     preference.automation_enabled = _checked(automation_enabled)
     preference.monitor_only = _checked(monitor_only)
     preference.keyword_discovery_enabled = _checked(keyword_discovery_enabled)
@@ -257,14 +259,16 @@ async def save_automation_preferences(
     preference.auto_peak_budget_enabled = _checked(auto_peak_budget_enabled)
     preference.testing_bootstrap_enabled = _checked(testing_bootstrap_enabled)
     preference.testing_bootstrap_days = clamp_int(testing_bootstrap_days, 15, 1, 60)
-    preference.pmax_min_7d_conversions = _clamp_float(_optional_float(pmax_min_7d_conversions), 15, 1, 1000)
+    preference.pmax_min_7d_conversions = _clamp_float(_optional_float(pmax_min_7d_conversions), 15, 15, 1000)
     preference.testing_sales_budget_ratio = _clamp_float(_optional_float(testing_sales_budget_pct), 5, 0.1, 100) / 100
-    preference.testing_keyword_limit = clamp_int(testing_keyword_limit, 30, 1, 200)
-    preference.testing_landing_page_limit = clamp_int(testing_landing_page_limit, 25, 1, 500)
+    preference.testing_keyword_limit = max(int(testing_keyword_limit or 0), 0)
+    preference.testing_landing_page_limit = max(int(testing_landing_page_limit or 0), 0)
     preference.peak_budget_increase_pct = _clamp_float(_optional_float(peak_budget_increase_pct), 50, 1, 200) / 100
     preference.peak_budget_warmup_minutes = clamp_int(peak_budget_warmup_minutes, 60, 15, 240)
     preference.peak_budget_restore_delay_minutes = clamp_int(peak_budget_restore_delay_minutes, 0, 0, 240)
-    preference.daily_keyword_lookback_days = clamp_int(daily_keyword_lookback_days, 60, 1, 365)
+    preference.daily_keyword_lookback_days = clamp_int(daily_keyword_lookback_days, 120, 1, 365)
+    if preference.automation_enabled and not was_enabled:
+        preference.last_keyword_pull_at = None
     preference.all_time_refresh_interval_days = clamp_int(all_time_refresh_interval_days, 7, 1, 90)
     preference.api_call_budget_per_day = clamp_int(api_call_budget_per_day, 750, 10, 100000)
     preference.max_daily_api_rows = clamp_int(max_daily_api_rows, 10000, 50, 250000)
@@ -325,6 +329,7 @@ async def queue_automation_monitor(
     preference = await _preference_for(session, account)
     if not preference.automation_enabled:
         preference.automation_enabled = True
+        preference.last_keyword_pull_at = None
         await session.commit()
     job = await create_background_job(
         session,

@@ -42,6 +42,7 @@ from app.services.google_ads_landing_page_bank import (
     usable_landing_page_url,
 )
 from app.services.google_ads_negative_keyword_bank import sync_account_negative_keyword_candidates
+from app.services.google_ads_pmax_gate import pmax_activation_gate, pmax_conversion_threshold
 from app.services.google_ads_research_collector import sync_account_research_snapshots
 from app.services.google_ads_snapshot_store import (
     DATASET_AI_MAX_SEARCH_TERM_COMBINATIONS,
@@ -98,6 +99,8 @@ TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
 WASTE_RECOVERY_TARGET_ROAS = 2.0
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
+DEFAULT_TESTING_KEYWORD_LIMIT = 0
+DEFAULT_TESTING_LANDING_PAGE_LIMIT = 0
 CAMPAIGN_PLANNING_REQUIRED_DATASETS = {DATASET_CAMPAIGN_INSIGHTS, DATASET_LANDING_PAGES}
 CAMPAIGN_PLANNING_KEYWORD_DATASETS = {
     DATASET_SEARCH_TERMS,
@@ -113,7 +116,6 @@ PEAK_BUDGET_TRANSITION_QUOTA_UNITS = 2
 PEAK_TIMEZONE_FETCH_QUOTA_UNITS = 1
 PMAX_SEARCH_THEME_LIMIT = 50
 PMAX_ASSET_GROUP_LIMIT = 100
-PMAX_SEARCH_THEME_BANK_LIMIT = 25000
 PMAX_SEARCH_THEME_TEXT_LIMIT = 80
 PMAX_POLICY_SENSITIVE_FALLBACK_TERMS = (
     "alli",
@@ -1335,12 +1337,13 @@ def best_keyword_candidates_for_testing(
     session: Session,
     account: GoogleAdsAccount,
     *,
-    limit: int = 30,
+    limit: Optional[int] = DEFAULT_TESTING_KEYWORD_LIMIT,
     allow_cross_account_fallback: bool = True,
 ) -> tuple[list[GoogleAdsKeywordCandidate], str]:
-    limit = clamp_int(limit, 30, 1, PMAX_SEARCH_THEME_BANK_LIMIT)
+    target_limit = int(limit or 0)
+    target_limit = target_limit if target_limit > 0 else None
     quality_order = ["revenue", "converting", "clicked"]
-    rows = session.scalars(
+    query = (
         select(GoogleAdsKeywordCandidate)
         .where(
             GoogleAdsKeywordCandidate.account_id == account.id,
@@ -1352,12 +1355,17 @@ def best_keyword_candidates_for_testing(
             GoogleAdsKeywordCandidate.conversions.desc(),
             GoogleAdsKeywordCandidate.clicks.desc(),
         )
-        .limit(limit)
-    ).all()
+    )
+    if target_limit:
+        query = query.limit(target_limit)
+    rows = session.scalars(query).all()
     source = "same_account_keyword_bank"
-    if allow_cross_account_fallback and len(rows) < limit:
+    # Cross-account keywords are only a bootstrap fallback for genuinely new
+    # accounts. Once an account has its own usable keyword bank, keep targeting
+    # country/site-specific instead of making mature accounts converge.
+    if allow_cross_account_fallback and not rows:
         seen = {row.normalized_keyword for row in rows}
-        fallback = session.scalars(
+        fallback_query = (
             select(GoogleAdsKeywordCandidate)
             .where(
                 GoogleAdsKeywordCandidate.account_id != account.id,
@@ -1369,20 +1377,22 @@ def best_keyword_candidates_for_testing(
                 GoogleAdsKeywordCandidate.conversions.desc(),
                 GoogleAdsKeywordCandidate.clicks.desc(),
             )
-            .limit(limit * 3)
-        ).all()
+        )
+        if target_limit:
+            fallback_query = fallback_query.limit(target_limit * 3)
+        fallback = session.scalars(fallback_query).all()
         for row in fallback:
             if row.normalized_keyword in seen:
                 continue
             rows.append(row)
             seen.add(row.normalized_keyword)
-            if len(rows) >= limit:
+            if target_limit and len(rows) >= target_limit:
                 break
         if len(rows) > len(seen):
             source = "mixed_keyword_bank"
         elif fallback:
             source = "same_account_then_cross_account_keyword_bank"
-    return list(rows[:limit]), source
+    return list(rows[:target_limit] if target_limit else rows), source
 
 
 def best_landing_page_candidates_for_testing(
@@ -1390,11 +1400,12 @@ def best_landing_page_candidates_for_testing(
     account: GoogleAdsAccount,
     *,
     website_url: str = "",
-    limit: int = 25,
+    limit: Optional[int] = DEFAULT_TESTING_LANDING_PAGE_LIMIT,
 ) -> tuple[list[GoogleAdsLandingPageCandidate], str]:
-    limit = clamp_int(limit, 25, 1, 500)
-    quality_order = ["revenue", "converting", "clicked"]
-    rows = session.scalars(
+    target_limit = int(limit or 0)
+    target_limit = target_limit if target_limit > 0 else None
+    quality_order = ["revenue", "converting", "clicked", "watch"]
+    query = (
         select(GoogleAdsLandingPageCandidate)
         .where(
             GoogleAdsLandingPageCandidate.account_id == account.id,
@@ -1406,13 +1417,15 @@ def best_landing_page_candidates_for_testing(
             GoogleAdsLandingPageCandidate.conversions.desc(),
             GoogleAdsLandingPageCandidate.clicks.desc(),
         )
-        .limit(limit)
-    ).all()
+    )
+    if target_limit:
+        query = query.limit(target_limit)
+    rows = session.scalars(query).all()
     source = "same_account_landing_page_bank"
-    if len(rows) < limit and website_url:
+    if website_url and ((target_limit and len(rows) < target_limit) or (target_limit is None and not rows)):
         host_root = _root_domain(urlsplit(website_url).netloc)
         seen = {row.normalized_url_hash for row in rows}
-        fallback = session.scalars(
+        fallback_query = (
             select(GoogleAdsLandingPageCandidate)
             .where(
                 GoogleAdsLandingPageCandidate.account_id != account.id,
@@ -1424,19 +1437,21 @@ def best_landing_page_candidates_for_testing(
                 GoogleAdsLandingPageCandidate.conversions.desc(),
                 GoogleAdsLandingPageCandidate.clicks.desc(),
             )
-            .limit(limit * 5)
-        ).all()
+        )
+        if target_limit:
+            fallback_query = fallback_query.limit(target_limit * 5)
+        fallback = session.scalars(fallback_query).all()
         for row in fallback:
             candidate_root = _root_domain(urlsplit(row.normalized_url or row.url or "").netloc)
             if row.normalized_url_hash in seen or not candidate_root or candidate_root != host_root:
                 continue
             rows.append(row)
             seen.add(row.normalized_url_hash)
-            if len(rows) >= limit:
+            if target_limit and len(rows) >= target_limit:
                 break
         if fallback:
             source = "same_domain_cross_account_landing_page_bank"
-    return list(rows[:limit]), source
+    return list(rows[:target_limit] if target_limit else rows), source
 
 
 def negative_keyword_candidates_for_waste_review(
@@ -2091,13 +2106,14 @@ def campaign_bootstrap_decision(
     now = now or utcnow()
     account = preference.account
     metrics = recent_account_metric_totals(session, account, days=7, now=now)
-    threshold = min(max(float(preference.pmax_min_7d_conversions or 15.0), 1.0), 1000.0)
+    threshold = pmax_conversion_threshold(preference)
+    pmax_gate = pmax_activation_gate(session, account, preference, now=now)
     bootstrap_days = clamp_int(preference.testing_bootstrap_days, 15, 1, 60)
     state = load_campaign_bootstrap_state(session, account)
     started_at = parse_iso_datetime(state.get("started_at_utc"))
     age_days = (now.astimezone(timezone.utc) - started_at).days if started_at else None
     no_recent_impressions = int(metrics.get("impressions") or 0) <= 0
-    enough_conversions = float(metrics.get("conversions") or 0) >= threshold
+    enough_conversions = bool(pmax_gate.get("allowed"))
     existing_automation_lanes = _has_existing_automation_production_lanes(session, account)
 
     if no_recent_impressions and not existing_automation_lanes and started_at is None:
@@ -2111,22 +2127,18 @@ def campaign_bootstrap_decision(
         age_days = 0
 
     in_bootstrap = started_at is not None and (age_days or 0) < bootstrap_days
-    if enough_conversions or existing_automation_lanes:
+    if enough_conversions:
         mode = "pmax_allowed"
         allowed_campaign_types = ["rsa", "dsa", "pmax"]
-        reason = (
-            "Existing automation-owned production campaigns are already live, so the account is treated as established."
-            if existing_automation_lanes and not enough_conversions
-            else "Last 7 days have enough purchase conversion signal for PMax."
-        )
+        reason = str(pmax_gate.get("reason") or "Automation-owned Search campaigns have enough conversion signal for PMax.")
     elif no_recent_impressions or in_bootstrap:
         mode = "testing_no_pmax"
         allowed_campaign_types = ["rsa", "dsa"]
-        reason = "No recent delivery or account is inside the RSA/DSA-only testing bootstrap window."
+        reason = "No recent delivery or account is inside the RSA/DSA-only testing bootstrap window. " + str(pmax_gate.get("reason") or "")
     else:
         mode = "normal_categories_no_pmax"
         allowed_campaign_types = ["rsa", "dsa"]
-        reason = "Bootstrap window is complete, but PMax still waits for enough 7-day conversion signal."
+        reason = "Bootstrap window is complete, but PMax still waits for enough automation Search conversion signal. " + str(pmax_gate.get("reason") or "")
 
     if started_at is not None and not enough_conversions and (age_days or 0) >= bootstrap_days:
         state = {
@@ -2142,9 +2154,11 @@ def campaign_bootstrap_decision(
         "allowed_campaign_types": allowed_campaign_types,
         "pmax_allowed": "pmax" in allowed_campaign_types,
         "no_recent_impressions": no_recent_impressions,
+        "enough_auto_search_conversions": enough_conversions,
         "enough_7d_conversions": enough_conversions,
         "existing_automation_lanes": existing_automation_lanes,
         "pmax_min_7d_conversions": threshold,
+        "pmax_gate": pmax_gate,
         "bootstrap_days": bootstrap_days,
         "bootstrap_started_at": started_at.isoformat() if started_at else None,
         "bootstrap_age_days": age_days,
@@ -2439,13 +2453,20 @@ def automation_live_creation_control(
     category: str,
     ad_type: str,
 ) -> dict[str, Any]:
+    if ad_type == "pmax" and not bool(decision.get("pmax_allowed")):
+        gate = decision.get("pmax_gate") if isinstance(decision.get("pmax_gate"), dict) else {}
+        return {
+            "enabled": False,
+            "phase": "pmax_search_conversion_gate",
+            "reason": str(gate.get("reason") or decision.get("reason") or "PMax is held until automation-owned Search campaigns reach the conversion gate."),
+            "pmax_gate": gate,
+        }
     return {
         "enabled": True,
         "phase": "full_closed_loop",
         "reason": (
-            "Automation owns the full closed-loop campaign set for this account. Conversion and bootstrap signals still "
-            "shape budgets, URL inclusion scope, keywords, negatives, and monitoring, but they do not suppress required "
-            "Core, Testing, Fix, Waste, DSA, RSA, or PMax campaign lanes."
+            "Automation owns this closed-loop campaign lane. Conversion and bootstrap signals still shape budgets, "
+            "URL inclusion scope, keywords, negatives, and monitoring. PMax has its own automation Search conversion gate."
         ),
     }
 
@@ -2535,7 +2556,7 @@ def _landing_page_payload(rows: list[GoogleAdsLandingPageCandidate]) -> list[dic
     ]
 
 
-def _url_inclusion_targets_from_rows(rows: list[GoogleAdsLandingPageCandidate], *, limit: int = 500) -> list[dict[str, Any]]:
+def _url_inclusion_targets_from_rows(rows: list[GoogleAdsLandingPageCandidate], *, limit: Optional[int] = None) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
@@ -2555,7 +2576,7 @@ def _url_inclusion_targets_from_rows(rows: list[GoogleAdsLandingPageCandidate], 
                 "engagement": _landing_page_engagement_metrics(row),
             }
         )
-        if len(targets) >= limit:
+        if limit and len(targets) >= limit:
             break
     return targets
 
@@ -2563,7 +2584,7 @@ def _url_inclusion_targets_from_rows(rows: list[GoogleAdsLandingPageCandidate], 
 def _url_inclusion_targets_from_page_items(
     items: list[dict[str, Any]],
     *,
-    limit: int = 500,
+    limit: Optional[int] = None,
     source: str = "landing_page_governance",
 ) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
@@ -2590,7 +2611,7 @@ def _url_inclusion_targets_from_page_items(
                 "quality_label": str(item.get("quality_label") or ""),
             }
         )
-        if len(targets) >= limit:
+        if limit and len(targets) >= limit:
             break
     return targets
 
@@ -2644,7 +2665,7 @@ def _pmax_safe_url_targets(
     targets: list[dict[str, Any]],
     policy_terms: list[str],
     *,
-    limit: int = 500,
+    limit: Optional[int] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     safe: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -2663,7 +2684,7 @@ def _pmax_safe_url_targets(
             )
             continue
         safe.append(item)
-        if len(safe) >= limit:
+        if limit and len(safe) >= limit:
             break
     return safe, {
         "mode": "pmax_policy_safe_subset",
@@ -2730,7 +2751,7 @@ def _matrix_scale_landing_page_items(
     ga4_matrix: Optional[dict[str, Any]] = None,
     search_console_matrix: Optional[dict[str, Any]] = None,
     seen_keys: Optional[set[str]] = None,
-    limit: int = 500,
+    limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     seen_keys = seen_keys or set()
     items: list[dict[str, Any]] = []
@@ -2776,7 +2797,7 @@ def _matrix_scale_landing_page_items(
             for raw in ga4_matrix.get(bucket_name) or []:
                 if isinstance(raw, dict):
                     append_item(raw, source=f"ga4_{bucket_name}")
-                    if len(items) >= limit:
+                    if limit and len(items) >= limit:
                         return items
 
     if isinstance(search_console_matrix, dict):
@@ -2786,7 +2807,7 @@ def _matrix_scale_landing_page_items(
             if float(raw.get("clicks") or 0) <= 0:
                 continue
             append_item(raw, source="search_console_clicked_page")
-            if len(items) >= limit:
+            if limit and len(items) >= limit:
                 return items
 
     return items
@@ -2800,8 +2821,20 @@ def scale_landing_page_plan(
 ) -> dict[str, Any]:
     pages: list[dict[str, Any]] = []
     seen: set[str] = set()
+    def is_scale_page(row: GoogleAdsLandingPageCandidate) -> bool:
+        label = str(getattr(row, "quality_label", "") or "").strip().lower()
+        engagement = _landing_page_engagement_metrics(row)
+        return (
+            label in {"revenue", "converting", "clicked"}
+            or _row_total_conversions(row) > 0
+            or _row_total_value(row) > 0
+            or float(engagement.get("add_to_carts") or 0) > 0
+            or float(engagement.get("checkouts") or 0) > 0
+            or float(engagement.get("purchases") or 0) > 0
+            or float(engagement.get("revenue") or 0) > 0
+        )
     ranked_rows = sorted(
-        page_rows,
+        [row for row in page_rows if is_scale_page(row)],
         key=lambda row: (
             _row_total_conversions(row),
             _row_total_value(row),
@@ -3003,7 +3036,7 @@ def _ranked_unique_landing_page_items(
     rows: list[GoogleAdsLandingPageCandidate],
     *,
     exclude_keys: Optional[set[str]] = None,
-    limit: int = 25,
+    limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     exclude_keys = exclude_keys or set()
     ranked = sorted(
@@ -3026,7 +3059,7 @@ def _ranked_unique_landing_page_items(
             continue
         seen.add(key)
         items.append(item)
-        if len(items) >= limit:
+        if limit and len(items) >= limit:
             break
     return items
 
@@ -3039,7 +3072,7 @@ def landing_page_category_governance_plan(
     scale_page_exclusion_plan: dict[str, Any],
     waste_plan: dict[str, Any],
     all_page_rows: Optional[list[GoogleAdsLandingPageCandidate]] = None,
-    testing_limit: int = 25,
+    testing_limit: Optional[int] = None,
     fix_watch_limit: int = 25,
 ) -> dict[str, Any]:
     all_page_rows = all_page_rows or page_rows
@@ -3239,13 +3272,12 @@ def pmax_search_theme_plan(
     *,
     limit: int = PMAX_SEARCH_THEME_LIMIT,
     asset_group_limit: int = PMAX_ASSET_GROUP_LIMIT,
-    overflow_limit: int = PMAX_SEARCH_THEME_BANK_LIMIT,
+    overflow_limit: Optional[int] = None,
     policy_terms: list[str] | None = None,
 ) -> dict[str, Any]:
     limit = clamp_int(limit, PMAX_SEARCH_THEME_LIMIT, 1, PMAX_SEARCH_THEME_LIMIT)
     asset_group_limit = clamp_int(asset_group_limit, PMAX_ASSET_GROUP_LIMIT, 1, PMAX_ASSET_GROUP_LIMIT)
-    overflow_limit = clamp_int(overflow_limit, PMAX_SEARCH_THEME_BANK_LIMIT, limit, 100000)
-    overflow_limit = max(overflow_limit, limit)
+    target_overflow_limit = int(overflow_limit or 0)
     ranked_rows = sorted(
         keyword_rows,
         key=lambda row: (
@@ -3298,15 +3330,13 @@ def pmax_search_theme_plan(
                 "scale_evidence": scale_evidence,
             }
         )
-        if len(candidates) >= overflow_limit:
+        if target_overflow_limit > 0 and len(candidates) >= target_overflow_limit:
             break
     asset_groups: list[dict[str, Any]] = []
     for start in range(0, len(candidates), limit):
         bucket = candidates[start : start + limit]
         if not bucket:
             continue
-        if len(bucket) < limit:
-            break
         asset_group_index = len(asset_groups) + 1
         asset_groups.append(
             {
@@ -3406,11 +3436,11 @@ def claim_keyword_terms(
     rows: list[GoogleAdsKeywordCandidate],
     used_keys: set[str],
     *,
-    limit: int,
+    limit: Optional[int] = None,
 ) -> tuple[list[str], list[GoogleAdsKeywordCandidate]]:
     terms: list[str] = []
     claimed_rows: list[GoogleAdsKeywordCandidate] = []
-    limit = clamp_int(limit, 30, 1, 200)
+    target_limit = int(limit or 0)
     for row in rows:
         key = _keyword_row_key(row)
         term = _clean_pmax_search_theme(getattr(row, "keyword", ""))
@@ -3419,7 +3449,7 @@ def claim_keyword_terms(
         used_keys.add(key)
         terms.append(term)
         claimed_rows.append(row)
-        if len(terms) >= limit:
+        if target_limit > 0 and len(terms) >= target_limit:
             break
     return terms, claimed_rows
 
@@ -3575,6 +3605,14 @@ def _compact_list(value: Any, *, limit: int) -> list[Any]:
     return value[: max(int(limit or 0), 0)]
 
 
+def _planning_items(value: Any, limit: Optional[int] = None) -> list[Any]:
+    if value is None:
+        return []
+    items = list(value) if isinstance(value, (list, tuple)) else []
+    target_limit = int(limit or 0)
+    return items[:target_limit] if target_limit > 0 else items
+
+
 def _compact_generated_assets_for_storage(generated_assets: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(generated_assets, dict):
         return {}
@@ -3584,8 +3622,6 @@ def _compact_generated_assets_for_storage(generated_assets: dict[str, Any]) -> d
         "landing_page_candidate_rows": 50,
         "keyword_candidates": 100,
         "negative_keyword_candidates": 100,
-        "page_feed_targets": 500,
-        "url_inclusion_targets": 500,
         "blocked_final_urls": 200,
         "negative_page_targets": 200,
     }
@@ -3831,7 +3867,7 @@ def run_testing_campaign_automation(
             "decision": decision,
         }
     try:
-        ga4_matrix = ga4_ads_signal_matrix(session, account.id, limit=100)
+        ga4_matrix = ga4_ads_signal_matrix(session, account.id, limit=0)
     except Exception as exc:  # noqa: BLE001 - saved Ads data remains enough to keep planning guarded.
         ga4_matrix = {
             "generated_at": utcnow().isoformat(),
@@ -3844,7 +3880,7 @@ def run_testing_campaign_automation(
             "basis": "GA4 matrix failed, so this plan used Google Ads data only.",
         }
     try:
-        search_console_matrix = search_console_ads_signal_matrix(session, account.id, limit=100)
+        search_console_matrix = search_console_ads_signal_matrix(session, account.id, limit=0)
     except Exception as exc:  # noqa: BLE001 - Search Console is additive, not a hard planning dependency.
         search_console_matrix = {
             "generated_at": utcnow().isoformat(),
@@ -3879,8 +3915,9 @@ def run_testing_campaign_automation(
     }
     protected_page_keys = ga4_protected_page_keys | search_console_protected_page_keys
 
-    keyword_limit = clamp_int(preference.testing_keyword_limit or 30, 30, 1, 200)
-    keyword_fetch_limit = PMAX_SEARCH_THEME_BANK_LIMIT if decision.get("pmax_allowed") else keyword_limit * 6
+    keyword_limit = max(int(preference.testing_keyword_limit or DEFAULT_TESTING_KEYWORD_LIMIT or 0), 0)
+    keyword_fetch_limit = 0
+    landing_page_limit = max(int(preference.testing_landing_page_limit or DEFAULT_TESTING_LANDING_PAGE_LIMIT or 0), 0)
     keyword_rows, keyword_source = best_keyword_candidates_for_testing(
         session,
         account,
@@ -3891,7 +3928,7 @@ def run_testing_campaign_automation(
         session,
         account,
         website_url=website_url,
-        limit=preference.testing_landing_page_limit or 25,
+        limit=landing_page_limit,
     )
     waste_negative_rows = negative_keyword_candidates_for_waste_review(session, account)
     waste_keyword_rows = keyword_candidates_for_waste_review(session, account)
@@ -3946,23 +3983,23 @@ def run_testing_campaign_automation(
     term_ledger_keys: set[str] = set()
     pmax_source_rows = [row for row in keyword_rows if getattr(row, "account_id", None) == account.id] or list(keyword_rows)
     pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows, policy_terms=pmax_policy_terms)
-    term_ledger_keys.update(_pmax_theme_keys(pmax_theme_plan))
     pmax_search_themes = list(pmax_theme_plan["active_terms"])
     core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     core_max_clicks_terms, core_max_clicks_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     testing_max_clicks_terms, testing_max_clicks_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
-    search_console_terms = search_console_keyword_terms(search_console_matrix, limit=keyword_limit * 5)
+    search_console_terms = search_console_keyword_terms(search_console_matrix, limit=0)
 
-    def fill_with_search_console_terms(target_terms: list[str], *, limit: int) -> None:
+    def fill_with_search_console_terms(target_terms: list[str], *, limit: Optional[int] = None) -> None:
+        target_limit = int(limit or 0)
         for term in search_console_terms:
             key = _term_key_from_text(term)
             if not term or not key or key in term_ledger_keys:
                 continue
             term_ledger_keys.add(key)
             target_terms.append(term)
-            if len(target_terms) >= limit:
+            if target_limit > 0 and len(target_terms) >= target_limit:
                 return
 
     fill_with_search_console_terms(core_rsa_terms, limit=keyword_limit)
@@ -4048,7 +4085,7 @@ def run_testing_campaign_automation(
         scale_page_exclusion_plan=scale_page_exclusion_plan,
         waste_plan=waste_plan,
         all_page_rows=list(page_rows) + list(waste_page_rows),
-        testing_limit=preference.testing_landing_page_limit or 25,
+        testing_limit=landing_page_limit,
     )
     draft_waste_plan = compact_waste_plan_for_draft(waste_plan)
     draft_landing_page_governance = compact_landing_page_governance_for_draft(landing_page_governance)
@@ -4198,7 +4235,7 @@ def run_testing_campaign_automation(
                     "best_landing_pages": _landing_page_payload(page_rows),
                     "best_landing_page_source": page_source,
                 },
-                "keyword_themes": _keyword_payload(keyword_rows[:keyword_limit]),
+                "keyword_themes": _keyword_payload(_planning_items(keyword_rows, keyword_limit)),
                 "keyword_source": keyword_source,
                 "scale_negative_keyword_plan": scale_negative_plan,
                 "scale_page_exclusion_plan": scale_page_exclusion_plan,
@@ -4284,7 +4321,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, "testing_keyword_rsa"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(testing_rows[:keyword_limit]),
+                    "keyword_themes": _keyword_payload(_planning_items(testing_rows, keyword_limit)),
                     "scale_negative_keyword_plan": scale_negative_plan,
                     "scale_page_exclusion_plan": scale_page_exclusion_plan,
                     "landing_page_governance_plan": draft_landing_page_governance,
@@ -4332,11 +4369,11 @@ def run_testing_campaign_automation(
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "url_inclusion_targets": testing_discovery_url_targets,
                 "blocked_final_urls": [item["url"] for item in testing_page_exclusions],
-                "source_terms": keywords[:30],
-                "search_console_source_terms": search_console_terms[:30],
+                "source_terms": _planning_items(keywords, keyword_limit),
+                "search_console_source_terms": _planning_items(search_console_terms, keyword_limit),
                 "google_keyword_plan": {
                     "source": keyword_source,
-                    "terms": keywords[:30],
+                    "terms": _planning_items(keywords, keyword_limit),
                     "candidate_count": len(keyword_rows),
                 },
                 "keyword_clusters": [
@@ -4344,7 +4381,7 @@ def run_testing_campaign_automation(
                         "ad_group_name": f"AUTO | Testing / Discovery | RSA Keywords | {campaign_identity['campaign_code']}",
                         "source": keyword_source,
                         "match_type": "exact",
-                        "exact_terms": keywords[:30],
+                        "exact_terms": _planning_items(keywords, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
@@ -4383,7 +4420,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, "testing_keyword_rsa_max_clicks_cpc_cap"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(testing_max_clicks_rows[:keyword_limit]),
+                    "keyword_themes": _keyword_payload(_planning_items(testing_max_clicks_rows, keyword_limit)),
                     "scale_negative_keyword_plan": scale_negative_plan,
                     "scale_page_exclusion_plan": scale_page_exclusion_plan,
                     "landing_page_governance_plan": draft_landing_page_governance,
@@ -4429,10 +4466,10 @@ def run_testing_campaign_automation(
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "url_inclusion_targets": testing_discovery_url_targets,
                 "blocked_final_urls": [item["url"] for item in testing_page_exclusions],
-                "source_terms": testing_max_clicks_terms[:30],
+                "source_terms": _planning_items(testing_max_clicks_terms, keyword_limit),
                 "google_keyword_plan": {
                     "source": keyword_source,
-                    "terms": testing_max_clicks_terms[:30],
+                    "terms": _planning_items(testing_max_clicks_terms, keyword_limit),
                     "candidate_count": len(keyword_rows),
                 },
                 "keyword_clusters": [
@@ -4440,7 +4477,7 @@ def run_testing_campaign_automation(
                         "ad_group_name": f"AUTO | Testing / Discovery | RSA Max Clicks Keywords | {campaign_identity['campaign_code']}",
                         "source": keyword_source,
                         "match_type": "exact",
-                        "exact_terms": testing_max_clicks_terms[:30],
+                        "exact_terms": _planning_items(testing_max_clicks_terms, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
@@ -4488,7 +4525,7 @@ def run_testing_campaign_automation(
                 "source_key": _automation_draft_source_key(account, "fix_watch_keyword_rsa"),
                 "decision": decision,
                 "keyword_source": keyword_source,
-                "keyword_themes": _keyword_payload(fix_watch_rows[:keyword_limit]),
+                "keyword_themes": _keyword_payload(_planning_items(fix_watch_rows, keyword_limit)),
                 "scale_negative_keyword_plan": scale_negative_plan,
                 "scale_page_exclusion_plan": scale_page_exclusion_plan,
                 "landing_page_governance_plan": draft_landing_page_governance,
@@ -4532,10 +4569,10 @@ def run_testing_campaign_automation(
             "landing_page_governance_plan": draft_landing_page_governance,
             "url_inclusion_targets": _url_inclusion_targets_from_rows(page_rows),
             "blocked_final_urls": [item["url"] for item in testing_page_exclusions],
-            "source_terms": fix_watch_terms[:30],
+            "source_terms": _planning_items(fix_watch_terms, keyword_limit),
             "google_keyword_plan": {
                 "source": keyword_source,
-                "terms": fix_watch_terms[:30],
+                "terms": _planning_items(fix_watch_terms, keyword_limit),
                 "candidate_count": len(keyword_rows),
             },
             "keyword_clusters": [
@@ -4543,7 +4580,7 @@ def run_testing_campaign_automation(
                     "ad_group_name": f"AUTO | Fix / Watch | RSA Keywords | {campaign_identity['campaign_code']}",
                     "source": keyword_source,
                     "match_type": "exact",
-                    "exact_terms": fix_watch_terms[:30],
+                    "exact_terms": _planning_items(fix_watch_terms, keyword_limit),
                 }
             ],
             "copy_strategy": {
@@ -4634,10 +4671,10 @@ def run_testing_campaign_automation(
             "ga4_ads_signal_matrix": ga4_matrix,
             "url_inclusion_targets": _url_inclusion_targets_from_rows(page_rows),
             "negative_keywords": [],
-            "source_terms": waste_recovery_terms[:30],
+            "source_terms": _planning_items(waste_recovery_terms, keyword_limit),
             "google_keyword_plan": {
                 "source": "waste_recovery_state",
-                "terms": waste_recovery_terms[:30],
+                "terms": _planning_items(waste_recovery_terms, keyword_limit),
                 "candidate_count": len(waste_recovery_keyword_items),
                 "pending_recovery_keyword_count": int(waste_negative_plan.get("pending_recovery_keyword_count") or 0),
                 "scale_recovery_keyword_count": int(waste_negative_plan.get("scale_recovery_keyword_count") or 0),
@@ -4648,7 +4685,7 @@ def run_testing_campaign_automation(
                     "ad_group_name": f"AUTO | Waste / Recovery | RSA Keywords | {campaign_identity['campaign_code']}",
                     "source": "waste_recovery_state",
                     "match_type": "exact",
-                    "exact_terms": waste_recovery_terms[:30],
+                    "exact_terms": _planning_items(waste_recovery_terms, keyword_limit),
                 }
             ],
             "copy_strategy": {
@@ -4692,7 +4729,7 @@ def run_testing_campaign_automation(
                 "source_key": _automation_draft_source_key(account, "core_scale_ai_max_dsa"),
                 "decision": decision,
                 "keyword_source": keyword_source,
-                "keyword_themes": _keyword_payload(pmax_source_rows[: min(keyword_limit, PMAX_SEARCH_THEME_LIMIT)]),
+                "keyword_themes": _keyword_payload(_planning_items(pmax_source_rows, keyword_limit)),
                 "pmax_search_theme_plan": pmax_theme_plan,
                 "scale_landing_page_plan": scale_page_plan,
                 "landing_page_governance_plan": draft_landing_page_governance,
@@ -4789,7 +4826,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, "core_scale_keyword_rsa"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(core_rsa_rows[: min(keyword_limit, PMAX_SEARCH_THEME_LIMIT)]),
+                    "keyword_themes": _keyword_payload(_planning_items(core_rsa_rows, keyword_limit)),
                     "pmax_search_theme_plan": pmax_theme_plan,
                     "scale_landing_page_plan": scale_page_plan,
                     "landing_page_governance_plan": draft_landing_page_governance,
@@ -4839,10 +4876,10 @@ def run_testing_campaign_automation(
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "url_inclusion_targets": core_scale_url_targets,
                 "blocked_final_urls": [item["url"] for item in core_scale_page_exclusions],
-                "source_terms": scale_rsa_terms[:30],
+                "source_terms": _planning_items(scale_rsa_terms, keyword_limit),
                 "google_keyword_plan": {
                     "source": keyword_source,
-                    "terms": scale_rsa_terms[:30],
+                    "terms": _planning_items(scale_rsa_terms, keyword_limit),
                     "candidate_count": int(pmax_theme_plan.get("candidate_count") or len(keyword_rows)),
                 },
                 "keyword_clusters": [
@@ -4850,7 +4887,7 @@ def run_testing_campaign_automation(
                         "ad_group_name": f"AUTO | Core / Scale | RSA Keywords | {campaign_identity['campaign_code']}",
                         "source": keyword_source,
                         "match_type": "exact",
-                        "exact_terms": scale_rsa_terms[:30],
+                        "exact_terms": _planning_items(scale_rsa_terms, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
@@ -4889,7 +4926,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, "core_scale_keyword_rsa_max_clicks_cpc_cap"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(core_max_clicks_rows[: min(keyword_limit, PMAX_SEARCH_THEME_LIMIT)]),
+                    "keyword_themes": _keyword_payload(_planning_items(core_max_clicks_rows, keyword_limit)),
                     "pmax_search_theme_plan": pmax_theme_plan,
                     "scale_landing_page_plan": scale_page_plan,
                     "landing_page_governance_plan": draft_landing_page_governance,
@@ -4935,10 +4972,10 @@ def run_testing_campaign_automation(
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "url_inclusion_targets": core_scale_url_targets,
                 "blocked_final_urls": [item["url"] for item in core_scale_page_exclusions],
-                "source_terms": core_max_clicks_terms[:30],
+                "source_terms": _planning_items(core_max_clicks_terms, keyword_limit),
                 "google_keyword_plan": {
                     "source": keyword_source,
-                    "terms": core_max_clicks_terms[:30],
+                    "terms": _planning_items(core_max_clicks_terms, keyword_limit),
                     "candidate_count": int(pmax_theme_plan.get("candidate_count") or len(keyword_rows)),
                 },
                 "keyword_clusters": [
@@ -4946,7 +4983,7 @@ def run_testing_campaign_automation(
                         "ad_group_name": f"AUTO | Core / Scale | RSA Max Clicks Keywords | {campaign_identity['campaign_code']}",
                         "source": keyword_source,
                         "match_type": "exact",
-                        "exact_terms": core_max_clicks_terms[:30],
+                        "exact_terms": _planning_items(core_max_clicks_terms, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
@@ -5018,7 +5055,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, f"pmax_scale_after_7d_conversions_{campaign_suffix.lower()}"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(keyword_rows[: min(keyword_limit, PMAX_SEARCH_THEME_LIMIT)]),
+                    "keyword_themes": _keyword_payload(_planning_items(keyword_rows, keyword_limit)),
                     "pmax_search_theme_plan": pmax_theme_plan,
                     "pmax_campaign_plan": campaign_plan,
                     "scale_landing_page_plan": scale_page_plan,
@@ -5163,7 +5200,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, f"testing_pmax_discovery_{campaign_suffix.lower()}"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(testing_pmax_source_rows[: min(keyword_limit, PMAX_SEARCH_THEME_LIMIT)]),
+                    "keyword_themes": _keyword_payload(_planning_items(testing_pmax_source_rows, keyword_limit)),
                     "pmax_search_theme_plan": testing_pmax_theme_plan,
                     "pmax_campaign_plan": campaign_plan,
                     "scale_negative_keyword_plan": scale_negative_plan,
@@ -5295,7 +5332,7 @@ def run_testing_campaign_automation(
         "ga4_ads_signal_matrix": ga4_matrix,
         "search_console_ads_signal_matrix": search_console_matrix,
         "search_console_source_term_count": len(search_console_terms),
-        "search_console_source_terms": search_console_terms[:50],
+        "search_console_source_terms": search_console_terms,
         "scale_migration_state": {
             "hold_days": scale_migration_state.get("hold_days"),
             "active_term_count": scale_migration_state.get("active_term_count"),
@@ -6781,13 +6818,13 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         testing_bootstrap_days = 15
         pmax_min_7d_conversions = 15.0
         testing_sales_budget_pct = 5
-        testing_keyword_limit = 30
-        testing_landing_page_limit = 25
+        testing_keyword_limit = DEFAULT_TESTING_KEYWORD_LIMIT
+        testing_landing_page_limit = DEFAULT_TESTING_LANDING_PAGE_LIMIT
         waste_currency_code = "USD"
     else:
         enabled = bool(preference.automation_enabled)
         monitor_only = bool(preference.monitor_only)
-        lookback_days = preference.daily_keyword_lookback_days or 60
+        lookback_days = preference.daily_keyword_lookback_days or 120
         all_time_days = preference.all_time_refresh_interval_days or 7
         max_rows = preference.max_daily_api_rows or 10000
         api_budget = preference.api_call_budget_per_day or 750
@@ -6809,10 +6846,10 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         peak_check_minutes = preference.peak_budget_check_interval_minutes or 60
         testing_bootstrap_enabled = bool(preference.testing_bootstrap_enabled)
         testing_bootstrap_days = preference.testing_bootstrap_days or 15
-        pmax_min_7d_conversions = float(preference.pmax_min_7d_conversions or 15.0)
+        pmax_min_7d_conversions = pmax_conversion_threshold(preference)
         testing_sales_budget_pct = round(float(preference.testing_sales_budget_ratio or 0.05) * 100, 2)
-        testing_keyword_limit = preference.testing_keyword_limit or 30
-        testing_landing_page_limit = preference.testing_landing_page_limit or 25
+        testing_keyword_limit = max(preference.testing_keyword_limit or DEFAULT_TESTING_KEYWORD_LIMIT, DEFAULT_TESTING_KEYWORD_LIMIT)
+        testing_landing_page_limit = max(int(preference.testing_landing_page_limit or DEFAULT_TESTING_LANDING_PAGE_LIMIT or 0), 0)
         waste_currency_code = str((preference.account.currency_code if preference.account else "") or "USD").upper()
     core_scale_roas = round(1 / max(float(sales_guard_ratio or 15) / 100, 0.01), 2)
     if core_scale_roas < CORE_SCALE_TARGET_ROAS:
@@ -6831,7 +6868,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "budget": "10-15% of allowed spend inside the rolling Odoo sales cap",
             "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
             "target_roas_pct": round(TESTING_DISCOVERY_TARGET_ROAS * 100),
-            "campaign_types": "Target-ROAS RSA plus a separate Maximize Clicks CPC-cap RSA from the keyword bank, with AI Max/final URL expansion or legacy DSA-style page discovery. PMax drafts are prepared but held from live until enough 7-day purchase conversions exist.",
+            "campaign_types": "Target-ROAS RSA plus a separate Maximize Clicks CPC-cap RSA from the keyword bank, with AI Max/final URL expansion or legacy DSA-style page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence.",
             "rule": f"Use RSA/page discovery only for the first {testing_bootstrap_days} day(s) when delivery is missing or conversion evidence is thin; promote to Core / Scale only after purchase evidence, healthy spend efficiency, and no duplicate keyword or landing-page conflict.",
         },
         {
@@ -6903,7 +6940,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             {
                 "name": "Testing campaign bootstrap",
                 "cadence": "After each daily insight refresh" if testing_bootstrap_enabled else "Disabled",
-                "detail": f"If an account has no last-7-day impressions, or is inside the {testing_bootstrap_days}-day bootstrap, automation publishes only Testing / Discovery Search using Target ROAS RSA, Maximize Clicks CPC-cap RSA, and page-discovery URL inclusions from the best keyword bank terms. Core / Scale, Fix / Watch, Waste / Recovery, and PMax are drafted from saved/cross-account signals but held from live until at least {pmax_min_7d_conversions:g} conversions in the last 7 days. The testing lane uses {testing_sales_budget_pct:g}% of rolling Odoo sales, capped by the account guard.",
+                "detail": f"If an account has no last-7-day impressions, or is inside the {testing_bootstrap_days}-day bootstrap, automation publishes Testing / Discovery Search using Target ROAS RSA, Maximize Clicks CPC-cap RSA, and page-discovery URL inclusions from the best keyword bank terms. Core / Scale, Fix / Watch, and Waste / Recovery can stay in the closed loop, but PMax is drafted/held from live until automation-owned Search campaigns reach at least {pmax_min_7d_conversions:g} conversions. The testing lane uses {testing_sales_budget_pct:g}% of rolling Odoo sales, capped by the account guard.",
             },
             {
                 "name": "Mutation cooldown",
@@ -6960,15 +6997,23 @@ def all_time_refresh_due(preference: GoogleAdsAutomationPreference, now: Optiona
     return preference.last_all_time_pull_at <= now - timedelta(days=interval_days)
 
 
-def daily_insight_api_window_days(preference: GoogleAdsAutomationPreference, now: Optional[datetime] = None) -> tuple[int, str]:
-    configured_days = clamp_int(preference.daily_keyword_lookback_days, 60, 1, 365)
+def daily_insight_api_window_days(
+    preference: GoogleAdsAutomationPreference,
+    now: Optional[datetime] = None,
+    *,
+    force: bool = False,
+) -> tuple[int, str]:
+    configured_days = clamp_int(preference.daily_keyword_lookback_days, 120, 1, 365)
+    if force:
+        return configured_days, "forced_full_configured_recent_window"
     if preference.last_all_time_pull_at is None:
         return configured_days, "baseline_recent_window_before_all_time_import"
     now = now or utcnow()
     if preference.last_keyword_pull_at is None:
-        return min(configured_days, 7), "post_baseline_initial_incremental_window"
+        return configured_days, "activation_recent_window_after_existing_all_time_import"
     gap_days = max((now.date() - preference.last_keyword_pull_at.date()).days + 1, 1)
-    return min(configured_days, max(1, min(gap_days, 7))), "incremental_since_last_daily_pull"
+    incremental_days = min(configured_days, max(3, min(gap_days, 7)))
+    return incremental_days, "incremental_last_3d_minimum_since_last_daily_pull"
 
 
 def run_account_automation_monitor(
@@ -7241,8 +7286,8 @@ def run_account_automation_monitor(
         )
 
     rows = clamp_int(preference.max_daily_api_rows, 10000, 50, 250000)
-    daily_rows = min(rows, 50000)
-    days, daily_window_mode = daily_insight_api_window_days(preference, now=now)
+    daily_rows = rows
+    days, daily_window_mode = daily_insight_api_window_days(preference, now=now, force=force)
     research: Optional[dict[str, Any]] = None
     if preference.keyword_discovery_enabled and google_ads_api_blocked:
         summary["steps"].append(
@@ -7277,6 +7322,7 @@ def run_account_automation_monitor(
                 account,
                 scope_key=str(research.get("scope_key") or ""),
                 source_job_id=source_job_id,
+                force=force,
             )
             landing_page_result = sync_account_landing_page_candidates(
                 session,

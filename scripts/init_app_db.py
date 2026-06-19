@@ -595,7 +595,7 @@ async def init_app_db() -> None:
                 "auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT true, "
                 "testing_bootstrap_enabled BOOLEAN NOT NULL DEFAULT true, "
                 "testing_bootstrap_days INTEGER NOT NULL DEFAULT 14, "
-                "pmax_min_7d_conversions DOUBLE PRECISION NOT NULL DEFAULT 5, "
+                "pmax_min_7d_conversions DOUBLE PRECISION NOT NULL DEFAULT 15, "
                 "testing_sales_budget_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.05, "
                 "testing_keyword_limit INTEGER NOT NULL DEFAULT 30, "
                 "testing_landing_page_limit INTEGER NOT NULL DEFAULT 25, "
@@ -604,7 +604,7 @@ async def init_app_db() -> None:
                 "peak_budget_restore_delay_minutes INTEGER NOT NULL DEFAULT 0, "
                 "peak_budget_decision_json JSONB NOT NULL DEFAULT '{}'::jsonb, "
                 "last_peak_budget_decision_at TIMESTAMP WITH TIME ZONE, "
-                "daily_keyword_lookback_days INTEGER NOT NULL DEFAULT 60, "
+                "daily_keyword_lookback_days INTEGER NOT NULL DEFAULT 120, "
                 "all_time_refresh_interval_days INTEGER NOT NULL DEFAULT 7, "
                 "api_call_budget_per_day INTEGER NOT NULL DEFAULT 750, "
                 "max_daily_api_rows INTEGER NOT NULL DEFAULT 10000, "
@@ -742,7 +742,13 @@ async def init_app_db() -> None:
             text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS testing_bootstrap_days INTEGER NOT NULL DEFAULT 14")
         )
         await conn.execute(
-            text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS pmax_min_7d_conversions DOUBLE PRECISION NOT NULL DEFAULT 5")
+            text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS pmax_min_7d_conversions DOUBLE PRECISION NOT NULL DEFAULT 15")
+        )
+        await conn.execute(
+            text("ALTER TABLE google_ads_automation_preferences ALTER COLUMN pmax_min_7d_conversions SET DEFAULT 15")
+        )
+        await conn.execute(
+            text("UPDATE google_ads_automation_preferences SET pmax_min_7d_conversions = 15 WHERE pmax_min_7d_conversions IS NULL OR pmax_min_7d_conversions < 15")
         )
         await conn.execute(
             text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS testing_sales_budget_ratio DOUBLE PRECISION NOT NULL DEFAULT 0.05")

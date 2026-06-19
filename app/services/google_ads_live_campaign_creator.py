@@ -29,6 +29,7 @@ from app.models import (
 )
 from app.services.google_ads_api_errors import summarize_google_ads_exception
 from app.services.google_ads_landing_page_bank import usable_landing_page_url
+from app.services.google_ads_pmax_gate import pmax_activation_gate
 from app.services.google_ads_sync import build_client, enum_name
 from app.services.page_feed_restrictions import normalize_restricted_text
 
@@ -46,8 +47,8 @@ SUPPORTED_AD_TYPES = {"dsa", "rsa", "pmax"}
 DSA_DISABLED_SETTING_PREFIX = "live_campaign_creator.dsa_disabled"
 LIVE_CREATION_QUOTA_COOLDOWN_PREFIX = "live_campaign_creator.quota_cooldown"
 LIVE_CAMPAIGN_PUBLISH_BATCH_LIMIT = 50
-URL_INCLUSION_SOURCE_LIMIT = 500
 URL_INCLUSION_MUTATION_BATCH_LIMIT = 100
+KEYWORD_MUTATION_BATCH_LIMIT = 100
 LIVE_CREATION_SUCCESS_STATUSES = {"validated", "published_enabled", "published_paused", "resumed_existing"}
 LIVE_PUBLISH_AD_TYPE_PRIORITY = {"dsa": 0, "rsa": 1, "pmax": 2}
 FORCE_MINIMUM_BUDGET_SETTING = "automation.force_minimum_budget_when_budget_guard_blocked"
@@ -61,7 +62,7 @@ PMAX_MEDIA_FIELD_TYPES = {
     "LOGO": 1,
     "YOUTUBE_VIDEO": 1,
 }
-PMAX_ASSET_GROUP_FINAL_URL_LIMIT = 10
+PMAX_ASSET_GROUP_FINAL_URL_LIMIT = 0
 PMAX_SEARCH_THEME_SIGNAL_LIMIT = 50
 RESTRICTED_SHARED_SET_NAME = "restricted"
 RESTRICTED_TERMS_SETTING_KEY = "page_feed.restricted_title_terms"
@@ -1105,7 +1106,7 @@ def _webpage_criterion_by_ad_group(client: Any, account: GoogleAdsAccount, ad_gr
     return None
 
 
-def _keyword_texts_from_draft(draft: AdDraft, *, limit: int = 30) -> list[str]:
+def _keyword_texts_from_draft(draft: AdDraft, *, limit: Optional[int] = None) -> list[str]:
     assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
     rejected = {
         " ".join(str(term or "").split()).lower()
@@ -1125,7 +1126,7 @@ def _keyword_texts_from_draft(draft: AdDraft, *, limit: int = 30) -> list[str]:
                 continue
             if text and text not in terms:
                 terms.append(text)
-            if len(terms) >= limit:
+            if limit and len(terms) >= limit:
                 return terms
     for term in assets.get("source_terms") or []:
         text = " ".join(str(term or "").split()).lower()
@@ -1135,7 +1136,7 @@ def _keyword_texts_from_draft(draft: AdDraft, *, limit: int = 30) -> list[str]:
             continue
         if text and text not in terms:
             terms.append(text)
-        if len(terms) >= limit:
+        if limit and len(terms) >= limit:
             return terms
     return terms
 
@@ -1805,7 +1806,7 @@ def _pmax_final_urls_from_assets(
     assets: dict[str, Any],
     fallback_url: str,
     *,
-    limit: int = PMAX_ASSET_GROUP_FINAL_URL_LIMIT,
+    limit: Optional[int] = PMAX_ASSET_GROUP_FINAL_URL_LIMIT,
 ) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
@@ -1827,15 +1828,15 @@ def _pmax_final_urls_from_assets(
                 continue
             seen.add(key)
             urls.append(key)
-            if len(urls) >= limit:
+            if limit and len(urls) >= limit:
                 return urls
     fallback_key = _webpage_url_key(fallback_url)
     if not urls and fallback_key and fallback_key not in seen:
         urls.append(fallback_key)
-    return urls[:limit]
+    return urls[:limit] if limit else urls
 
 
-def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: int = URL_INCLUSION_SOURCE_LIMIT) -> list[str]:
+def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = None) -> list[str]:
     assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
     sources = [
         assets.get("url_inclusion_targets"),
@@ -1858,7 +1859,7 @@ def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: int = URL_INCLUSION
                 continue
             seen.add(key)
             urls.append(key)
-            if len(urls) >= limit:
+            if limit and len(urls) >= limit:
                 return urls
     return urls
 
@@ -1896,28 +1897,32 @@ def _create_ad_group_webpage_inclusions(
     urls: list[str],
     validate_only: bool,
 ) -> list[str]:
-    operations = []
-    for url in urls[:URL_INCLUSION_MUTATION_BATCH_LIMIT]:
-        operation = client.get_type("AdGroupCriterionOperation")
-        criterion = operation.create
-        criterion.ad_group = ad_group_resource_name
-        criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
-        criterion.webpage.criterion_name = _clip(f"AUTO included page | {url}", 255)
-        condition = client.get_type("WebpageConditionInfo")
-        condition.operand = client.enums.WebpageConditionOperandEnum.URL
-        condition.operator = client.enums.WebpageConditionOperatorEnum.EQUALS
-        condition.argument = url
-        criterion.webpage.conditions.append(condition)
-        operations.append(operation)
-    if not operations:
-        return []
-    request = client.get_type("MutateAdGroupCriteriaRequest")
-    request.customer_id = account.customer_id
-    request.operations.extend(operations)
-    request.partial_failure = True
-    request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("AdGroupCriterionService"), "mutate_ad_group_criteria", request)
-    return _successful_resource_names(response)
+    resources: list[str] = []
+    service = client.get_service("AdGroupCriterionService")
+    for start in range(0, len(urls), URL_INCLUSION_MUTATION_BATCH_LIMIT):
+        operations = []
+        for url in urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]:
+            operation = client.get_type("AdGroupCriterionOperation")
+            criterion = operation.create
+            criterion.ad_group = ad_group_resource_name
+            criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+            criterion.webpage.criterion_name = _clip(f"AUTO included page | {url}", 255)
+            condition = client.get_type("WebpageConditionInfo")
+            condition.operand = client.enums.WebpageConditionOperandEnum.URL
+            condition.operator = client.enums.WebpageConditionOperatorEnum.EQUALS
+            condition.argument = url
+            criterion.webpage.conditions.append(condition)
+            operations.append(operation)
+        if not operations:
+            continue
+        request = client.get_type("MutateAdGroupCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations)
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(service, "mutate_ad_group_criteria", request)
+        resources.extend(_successful_resource_names(response))
+    return resources
 
 
 def _apply_ad_group_webpage_inclusions(
@@ -1962,24 +1967,28 @@ def _create_exact_keywords(
     keywords: list[str],
     validate_only: bool,
 ) -> list[str]:
-    operations = []
-    for keyword in keywords[:30]:
-        operation = client.get_type("AdGroupCriterionOperation")
-        criterion = operation.create
-        criterion.ad_group = ad_group_resource_name
-        criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
-        criterion.keyword.text = keyword
-        criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
-        operations.append(operation)
-    if not operations:
-        return []
-    request = client.get_type("MutateAdGroupCriteriaRequest")
-    request.customer_id = account.customer_id
-    request.operations.extend(operations)
-    request.partial_failure = True
-    request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("AdGroupCriterionService"), "mutate_ad_group_criteria", request)
-    return _successful_resource_names(response)
+    resources: list[str] = []
+    service = client.get_service("AdGroupCriterionService")
+    for start in range(0, len(keywords), KEYWORD_MUTATION_BATCH_LIMIT):
+        operations = []
+        for keyword in keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]:
+            operation = client.get_type("AdGroupCriterionOperation")
+            criterion = operation.create
+            criterion.ad_group = ad_group_resource_name
+            criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+            criterion.keyword.text = keyword
+            criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
+            operations.append(operation)
+        if not operations:
+            continue
+        request = client.get_type("MutateAdGroupCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations)
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(service, "mutate_ad_group_criteria", request)
+        resources.extend(_successful_resource_names(response))
+    return resources
 
 
 def _enable_ad_group_criteria_if_needed(
@@ -4194,6 +4203,26 @@ def publish_pmax_draft(
     if not final_url:
         return {"draft_id": draft.id, "ad_type": draft.ad_type, "status": "blocked", "reason": "Missing final URL."}
 
+    pmax_gate = pmax_activation_gate(session, account, preference)
+    if not bool(pmax_gate.get("allowed")):
+        operations: list[dict[str, Any]] = []
+        existing_campaign = _campaign_by_code(client, account, campaign_code)
+        if existing_campaign and str(existing_campaign.get("campaign_status") or "").upper() == "ENABLED":
+            paused = _pause_campaign_if_needed(client, account, existing_campaign, validate_only=validate_only)
+            if paused:
+                operations.append({"operation": "pause_pmax_below_search_conversion_gate", "resource_name": paused})
+        return {
+            "draft_id": draft.id,
+            "ad_type": "pmax",
+            "status": "blocked_pmax_conversion_gate",
+            "reason": str(pmax_gate.get("reason") or "PMax is held until automation-owned Search campaigns reach the conversion gate."),
+            "campaign_code": campaign_code,
+            "campaign_name": campaign_name,
+            "campaign": existing_campaign,
+            "pmax_gate": pmax_gate,
+            "operations": operations,
+        }
+
     def checkpoint(name: str, status: str = "started", **extra: Any) -> None:
         if progress_callback is None:
             return
@@ -4741,6 +4770,8 @@ def _compact_live_result(result: dict[str, Any]) -> dict[str, Any]:
         compact["media_asset_counts"] = result.get("media_asset_counts")
     if isinstance(result.get("live_creation"), dict):
         compact["live_creation"] = result.get("live_creation")
+    if isinstance(result.get("pmax_gate"), dict):
+        compact["pmax_gate"] = result.get("pmax_gate")
     if isinstance(result.get("google_ads_error"), dict):
         compact["google_ads_error"] = result.get("google_ads_error")
     if result.get("error"):
