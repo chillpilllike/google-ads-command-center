@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import unittest
+import zipfile
 from types import SimpleNamespace
 
-from app.services.google_ads_manual_export import confirm_manual_automation_upload, manual_export_rows
+from app.services.google_ads_manual_export import build_manual_automation_export, confirm_manual_automation_upload, manual_export_rows
 
 
 class GoogleAdsManualExportTests(unittest.TestCase):
@@ -43,7 +45,7 @@ class GoogleAdsManualExportTests(unittest.TestCase):
         inclusions = manual_export_rows(account, [draft], "url_inclusions")
         exclusions = manual_export_rows(account, [draft], "url_exclusions")
 
-        self.assertEqual([row["Keyword"] for row in keywords], ["vitamin c canada", "magnesium glycinate", "vitamin d canada"])
+        self.assertEqual([row["Keyword"] for row in keywords], ["magnesium glycinate", "vitamin c canada", "vitamin d canada"])
         self.assertEqual(keywords[0]["Campaign"], "AUTO | Core / Scale | RSA Target ROAS Scale Keywords | AUTO-123")
         self.assertEqual(keywords[2]["Action"], "Add search theme")
         self.assertEqual(keywords[2]["Asset group"], "AUTO | Core / Scale | PMax Asset Group | AUTO-123 | AG001")
@@ -52,6 +54,58 @@ class GoogleAdsManualExportTests(unittest.TestCase):
         self.assertEqual(len(inclusions), 1)
         self.assertEqual(inclusions[0]["URL"], "https://nutricity.ca/shop/vitamin-c")
         self.assertEqual(exclusions[0]["URL"], "https://nutricity.ca/shop/no-conversion")
+        self.assertEqual(keywords[0]["Manual target"], "RSA exact keyword")
+        self.assertEqual(keywords[2]["Manual target"], "PMax search theme")
+        self.assertEqual(inclusions[0]["Manual target"], "Dynamic/AI Max exact URL inclusion")
+
+    def test_grouped_manual_export_creates_campaign_wise_zip(self) -> None:
+        account = SimpleNamespace(id=1, name="Nutricity CA", customer_id="3495463031")
+        draft_one = SimpleNamespace(
+            id=20,
+            ad_type="rsa",
+            status="ready_for_review",
+            generated_assets={
+                "automation": {"source_key": "automation:3495463031:scale_rsa"},
+                "campaign_identity": {
+                    "campaign_name": "AUTO | Core / Scale | RSA Target ROAS Scale Keywords | AUTO-123",
+                    "campaign_code": "AUTO-123",
+                    "category": "Core / Scale",
+                },
+                "keyword_clusters": [{"ad_group_name": "Core Keywords", "exact_terms": ["Vitamin C Canada"]}],
+            },
+        )
+        draft_two = SimpleNamespace(
+            id=21,
+            ad_type="dsa",
+            status="ready_for_review",
+            generated_assets={
+                "automation": {"source_key": "automation:3495463031:testing_dsa"},
+                "campaign_identity": {
+                    "campaign_name": "AUTO | Testing / Discovery | Expanded DSA AI Max Target | AUTO-456",
+                    "campaign_code": "AUTO-456",
+                    "category": "Testing / Discovery",
+                },
+                "keyword_clusters": [{"ad_group_name": "Testing Keywords", "exact_terms": ["Magnesium Canada"]}],
+            },
+        )
+
+        class FakeSession:
+            class Scalars:
+                def all(self):
+                    return [draft_two, draft_one]
+
+            def scalars(self, _statement):
+                return self.Scalars()
+
+        export_file = build_manual_automation_export(FakeSession(), account, kind="keywords", grouped=True)
+
+        self.assertTrue(export_file.filename.endswith(".zip"))
+        self.assertEqual(export_file.content_type, "application/zip")
+        with zipfile.ZipFile(io.BytesIO(export_file.content), "r") as archive:
+            names = archive.namelist()
+            self.assertIn("00-manifest.csv", names)
+            self.assertTrue(any(name.endswith("/keywords.csv") and "core-scale-rsa" in name for name in names))
+            self.assertTrue(any(name.endswith("/keywords.csv") and "testing-discovery-dsa" in name for name in names))
 
     def test_confirm_manual_upload_marks_drafts_as_published_enabled(self) -> None:
         account = SimpleNamespace(id=1, name="Nutricity CA", customer_id="3495463031")

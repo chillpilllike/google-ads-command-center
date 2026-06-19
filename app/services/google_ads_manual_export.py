@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import re
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Optional
@@ -60,6 +61,15 @@ def _campaign_code(draft: AdDraft) -> str:
     assets = _assets(draft)
     identity = _identity(draft)
     return str(identity.get("campaign_code") or assets.get("campaign_code") or "").strip()
+
+
+def _campaign_lane(draft: AdDraft) -> str:
+    name = _campaign_name(draft)
+    parts = [part.strip() for part in str(name or "").split("|")]
+    if len(parts) >= 4 and parts[0].upper() == "AUTO":
+        return parts[2]
+    identity = _identity(draft)
+    return str(identity.get("campaign_lane") or identity.get("lane") or "").strip()
 
 
 def _category(draft: AdDraft) -> str:
@@ -131,6 +141,18 @@ def _draft_sort_key(draft: AdDraft) -> tuple[str, int]:
     return (_campaign_name(draft).lower(), int(draft.id or 0))
 
 
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-") or "google-ads-account"
+
+
+def _campaign_file_label(draft: AdDraft) -> str:
+    category = _slug(_category(draft) or "uncategorized")
+    ad_type = _slug(str(draft.ad_type or "ad").upper())
+    lane = _slug(_campaign_lane(draft) or "campaign")
+    code = _slug(_campaign_code(draft) or f"draft-{draft.id}")
+    return "-".join(part for part in [category, ad_type, lane, code] if part)[:120]
+
+
 def automation_drafts_for_manual_export(session: Session, account: GoogleAdsAccount) -> list[AdDraft]:
     drafts = list(
         session.scalars(
@@ -167,11 +189,13 @@ def _base_row(account: GoogleAdsAccount, draft: AdDraft) -> dict[str, Any]:
         "Ad group": _ad_group_name(draft),
         "Asset group": "",
         "Category": _category(draft),
+        "Campaign lane": _campaign_lane(draft),
         "Ad type": str(draft.ad_type or "").upper(),
         "Campaign code": _campaign_code(draft),
         "Draft ID": draft.id,
         "Draft status": _status(draft),
         "Automation source": _automation_source_key(draft),
+        "Manual file group": _campaign_file_label(draft),
     }
 
 
@@ -199,6 +223,9 @@ def _keyword_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft]) -> list[
                     {
                         "Ad group": ad_group_name,
                         "Action": "Add keyword",
+                        "Manual upload level": "Ad group",
+                        "Manual target": "RSA exact keyword",
+                        "Editor entity": "Keyword",
                         "Keyword": text,
                         "Match type": "Exact",
                         "Google Ads Editor match type": "Exact",
@@ -225,6 +252,9 @@ def _keyword_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft]) -> list[
                         "Ad group": "",
                         "Asset group": asset_group_name,
                         "Action": "Add search theme",
+                        "Manual upload level": "Asset group",
+                        "Manual target": "PMax search theme",
+                        "Editor entity": "Search theme",
                         "Keyword": text,
                         "Match type": "Search theme",
                         "Google Ads Editor match type": "Search theme",
@@ -255,6 +285,9 @@ def _negative_keyword_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft])
             row.update(
                 {
                     "Action": "Add campaign negative keyword",
+                    "Manual upload level": "Campaign",
+                    "Manual target": "Campaign negative keyword",
+                    "Editor entity": "Campaign negative keyword",
                     "Keyword": text,
                     "Match type": match_type,
                     "Google Ads Editor match type": f"Campaign Negative {match_type}",
@@ -285,6 +318,9 @@ def _url_inclusion_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft]) ->
             row.update(
                 {
                     "Action": "Add URL inclusion",
+                    "Manual upload level": "Ad group",
+                    "Manual target": "Dynamic/AI Max exact URL inclusion",
+                    "Editor entity": "Dynamic ad target",
                     "URL": url,
                     "URL rule condition": "URL",
                     "URL rule match": "Exact URL",
@@ -317,6 +353,9 @@ def _url_exclusion_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft]) ->
             row.update(
                 {
                     "Action": "Add URL exclusion",
+                    "Manual upload level": "Campaign",
+                    "Manual target": "Campaign URL exclusion",
+                    "Editor entity": "Campaign URL exclusion",
                     "URL": url,
                     "URL rule condition": "URL",
                     "URL rule match": "Exact URL",
@@ -331,38 +370,81 @@ def _url_exclusion_rows(account: GoogleAdsAccount, drafts: Iterable[AdDraft]) ->
 def manual_export_rows(account: GoogleAdsAccount, drafts: list[AdDraft], kind: str) -> list[dict[str, Any]]:
     normalized = str(kind or "keywords").strip().lower().replace("-", "_")
     if normalized in {"keyword", "keywords", "positive_keywords"}:
-        return _keyword_rows(account, drafts)
+        return _sort_manual_rows(_keyword_rows(account, drafts))
     if normalized in {"negative_keyword", "negative_keywords", "keyword_exclusions"}:
-        return _negative_keyword_rows(account, drafts)
+        return _sort_manual_rows(_negative_keyword_rows(account, drafts))
     if normalized in {"url", "urls", "url_inclusion", "url_inclusions", "inclusions"}:
-        return _url_inclusion_rows(account, drafts)
+        return _sort_manual_rows(_url_inclusion_rows(account, drafts))
     if normalized in {"url_exclusion", "url_exclusions", "exclusions", "negative_urls"}:
-        return _url_exclusion_rows(account, drafts)
+        return _sort_manual_rows(_url_exclusion_rows(account, drafts))
     raise ValueError(f"Unsupported manual export kind: {kind}")
+
+
+def _sort_manual_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    target_rank = {
+        "rsa exact keyword": 10,
+        "dynamic/ai max exact url inclusion": 20,
+        "pmax search theme": 30,
+        "campaign negative keyword": 40,
+        "campaign url exclusion": 50,
+    }
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("Category") or "").lower(),
+            str(row.get("Ad type") or "").lower(),
+            str(row.get("Campaign lane") or "").lower(),
+            str(row.get("Campaign") or "").lower(),
+            target_rank.get(str(row.get("Manual target") or "").lower(), 99),
+            str(row.get("Ad group") or row.get("Asset group") or "").lower(),
+            str(row.get("Keyword") or row.get("URL") or "").lower(),
+        ),
+    )
+
+
+def _manual_csv_fields(rows: list[dict[str, Any]]) -> list[str]:
+    preferred = [
+        "Account",
+        "Customer ID",
+        "Campaign",
+        "Ad group",
+        "Asset group",
+        "Category",
+        "Campaign lane",
+        "Ad type",
+        "Campaign code",
+        "Manual file group",
+        "Manual upload level",
+        "Manual target",
+        "Editor entity",
+        "Action",
+        "Keyword",
+        "Match type",
+        "Google Ads Editor match type",
+        "URL",
+        "URL rule condition",
+        "URL rule match",
+        "Status",
+        "Source label",
+        "Score",
+        "Conversions",
+        "Clicks",
+        "Reason",
+        "Draft ID",
+        "Draft status",
+        "Automation source",
+    ]
+    keys: set[str] = set()
+    for row in rows:
+        keys.update(row.keys())
+    if not keys:
+        return preferred
+    return [field for field in preferred if field in keys] + sorted(keys.difference(preferred))
 
 
 def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
     output = io.StringIO()
-    if rows:
-        fields = list(rows[0].keys())
-    else:
-        fields = [
-            "Account",
-            "Customer ID",
-            "Campaign",
-            "Ad group",
-            "Category",
-            "Ad type",
-            "Campaign code",
-            "Draft ID",
-            "Draft status",
-            "Automation source",
-            "Action",
-            "Keyword",
-            "Match type",
-            "URL",
-            "Status",
-        ]
+    fields = _manual_csv_fields(rows)
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
     writer.writeheader()
     for row in rows:
@@ -370,11 +452,38 @@ def _csv_bytes(rows: list[dict[str, Any]]) -> bytes:
     return output.getvalue().encode("utf-8")
 
 
-def _slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-") or "google-ads-account"
+def _campaign_wise_zip_bytes(rows: list[dict[str, Any]], *, export_label: str, account_slug: str, date_label: str) -> bytes:
+    payload = io.BytesIO()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        group = str(row.get("Manual file group") or _slug(str(row.get("Campaign") or "campaign"))).strip()
+        grouped.setdefault(group, []).append(row)
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"00-master-{export_label}-{account_slug}-{date_label}.csv", _csv_bytes(rows))
+        manifest_rows = [
+            {
+                "Manual file group": group,
+                "Campaign": group_rows[0].get("Campaign") or "",
+                "Category": group_rows[0].get("Category") or "",
+                "Campaign lane": group_rows[0].get("Campaign lane") or "",
+                "Ad type": group_rows[0].get("Ad type") or "",
+                "Row count": len(group_rows),
+            }
+            for group, group_rows in sorted(grouped.items())
+        ]
+        archive.writestr("00-manifest.csv", _csv_bytes(manifest_rows))
+        for index, (group, group_rows) in enumerate(sorted(grouped.items()), start=1):
+            archive.writestr(f"{index:02d}-{group}/{export_label}.csv", _csv_bytes(group_rows))
+    return payload.getvalue()
 
 
-def build_manual_automation_export(session: Session, account: GoogleAdsAccount, *, kind: str) -> ManualExportFile:
+def build_manual_automation_export(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    grouped: bool = False,
+) -> ManualExportFile:
     normalized = str(kind or "keywords").strip().lower().replace("-", "_")
     label_by_kind = {
         "keywords": "keywords",
@@ -398,7 +507,15 @@ def build_manual_automation_export(session: Session, account: GoogleAdsAccount, 
     drafts = automation_drafts_for_manual_export(session, account)
     rows = manual_export_rows(account, drafts, normalized)
     date_label = datetime.utcnow().strftime("%Y-%m-%d")
-    filename = f"automation-{export_label}-{_slug(account.name)}-{account.customer_id or account.id}-{date_label}.csv"
+    account_slug = _slug(account.name)
+    if grouped:
+        filename = f"automation-{export_label}-by-campaign-{account_slug}-{account.customer_id or account.id}-{date_label}.zip"
+        return ManualExportFile(
+            filename=filename,
+            content=_campaign_wise_zip_bytes(rows, export_label=export_label, account_slug=account_slug, date_label=date_label),
+            content_type="application/zip",
+        )
+    filename = f"automation-{export_label}-{account_slug}-{account.customer_id or account.id}-{date_label}.csv"
     return ManualExportFile(filename=filename, content=_csv_bytes(rows))
 
 

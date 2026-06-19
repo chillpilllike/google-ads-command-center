@@ -67,6 +67,7 @@ async def download_google_ads_editor_export(
 async def download_manual_automation_export(
     account_id: int,
     kind: str = "keywords",
+    grouped: bool = False,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(require_user),
 ) -> Response:
@@ -80,6 +81,7 @@ async def download_manual_automation_export(
                 sync_session,
                 sync_session.get(GoogleAdsAccount, int(account_id)),
                 kind=kind,
+                grouped=grouped,
             )
         )
     except ValueError as exc:
