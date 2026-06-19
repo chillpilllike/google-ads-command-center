@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      body { width: 360px; margin: 0; font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; }
+      header { padding: 12px 14px; border-bottom: 1px solid #d9dee8; font-weight: 700; }
+      main { padding: 12px 14px; display: grid; gap: 10px; }
+      label { display: grid; gap: 4px; font-weight: 600; }
+      input { border: 1px solid #c8d0dc; border-radius: 6px; padding: 8px; font: inherit; }
+      .row { display: flex; gap: 8px; }
+      button { border: 1px solid #0b66c3; background: #0b66c3; color: white; border-radius: 6px; padding: 8px 10px; font-weight: 700; cursor: pointer; }
+      button.secondary { background: white; color: #0b66c3; }
+      button.danger { border-color: #c03434; background: #c03434; }
+      .status { border: 1px solid #d9dee8; border-radius: 6px; padding: 8px; background: #f7f9fc; white-space: pre-wrap; }
+      .muted { color: #687386; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <header>Google Ads Command Center Worker</header>
+    <main>
+      <label>
+        App URL
+        <input id="appBaseUrl" placeholder="https://googleads.gofinch.com">
+      </label>
+      <label>
+        Extension token
+        <input id="token" type="password" placeholder="Paste token from Browser Worker page">
+      </label>
+      <label>
+        Account ID filter
+        <input id="accountId" placeholder="Optional app account id">
+      </label>
+      <div class="row">
+        <button id="save">Save</button>
+        <button id="start" class="secondary">Start</button>
+        <button id="stop" class="danger">Stop</button>
+      </div>
+      <div class="row">
+        <button id="runOnce" class="secondary">Run one step</button>
+        <button id="statusBtn" class="secondary">Refresh status</button>
+      </div>
+      <div id="status" class="status">Not connected.</div>
+      <div class="muted">Keep a logged-in ads.google.com tab available. The worker only executes app-issued queue steps and reports every result back to Postgres.</div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

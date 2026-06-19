@@ -1,0 +1,54 @@
+#gacc-worker-panel {
+  position: fixed;
+  top: 80px;
+  right: 18px;
+  z-index: 2147483647;
+  width: 380px;
+  max-height: 70vh;
+  overflow: auto;
+  border: 1px solid #0b66c3;
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(17, 25, 40, 0.22);
+  background: #ffffff;
+  color: #172033;
+  font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#gacc-worker-panel header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  color: #ffffff;
+  background: #0b66c3;
+  font-weight: 700;
+}
+
+#gacc-worker-panel main {
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+#gacc-worker-panel .gacc-muted {
+  color: #667085;
+}
+
+#gacc-worker-panel .gacc-value {
+  padding: 8px;
+  border: 1px solid #d9dee8;
+  border-radius: 6px;
+  background: #f7f9fc;
+  word-break: break-word;
+}
+
+#gacc-worker-panel button {
+  border: 1px solid #0b66c3;
+  background: #ffffff;
+  color: #0b66c3;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}

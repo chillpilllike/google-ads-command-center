@@ -11,7 +11,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import ROOT_DIR, get_settings
 from app.database import AsyncSessionLocal, Base, engine, get_session
-from app.routers import ad_factory, analytics, assets, auth, automation, customer_match, dashboard, editor_exports, ga_search_terms, keywords, landing_pages, negative_keywords, optimize_campaigns, page_feeds, settings as settings_router, stores
+from app.routers import ad_factory, analytics, assets, auth, automation, browser_automation, customer_match, dashboard, editor_exports, ga_search_terms, keywords, landing_pages, negative_keywords, optimize_campaigns, page_feeds, settings as settings_router, stores
 from app.seed import seed_database
 from app.services.dashboard import get_dashboard_static_data, get_recent_runs
 from app.services.google_ads_api_errors import recent_unacknowledged_google_ads_api_errors
@@ -58,6 +58,7 @@ app.include_router(ga_search_terms.router)
 app.include_router(landing_pages.router)
 app.include_router(negative_keywords.router)
 app.include_router(automation.router)
+app.include_router(browser_automation.router)
 app.include_router(editor_exports.router)
 app.include_router(customer_match.router)
 app.include_router(stores.router)

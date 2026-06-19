@@ -204,6 +204,66 @@ async def init_app_db() -> None:
         )
         await conn.execute(
             text(
+                "CREATE TABLE IF NOT EXISTS browser_automation_tasks ("
+                "id SERIAL PRIMARY KEY, "
+                "account_id INTEGER NOT NULL REFERENCES google_ads_accounts(id), "
+                "draft_id INTEGER REFERENCES ad_drafts(id), "
+                "action_type VARCHAR(80) NOT NULL, "
+                "entity_type VARCHAR(80) NOT NULL DEFAULT '', "
+                "campaign_name VARCHAR(255) NOT NULL DEFAULT '', "
+                "ad_group_name VARCHAR(255) NOT NULL DEFAULT '', "
+                "asset_group_name VARCHAR(255) NOT NULL DEFAULT '', "
+                "dedupe_key VARCHAR(80) NOT NULL, "
+                "priority INTEGER NOT NULL DEFAULT 100, "
+                "step_order INTEGER NOT NULL DEFAULT 0, "
+                "status VARCHAR(40) NOT NULL DEFAULT 'queued', "
+                "payload_json JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "result_json JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "claimed_by VARCHAR(160) NOT NULL DEFAULT '', "
+                "claimed_at TIMESTAMP WITH TIME ZONE, "
+                "started_at TIMESTAMP WITH TIME ZONE, "
+                "finished_at TIMESTAMP WITH TIME ZONE, "
+                "created_at TIMESTAMP WITH TIME ZONE DEFAULT now(), "
+                "updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), "
+                "CONSTRAINT uq_browser_automation_task_account_dedupe UNIQUE (account_id, dedupe_key)"
+                ")"
+            )
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_account_id ON browser_automation_tasks (account_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_draft_id ON browser_automation_tasks (draft_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_action_type ON browser_automation_tasks (action_type)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_entity_type ON browser_automation_tasks (entity_type)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_campaign_name ON browser_automation_tasks (campaign_name)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_status ON browser_automation_tasks (status)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_priority ON browser_automation_tasks (priority)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_step_order ON browser_automation_tasks (step_order)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_claimed_by ON browser_automation_tasks (claimed_by)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_claimed_at ON browser_automation_tasks (claimed_at)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_browser_automation_tasks_finished_at ON browser_automation_tasks (finished_at)")
+        )
+        await conn.execute(
+            text(
                 "CREATE TABLE IF NOT EXISTS currency_rate_snapshots ("
                 "id SERIAL PRIMARY KEY, "
                 "rate_date DATE NOT NULL, "

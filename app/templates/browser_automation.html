@@ -1,0 +1,137 @@
+{% extends "layout.html" %}
+
+{% block page_header %}
+<div class="row align-items-center">
+  <div class="col">
+    <div class="page-pretitle">Google Ads</div>
+    <h2 class="page-title">Browser Worker</h2>
+  </div>
+  <div class="col-auto">
+    <a class="btn btn-outline-primary" href="/browser-automation/extension.zip">
+      <i class="ti ti-download me-2"></i>
+      Download extension
+    </a>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_body %}
+{% if request.query_params.get("created") is not none %}
+  <div class="alert alert-success" role="alert">
+    Browser queue generated. Created {{ request.query_params.get("created") }} new task{{ "" if request.query_params.get("created") == "1" else "s" }} and refreshed {{ request.query_params.get("updated", "0") }}.
+  </div>
+{% endif %}
+{% if request.query_params.get("token_rotated") %}
+  <div class="alert alert-warning" role="alert">Extension token rotated. Update the extension popup config before running the worker again.</div>
+{% endif %}
+
+<div class="row g-3">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Account</h3>
+      </div>
+      <div class="card-body">
+        <form method="get" action="/browser-automation">
+          <label class="form-label" for="account_id">Google Ads account</label>
+          <select class="form-select" id="account_id" name="account_id" onchange="this.form.submit()">
+            {% for account in accounts %}
+              <option value="{{ account.id }}" {% if selected_account and selected_account.id == account.id %}selected{% endif %}>
+                {{ account.name }} - {{ account.customer_id }}{% if account.currency_code %} - {{ account.currency_code }}{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+        </form>
+        {% if selected_account %}
+          <form class="mt-3" method="post" action="/browser-automation/generate">
+            <input type="hidden" name="account_id" value="{{ selected_account.id }}">
+            <button class="btn btn-primary w-100" type="submit">
+              <i class="ti ti-list-plus me-2"></i>
+              Generate browser queue
+            </button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header">
+        <h3 class="card-title">Extension Config</h3>
+      </div>
+      <div class="card-body">
+        <label class="form-label">App URL</label>
+        <input class="form-control font-monospace" value="{{ public_base_url }}" readonly>
+        <label class="form-label mt-3">Token</label>
+        <input class="form-control font-monospace" value="{{ extension_token }}" readonly>
+        <div class="form-hint">Paste these into the extension popup. The token is stored in Postgres and can be rotated.</div>
+        <form class="mt-3" method="post" action="/browser-automation/token/rotate">
+          {% if selected_account %}<input type="hidden" name="account_id" value="{{ selected_account.id }}">{% endif %}
+          <button class="btn btn-outline-danger w-100" type="submit">
+            <i class="ti ti-refresh-alert me-2"></i>
+            Rotate token
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Queue Status</h3>
+      </div>
+      <div class="card-body">
+        <div class="row g-2">
+          {% for status, count in counts.statuses.items() %}
+            <div class="col-6 col-md-3">
+              <div class="border rounded p-2">
+                <div class="text-secondary text-uppercase small">{{ status }}</div>
+                <div class="h2 mb-0">{{ count }}</div>
+              </div>
+            </div>
+          {% else %}
+            <div class="col">
+              <div class="empty">
+                <div class="empty-icon"><i class="ti ti-list-check"></i></div>
+                <p class="empty-title">No browser tasks yet</p>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-vcenter table-sm card-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Status</th>
+              <th>Action</th>
+              <th>Campaign</th>
+              <th>Ad group / Asset group</th>
+              <th>Payload</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for task in tasks %}
+              <tr>
+                <td class="text-secondary">#{{ task.id }}</td>
+                <td><span class="badge bg-secondary-lt">{{ task.status }}</span></td>
+                <td>{{ task.action_type|replace("_", " ") }}</td>
+                <td class="text-truncate" style="max-width: 220px">{{ task.campaign_name }}</td>
+                <td class="text-truncate" style="max-width: 220px">{{ task.ad_group_name or task.asset_group_name }}</td>
+                <td class="text-truncate text-secondary" style="max-width: 260px">
+                  {{ task.payload_json.keyword or task.payload_json.search_theme or task.payload_json.url or task.payload_json.ad_type or task.entity_type }}
+                </td>
+              </tr>
+            {% else %}
+              <tr>
+                <td colspan="6" class="text-center text-secondary py-4">Generate the queue for this account to begin browser fallback work.</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

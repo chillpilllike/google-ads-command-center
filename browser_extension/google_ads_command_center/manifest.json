@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Google Ads Command Center Worker",
+  "version": "0.1.0",
+  "description": "Executes queued Google Ads Command Center browser fallback steps inside a logged-in Google Ads tab.",
+  "permissions": ["storage", "tabs", "scripting", "activeTab", "clipboardWrite"],
+  "host_permissions": [
+    "https://ads.google.com/*",
+    "https://googleads.gofinch.com/*",
+    "http://localhost:*/*",
+    "http://127.0.0.1:*/*"
+  ],
+  "background": {
+    "service_worker": "worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Ads Worker",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://ads.google.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

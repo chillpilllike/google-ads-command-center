@@ -49,6 +49,7 @@ COPY --from=source /src/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --from=source /src/app ./app
+COPY --from=source /src/browser_extension ./browser_extension
 COPY --from=source /src/scripts ./scripts
 COPY --from=source /src/config ./config
 COPY --from=source /src/README.md ./

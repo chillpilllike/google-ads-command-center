@@ -86,6 +86,12 @@
               <span class="nav-link-title">Automation</span>
             </a>
           </li>
+          <li class="nav-item {% if request.url.path.startswith('/browser-automation') %}active{% endif %}">
+            <a class="nav-link" href="/browser-automation">
+              <span class="nav-link-icon"><i class="ti ti-browser-check"></i></span>
+              <span class="nav-link-title">Browser Worker</span>
+            </a>
+          </li>
           <li class="nav-item {% if request.url.path.startswith('/customer-match') %}active{% endif %}">
             <a class="nav-link" href="/customer-match">
               <span class="nav-link-icon"><i class="ti ti-users-group"></i></span>

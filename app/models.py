@@ -797,14 +797,14 @@ class GoogleAdsAutomationPreference(Base):
     testing_bootstrap_days: Mapped[int] = mapped_column(Integer, default=15)
     pmax_min_7d_conversions: Mapped[float] = mapped_column(Float, default=15.0)
     testing_sales_budget_ratio: Mapped[float] = mapped_column(Float, default=0.05)
-    testing_keyword_limit: Mapped[int] = mapped_column(Integer, default=30)
-    testing_landing_page_limit: Mapped[int] = mapped_column(Integer, default=25)
+    testing_keyword_limit: Mapped[int] = mapped_column(Integer, default=0)
+    testing_landing_page_limit: Mapped[int] = mapped_column(Integer, default=0)
     peak_budget_increase_pct: Mapped[float] = mapped_column(Float, default=0.5)
     peak_budget_warmup_minutes: Mapped[int] = mapped_column(Integer, default=60)
     peak_budget_restore_delay_minutes: Mapped[int] = mapped_column(Integer, default=0)
     peak_budget_decision_json: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
     last_peak_budget_decision_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    daily_keyword_lookback_days: Mapped[int] = mapped_column(Integer, default=60)
+    daily_keyword_lookback_days: Mapped[int] = mapped_column(Integer, default=120)
     all_time_refresh_interval_days: Mapped[int] = mapped_column(Integer, default=7)
     api_call_budget_per_day: Mapped[int] = mapped_column(Integer, default=750)
     max_daily_api_rows: Mapped[int] = mapped_column(Integer, default=10000)
@@ -1351,6 +1351,42 @@ class AdDraft(Base):
 
     account: Mapped[GoogleAdsAccount] = relationship(lazy="joined")
     created_by: Mapped[Optional[User]] = relationship(lazy="joined")
+
+
+class BrowserAutomationTask(Base):
+    __tablename__ = "browser_automation_tasks"
+    __table_args__ = (
+        UniqueConstraint("account_id", "dedupe_key", name="uq_browser_automation_task_account_dedupe"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("google_ads_accounts.id"), index=True)
+    draft_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ad_drafts.id"), nullable=True, index=True)
+    action_type: Mapped[str] = mapped_column(String(80), index=True)
+    entity_type: Mapped[str] = mapped_column(String(80), default="", index=True)
+    campaign_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    ad_group_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    asset_group_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(80), index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    step_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="queued", index=True)
+    payload_json: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
+    result_json: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
+    claimed_by: Mapped[str] = mapped_column(String(160), default="", index=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+    account: Mapped[GoogleAdsAccount] = relationship(lazy="joined")
+    draft: Mapped[Optional[AdDraft]] = relationship(lazy="joined")
 
 
 class CampaignOptimizationRun(Base):
