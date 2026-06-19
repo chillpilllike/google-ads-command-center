@@ -28,6 +28,7 @@ from app.models import (
     OdooWebsite,
 )
 from app.services.google_ads_api_errors import summarize_google_ads_exception
+from app.services.google_ads_browser_automation import generate_browser_automation_tasks
 from app.services.google_ads_landing_page_bank import usable_landing_page_url
 from app.services.google_ads_pmax_gate import pmax_activation_gate
 from app.services.google_ads_sync import build_client, enum_name
@@ -1314,11 +1315,17 @@ def defer_live_creation_for_quota(session: Session, account: GoogleAdsAccount, e
     else:
         setting.value = payload
     session.flush()
+    browser_queue: dict[str, Any] = {}
+    try:
+        browser_queue = generate_browser_automation_tasks(session, account)
+    except Exception as exc:  # noqa: BLE001 - quota cooldown must still be recorded if browser fallback queueing fails.
+        browser_queue = {"status": "failed", "error": str(exc)[:500]}
     return {
         "status": "deferred_quota",
         "retry_at": retry_at.isoformat(),
         "retry_seconds": retry_seconds,
         "reason": payload["reason"],
+        "browser_queue": browser_queue,
     }
 
 
