@@ -40,6 +40,9 @@ PRE_MUTATE_LINK_LIMITS = {
     "structured_snippet": 20,
     "price": 20,
 }
+DEFER_NON_ACCOUNT_LINKS_SETTING = "asset_publisher.defer_campaign_and_ad_group_links"
+MAX_NON_ACCOUNT_LINKS_PER_RUN_SETTING = "asset_publisher.max_non_account_links_per_run"
+LINK_MUTATION_TIMEOUT_SECONDS_SETTING = "asset_publisher.link_mutation_timeout_seconds"
 INTERNAL_AD_COPY_TERMS = {
     "conversion signal",
     "google conversion signal",
@@ -76,6 +79,13 @@ def _micros(value: Any) -> int:
         return int(round(float(value or 0) * 1_000_000))
     except (TypeError, ValueError):
         return 0
+
+
+def _parse_non_negative_int(value: Any, default: int) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return max(int(default), 0)
 
 
 def _enum_value(enum: Any, name: str, default: str = "UNSPECIFIED") -> Any:
@@ -520,7 +530,9 @@ def _mutate_link(
     scope_level: str,
     scope_resource_name: str = "",
     validate_only: bool,
+    timeout_seconds: int = 30,
 ) -> str:
+    timeout_seconds = max(int(timeout_seconds or 30), 1)
     if scope_level == "account":
         operation = client.get_type("CustomerAssetOperation")
         link = operation.create
@@ -530,7 +542,7 @@ def _mutate_link(
         request.customer_id = account.customer_id
         request.operations.append(operation)
         request.validate_only = validate_only
-        response = client.get_service("CustomerAssetService").mutate_customer_assets(request=request, timeout=30)
+        response = client.get_service("CustomerAssetService").mutate_customer_assets(request=request, timeout=timeout_seconds)
         return str(response.results[0].resource_name or "")
     if scope_level == "campaign":
         if not scope_resource_name:
@@ -544,7 +556,7 @@ def _mutate_link(
         request.customer_id = account.customer_id
         request.operations.append(operation)
         request.validate_only = validate_only
-        response = client.get_service("CampaignAssetService").mutate_campaign_assets(request=request, timeout=30)
+        response = client.get_service("CampaignAssetService").mutate_campaign_assets(request=request, timeout=timeout_seconds)
         return str(response.results[0].resource_name or "")
     if scope_level == "ad_group":
         if not scope_resource_name:
@@ -558,7 +570,7 @@ def _mutate_link(
         request.customer_id = account.customer_id
         request.operations.append(operation)
         request.validate_only = validate_only
-        response = client.get_service("AdGroupAssetService").mutate_ad_group_assets(request=request, timeout=30)
+        response = client.get_service("AdGroupAssetService").mutate_ad_group_assets(request=request, timeout=timeout_seconds)
         return str(response.results[0].resource_name or "")
     raise ValueError(f"Unsupported asset scope: {scope_level}")
 
@@ -572,7 +584,9 @@ def publish_generated_assets(
     max_assets: int = 500,
 ) -> dict[str, Any]:
     settings_map = get_sync_setting_map(session)
-    defer_non_account_links = parse_bool(settings_map.get("asset_publisher.defer_campaign_and_ad_group_links", True))
+    defer_non_account_links = parse_bool(settings_map.get(DEFER_NON_ACCOUNT_LINKS_SETTING, False))
+    max_non_account_links = _parse_non_negative_int(settings_map.get(MAX_NON_ACCOUNT_LINKS_PER_RUN_SETTING), 20)
+    link_timeout_seconds = _parse_non_negative_int(settings_map.get(LINK_MUTATION_TIMEOUT_SECONDS_SETTING), 12) or 12
     rows = session.scalars(
         select(GoogleAdsGeneratedAsset)
         .where(
@@ -595,6 +609,8 @@ def publish_generated_assets(
         "failed": 0,
         "quota_exhausted": False,
         "quota_retry_after_seconds": 0,
+        "max_non_account_links_per_run": max_non_account_links,
+        "non_account_links_attempted": 0,
         "by_type": {},
         "errors": [],
     }
@@ -602,6 +618,7 @@ def publish_generated_assets(
     ad_group_resource_cache: dict[tuple[str, str], str] = {}
     capped_link_scopes: set[tuple[str, str, str]] = set()
     link_count_cache: dict[tuple[str, str, str], int] = {}
+    non_account_link_attempts = 0
     for row in rows:
         result["by_type"][row.asset_type] = int(result["by_type"].get(row.asset_type, 0)) + 1
         try:
@@ -619,6 +636,19 @@ def publish_generated_assets(
                     }
                 )
                 continue
+            if scope_level in {"campaign", "ad_group"} and row.status not in REMOVE_READY_STATUSES:
+                if non_account_link_attempts >= max_non_account_links:
+                    result["skipped"] += 1
+                    result["errors"].append(
+                        {
+                            "asset_id": row.id,
+                            "asset_type": row.asset_type,
+                            "status": "deferred_daily_asset_link_limit",
+                            "scope_level": scope_level,
+                            "limit": max_non_account_links,
+                        }
+                    )
+                    continue
             if row.asset_type == "promotion":
                 result["skipped"] += 1
                 continue
@@ -738,6 +768,9 @@ def publish_generated_assets(
                 row.updated_at = _utcnow()
                 result["created"] += 1
                 session.commit()
+            if scope_level in {"campaign", "ad_group"}:
+                non_account_link_attempts += 1
+                result["non_account_links_attempted"] = non_account_link_attempts
             link_resource = _mutate_link(
                 client,
                 account,
@@ -746,6 +779,7 @@ def publish_generated_assets(
                 scope_level=scope_level,
                 scope_resource_name=scope_resource,
                 validate_only=validate_only,
+                timeout_seconds=link_timeout_seconds,
             )
             if link_resource == "existing":
                 result["existing_links"] += 1

@@ -140,6 +140,9 @@ SCALE_NEGATIVE_MIGRATION_HOLD_DAYS = 3
 SCALE_PAGE_MIGRATION_HOLD_DAYS = 3
 WASTE_RECOVERY_HOLD_DAYS = 7
 WASTE_FIXED_DAILY_BUDGET_AMOUNT = 50.0
+MINIMUM_DAILY_BUDGET_BY_CURRENCY = {
+    "INR": 1000.0,
+}
 BUDGET_BOOTSTRAP_DAYS = 3
 WASTE_KEYWORD_PLAN_LIMIT = 1000
 WASTE_LANDING_PAGE_PLAN_LIMIT = 1000
@@ -151,6 +154,21 @@ WASTE_PAGE_LOW_CTR_RATE = 0.002
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def currency_minimum_daily_budget(account: GoogleAdsAccount | None, configured: Any = None) -> float:
+    """Return the account-currency floor used for first-run and forced-minimum budgets."""
+    try:
+        configured_amount = max(float(configured if configured is not None else 0.0), 0.0)
+    except (TypeError, ValueError):
+        configured_amount = 0.0
+    currency_code = str(getattr(account, "currency_code", "") or "").upper()
+    currency_floor = MINIMUM_DAILY_BUDGET_BY_CURRENCY.get(currency_code, 10.0)
+    return max(configured_amount, currency_floor)
+
+
+def waste_fixed_daily_budget(account: GoogleAdsAccount | None) -> float:
+    return currency_minimum_daily_budget(account, WASTE_FIXED_DAILY_BUDGET_AMOUNT)
 
 
 def _asset_publish_quota_retry_state(session: Session, account: GoogleAdsAccount, now: datetime | None = None) -> dict[str, Any] | None:
@@ -2092,7 +2110,7 @@ def testing_daily_budget_from_sales(
     rates = snapshot_payload(get_latest_rate_snapshot_sync(session)).get("rates", {})
     currency_code = account.currency_code or "INR"
     converted = convert_amount(daily_inr, "INR", currency_code, rates) if daily_inr > 0 else None
-    minimum = float(preference.minimum_daily_budget_amount if preference.minimum_daily_budget_amount is not None else 1.0)
+    minimum = currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount)
     converted_amount = float(converted or 0.0)
     budget_blocked = False
     block_reason = ""
@@ -2642,6 +2660,7 @@ def _url_inclusion_targets_from_page_items(
     *,
     limit: Optional[int] = None,
     source: str = "landing_page_governance",
+    exclude_broad_pages: bool = False,
 ) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -2651,6 +2670,8 @@ def _url_inclusion_targets_from_page_items(
         url = canonical_landing_page_url(str(item.get("url") or item.get("page_url") or ""))
         key = _page_key(url)
         if not url or not usable_landing_page_url(url) or not key or key in seen:
+            continue
+        if exclude_broad_pages and _is_broad_or_category_landing_page(url):
             continue
         seen.add(key)
         targets.append(
@@ -2762,6 +2783,22 @@ def _primary_url_from_targets(targets: list[dict[str, Any]], fallback_url: str) 
 
 def _page_key(value: Any) -> str:
     return canonical_landing_page_url(str(value or "")).lower()
+
+
+def _is_broad_or_category_landing_page(url: Any) -> bool:
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return False
+    path = parsed.path.strip("/").lower()
+    if not path:
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    if path in {"shop", "products", "product"}:
+        return True
+    if path.startswith(("shop/category/", "category/", "collections/", "collection/", "brands/", "brand/")):
+        return True
+    return any(segment in {"cart", "checkout", "contact", "about", "blog", "privacy", "terms"} for segment in segments)
 
 
 def _scale_landing_page_evidence(row: GoogleAdsLandingPageCandidate) -> dict[str, Any]:
@@ -2903,7 +2940,7 @@ def scale_landing_page_plan(
     for row in ranked_rows:
         url = canonical_landing_page_url(str(getattr(row, "normalized_url", "") or getattr(row, "url", "") or ""))
         key = _page_key(url)
-        if not url or key in seen:
+        if not url or key in seen or _is_broad_or_category_landing_page(url):
             continue
         seen.add(key)
         pages.append(
@@ -2925,13 +2962,14 @@ def scale_landing_page_plan(
                 "scale_evidence": _scale_landing_page_evidence(row),
             }
         )
-    pages.extend(
-        _matrix_scale_landing_page_items(
-            ga4_matrix=ga4_matrix,
-            search_console_matrix=search_console_matrix,
-            seen_keys=seen,
-        )
-    )
+    for item in _matrix_scale_landing_page_items(
+        ga4_matrix=ga4_matrix,
+        search_console_matrix=search_console_matrix,
+        seen_keys=seen,
+    ):
+        url = canonical_landing_page_url(str(item.get("url") or item.get("page_url") or ""))
+        if url and not _is_broad_or_category_landing_page(url):
+            pages.append(item)
     return {
         "active_pages": pages,
         "active_page_count": len(pages),
@@ -4079,6 +4117,9 @@ def run_testing_campaign_automation(
         recovery_state=load_waste_recovery_state(session, account),
         currency_code=account.currency_code or "USD",
     )
+    waste_budget_amount = waste_fixed_daily_budget(account)
+    waste_plan["budget"] = waste_budget_amount
+    waste_plan["fixed_daily_budget"] = waste_budget_amount
     save_waste_recovery_state(session, account, waste_plan["state"])
     waste_negative_plan = waste_plan["negative_keyword_plan"]
     waste_page_exclusion_plan = waste_plan["page_exclusion_plan"]
@@ -4250,6 +4291,7 @@ def run_testing_campaign_automation(
     core_scale_url_targets = _url_inclusion_targets_from_page_items(
         (governance_categories.get("Core / Scale") or {}).get("included_pages") or [],
         source="core_scale_governance",
+        exclude_broad_pages=True,
     )
     testing_discovery_url_targets = _url_inclusion_targets_from_page_items(
         (governance_categories.get("Testing / Discovery") or {}).get("candidate_pages") or [],
@@ -4293,7 +4335,7 @@ def run_testing_campaign_automation(
     if budget.get("budget_blocked"):
         settings = get_sync_setting_map(session)
         if parse_bool(settings.get(FORCE_MINIMUM_BUDGET_SETTING, False)):
-            minimum_budget = float(preference.minimum_daily_budget_amount if preference.minimum_daily_budget_amount is not None else 1.0)
+            minimum_budget = currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount)
             budget = {
                 **budget,
                 "daily_budget": minimum_budget,
@@ -4762,8 +4804,8 @@ def run_testing_campaign_automation(
     if True:  # Always keep the automation-owned Waste / Recovery lane visible.
         waste_bidding = {
             **bidding,
-            "daily_budget": WASTE_FIXED_DAILY_BUDGET_AMOUNT,
-            "fixed_daily_budget": WASTE_FIXED_DAILY_BUDGET_AMOUNT,
+            "daily_budget": waste_budget_amount,
+            "fixed_daily_budget": waste_budget_amount,
             "target_roas": WASTE_RECOVERY_TARGET_ROAS,
             "target_roas_percent": round(WASTE_RECOVERY_TARGET_ROAS * 100, 2),
             "category_strategy": "waste_recovery_fixed_budget",
@@ -6993,7 +7035,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         sales_guard_ratio = round(float(preference.odoo_sales_max_spend_ratio or 0.15) * 100, 2)
         sales_guard_days = preference.odoo_sales_guard_window_days or 7
         budget_guard_interval_hours = preference.budget_guard_check_interval_hours or 6
-        min_daily_budget = preference.minimum_daily_budget_amount if preference.minimum_daily_budget_amount is not None else 1.0
+        min_daily_budget = currency_minimum_daily_budget(preference.account, preference.minimum_daily_budget_amount)
         budget_reduce_pct = round(float(preference.underperforming_budget_reduce_pct or 0.2) * 100, 2)
         peak_extra_pct = round(float(preference.peak_budget_extra_spend_ratio or 0.05) * 100, 2)
         peak_check_minutes = preference.peak_budget_check_interval_minutes or 60
@@ -7004,6 +7046,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         testing_keyword_limit = max(preference.testing_keyword_limit or DEFAULT_TESTING_KEYWORD_LIMIT, DEFAULT_TESTING_KEYWORD_LIMIT)
         testing_landing_page_limit = max(int(preference.testing_landing_page_limit or DEFAULT_TESTING_LANDING_PAGE_LIMIT or 0), 0)
         waste_currency_code = str((preference.account.currency_code if preference.account else "") or "USD").upper()
+    waste_fixed_amount = waste_fixed_daily_budget(preference.account if preference else None)
     core_scale_roas = round(1 / max(float(sales_guard_ratio or 15) / 100, 0.01), 2)
     if core_scale_roas < CORE_SCALE_TARGET_ROAS:
         core_scale_roas = CORE_SCALE_TARGET_ROAS
@@ -7034,10 +7077,10 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         },
         {
             "name": "Waste / Recovery",
-            "budget": f"Fixed {WASTE_FIXED_DAILY_BUDGET_AMOUNT:,.2f} {waste_currency_code} daily budget; never peak-boosted and never reduced by the sales guard",
+            "budget": f"Fixed {waste_fixed_amount:,.2f} {waste_currency_code} daily budget; never peak-boosted and never reduced by the sales guard",
             "target_roas": WASTE_RECOVERY_TARGET_ROAS,
             "target_roas_pct": round(WASTE_RECOVERY_TARGET_ROAS * 100),
-            "badge": f"Fixed {WASTE_FIXED_DAILY_BUDGET_AMOUNT:,.0f} {waste_currency_code}",
+            "badge": f"Fixed {waste_fixed_amount:,.0f} {waste_currency_code}",
             "campaign_types": "Target-ROAS RSA recovery lane for released waste terms plus campaign-scoped exact negatives and AI Max/PMax/legacy DSA URL exclusions for active waste terms/pages.",
             "rule": f"Keep no-conversion waste blocked from Testing and Core / Scale. Release only after fresh positive evidence and a {WASTE_RECOVERY_HOLD_DAYS}-day recovery hold, then move conversion-backed items to Core / Scale or low-risk items to Testing review.",
         },
@@ -7074,7 +7117,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             {
                 "name": "Waste quarantine and recovery",
                 "cadence": "After each daily insight refresh",
-                "detail": f"Builds a fixed {WASTE_FIXED_DAILY_BUDGET_AMOUNT:,.2f} {waste_currency_code} Waste / Recovery lane from negative keyword candidates and no-conversion landing-page waste. Its budget is protected from peak boosts and Odoo sales-guard reductions; recovery requires fresh positive evidence and a {WASTE_RECOVERY_HOLD_DAYS}-day hold before promotion.",
+                "detail": f"Builds a fixed {waste_fixed_amount:,.2f} {waste_currency_code} Waste / Recovery lane from negative keyword candidates and no-conversion landing-page waste. Its budget is protected from peak boosts and Odoo sales-guard reductions; recovery requires fresh positive evidence and a {WASTE_RECOVERY_HOLD_DAYS}-day hold before promotion.",
             },
             {
                 "name": "Peak conversion budget",
@@ -7119,7 +7162,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "testing_keyword_limit": testing_keyword_limit,
             "testing_landing_page_limit": testing_landing_page_limit,
             "waste_recovery_hold_days": WASTE_RECOVERY_HOLD_DAYS,
-            "waste_fixed_daily_budget": WASTE_FIXED_DAILY_BUDGET_AMOUNT,
+            "waste_fixed_daily_budget": waste_fixed_amount,
             "waste_currency_code": waste_currency_code,
         },
         "campaign_categories": campaign_categories,
@@ -7132,7 +7175,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "PMax audience signal plans are attached at asset-group scope with search/interest terms and similar-website URLs; manual competitor URLs fill the gap when Auction Insights domains are not available through API data.",
             "Negative candidates are upserted by account, campaign scope, normalized keyword, and match type, so the same campaign does not receive duplicate exclusions.",
             "Landing-page proposals are deduped by canonical URL and governed by category: Waste excludes first, Scale reserve rules wait for proof, and RSA only receives final-URL guidance.",
-            f"Waste / Recovery has a fixed {WASTE_FIXED_DAILY_BUDGET_AMOUNT:,.2f} {waste_currency_code} daily budget and is excluded from peak budget boosts and Odoo sales-guard reductions.",
+            f"Waste / Recovery has a fixed {waste_fixed_amount:,.2f} {waste_currency_code} daily budget and is excluded from peak budget boosts and Odoo sales-guard reductions.",
             f"Fix / Watch campaigns use {round(FIX_WATCH_TARGET_ROAS * 100)}% ROAS as the repair threshold before they are allowed to leave watch mode.",
             "PMax, Core / Scale, Fix / Watch, and Waste / Recovery drafts are not live-created for no-impression or thin-signal accounts; bootstrap publishes Testing / Discovery Search only.",
             "Automation campaign names include the category and a stable AUTO code, so reconnecting the same Google Ads customer can resume the existing campaign instead of creating a duplicate.",

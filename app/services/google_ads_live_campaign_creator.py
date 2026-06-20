@@ -78,6 +78,9 @@ CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
 WASTE_RECOVERY_TARGET_ROAS = 2.0
+MINIMUM_DAILY_BUDGET_BY_CURRENCY = {
+    "INR": 1000.0,
+}
 COUNTRY_TARGET_SETTING_PREFIX = "google_ads_account_country_target"
 COUNTRY_TARGETS = {
     "AU": {"name": "Australia", "geo_target_constant": "geoTargetConstants/2036"},
@@ -536,6 +539,16 @@ def _float_value(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _currency_minimum_daily_budget(account: GoogleAdsAccount | None, configured: Any = None) -> float:
+    try:
+        configured_amount = max(float(configured if configured is not None else 0.0), 0.0)
+    except (TypeError, ValueError):
+        configured_amount = 0.0
+    currency_code = str(getattr(account, "currency_code", "") or "").upper()
+    currency_floor = MINIMUM_DAILY_BUDGET_BY_CURRENCY.get(currency_code, 10.0)
+    return max(configured_amount, currency_floor)
+
+
 def _budget_block_result(
     session: Session,
     draft: AdDraft,
@@ -561,7 +574,7 @@ def _budget_block_result(
         ),
         "budget_blocked": budget_blocked,
         "requested_daily_budget": daily_budget,
-        "minimum_daily_budget_amount": _float_value(preference.minimum_daily_budget_amount, 1.0),
+        "minimum_daily_budget_amount": _currency_minimum_daily_budget(getattr(preference, "account", None), preference.minimum_daily_budget_amount),
     }
 
 
@@ -2077,11 +2090,28 @@ def _webpage_url_key(url: Any) -> str:
     return value.rstrip("/")
 
 
+def _is_broad_or_category_landing_page(url: Any) -> bool:
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return False
+    path = parsed.path.strip("/").lower()
+    if not path:
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    if path in {"shop", "products", "product"}:
+        return True
+    if path.startswith(("shop/category/", "category/", "collections/", "collection/", "brands/", "brand/")):
+        return True
+    return any(segment in {"cart", "checkout", "contact", "about", "blog", "privacy", "terms"} for segment in segments)
+
+
 def _pmax_final_urls_from_assets(
     assets: dict[str, Any],
     fallback_url: str,
     *,
     limit: Optional[int] = PMAX_ASSET_GROUP_FINAL_URL_LIMIT,
+    exclude_broad_pages: bool = False,
 ) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
@@ -2101,18 +2131,28 @@ def _pmax_final_urls_from_assets(
             key = _webpage_url_key(raw_url)
             if not key or key in seen:
                 continue
+            if exclude_broad_pages and _is_broad_or_category_landing_page(key):
+                continue
             seen.add(key)
             urls.append(key)
             if limit and len(urls) >= limit:
                 return urls
     fallback_key = _webpage_url_key(fallback_url)
-    if not urls and fallback_key and fallback_key not in seen:
+    if (
+        not urls
+        and fallback_key
+        and fallback_key not in seen
+        and not (exclude_broad_pages and _is_broad_or_category_landing_page(fallback_key))
+    ):
         urls.append(fallback_key)
     return urls[:limit] if limit else urls
 
 
 def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = None) -> list[str]:
     assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    identity = _draft_identity(draft)
+    category = str(identity.get("category") or assets.get("category") or assets.get("campaign_name") or "").lower()
+    core_scale_only = "core / scale" in category or "core scale" in category
     sources = [
         assets.get("url_inclusion_targets"),
         assets.get("page_feed_targets"),
@@ -2131,6 +2171,8 @@ def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = Non
                 url = str(item or "").strip()
             key = _webpage_url_key(url)
             if not key or key in seen:
+                continue
+            if core_scale_only and _is_broad_or_category_landing_page(key):
                 continue
             seen.add(key)
             urls.append(key)
@@ -3960,7 +4002,7 @@ def publish_dsa_draft(
         return budget_block
     daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
     budget_blocked = bool(bidding.get("budget_blocked"))
-    effective_daily_budget = max(daily_budget, _float_value(preference.minimum_daily_budget_amount, 1.0), 1.0)
+    effective_daily_budget = max(daily_budget, _currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount), 1.0)
     max_cpc = _float_value(bidding.get("max_cpc_bid_limit"), 2.5)
     final_url = str(assets.get("final_url") or draft.final_url or draft.website_url or "").strip()
     domain = root_domain(final_url)
@@ -4392,7 +4434,7 @@ def publish_rsa_draft(
         return budget_block
     daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
     budget_blocked = bool(bidding.get("budget_blocked"))
-    effective_daily_budget = max(daily_budget, _float_value(preference.minimum_daily_budget_amount, 1.0), 1.0)
+    effective_daily_budget = max(daily_budget, _currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount), 1.0)
     max_cpc = _float_value(bidding.get("max_cpc_bid_limit"), 2.5)
     ad_group_name = _rsa_ad_group_name_from_assets(assets, campaign_code)
     legacy_ad_group_name = f"AUTO | Testing / Discovery | RSA Keywords | {campaign_code}"
@@ -4786,9 +4828,25 @@ def publish_pmax_draft(
     if budget_block is not None:
         return budget_block
     daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
-    effective_daily_budget = max(daily_budget, _float_value(preference.minimum_daily_budget_amount, 1.0), 1.0)
+    effective_daily_budget = max(daily_budget, _currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount), 1.0)
     target_roas = _float_value(bidding.get("target_roas"), 3.5)
     criteria_csv_pending = _manual_first_run_criteria_csv_pending(preference, draft)
+    category_label = str((assets.get("campaign_identity") or {}).get("category") or "Core / Scale").strip() or "Core / Scale"
+    pmax_final_urls = _pmax_final_urls_from_assets(
+        assets,
+        final_url,
+        exclude_broad_pages="core / scale" in category_label.lower(),
+    )
+    if "core / scale" in category_label.lower() and not pmax_final_urls:
+        return {
+            "draft_id": draft.id,
+            "ad_type": "pmax",
+            "status": "blocked_missing_core_product_urls",
+            "reason": "Core / Scale PMax requires product/performance final URLs; category, homepage, and navigation URLs are asset-only.",
+            "campaign_code": campaign_code,
+            "campaign_name": campaign_name,
+            "operations": [],
+        }
 
     operations: list[dict[str, Any]] = []
     checkpoint("pmax_campaign_lookup")
@@ -4938,8 +4996,6 @@ def publish_pmax_draft(
     audience_signals_blocked_reason: Optional[str] = None
     campaign_search_theme_keys = set() if defer_search_theme_mutations else _existing_campaign_search_theme_keys(client, account, campaign_id)
     search_theme_backfill_terms = _pmax_search_theme_backfill_terms(assets)
-    category_label = str((assets.get("campaign_identity") or {}).get("category") or "Core / Scale").strip() or "Core / Scale"
-    pmax_final_urls = _pmax_final_urls_from_assets(assets, final_url)
     existing_asset_groups = _asset_groups_by_name(client, account, campaign_id)
     for group in _pmax_asset_group_plan(assets):
         group_code = str(group.get("asset_group_code") or f"AG{len(asset_group_results) + 1:03d}")

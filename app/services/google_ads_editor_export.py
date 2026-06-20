@@ -7,7 +7,7 @@ import re
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import select
@@ -481,7 +481,7 @@ def _dynamic_search_budget_and_roas(drafts: list[AdDraft]) -> tuple[float, float
     return 25.0, 0.0
 
 
-def _candidate_urls_from_drafts(drafts: list[AdDraft], *, limit: int = 500) -> list[str]:
+def _candidate_urls_from_drafts(drafts: list[AdDraft], *, limit: Optional[int] = None) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
     for draft in drafts:
@@ -498,25 +498,33 @@ def _candidate_urls_from_drafts(drafts: list[AdDraft], *, limit: int = 500) -> l
             for item in source:
                 value = item.get("url") or item.get("final_url") or item.get("landing_page") if isinstance(item, dict) else item
                 url = canonical_landing_page_url(_clean_cell(value))
-                if not url.startswith(("http://", "https://")) or not usable_landing_page_url(url):
+                if (
+                    not url.startswith(("http://", "https://"))
+                    or not usable_landing_page_url(url)
+                    or _is_broad_or_category_landing_page(url)
+                ):
                     continue
                 key = url.rstrip("/")
                 if key in seen:
                     continue
                 seen.add(key)
                 urls.append(key)
-                if len(urls) >= limit:
+                if limit and len(urls) >= limit:
                     return urls
     return urls
 
 
-def _candidate_urls_from_db(session: Session, account: GoogleAdsAccount, *, limit: int = 500) -> list[str]:
+def _candidate_urls_from_db(session: Session, account: GoogleAdsAccount, *, limit: Optional[int] = None) -> list[str]:
     urls: list[str] = []
     seen: set[str] = set()
 
     def add(value: Any) -> None:
         url = canonical_landing_page_url(_clean_cell(value))
-        if not url.startswith(("http://", "https://")) or not usable_landing_page_url(url):
+        if (
+            not url.startswith(("http://", "https://"))
+            or not usable_landing_page_url(url)
+            or _is_broad_or_category_landing_page(url)
+        ):
             return
         key = url.rstrip("/")
         if key in seen:
@@ -528,11 +536,10 @@ def _candidate_urls_from_db(session: Session, account: GoogleAdsAccount, *, limi
         select(GoogleAdsLandingPageCandidate)
         .where(GoogleAdsLandingPageCandidate.account_id == account.id)
         .order_by(GoogleAdsLandingPageCandidate.score.desc(), GoogleAdsLandingPageCandidate.updated_at.desc())
-        .limit(limit)
     ).all()
     for candidate in landing_pages:
         add(candidate.url or candidate.normalized_url)
-        if len(urls) >= limit:
+        if limit and len(urls) >= limit:
             return urls
 
     product_pages = session.scalars(
@@ -543,13 +550,28 @@ def _candidate_urls_from_db(session: Session, account: GoogleAdsAccount, *, limi
             OdooProductPageSignal.sales_amount.desc(),
             OdooProductPageSignal.order_count.desc(),
         )
-        .limit(limit)
     ).all()
     for signal in product_pages:
         add(signal.product_url)
-        if len(urls) >= limit:
+        if limit and len(urls) >= limit:
             return urls
     return urls
+
+
+def _is_broad_or_category_landing_page(url: Any) -> bool:
+    try:
+        parsed = urlparse(str(url or ""))
+    except Exception:
+        return False
+    path = parsed.path.strip("/").lower()
+    if not path:
+        return True
+    segments = [segment for segment in path.split("/") if segment]
+    if path in {"shop", "products", "product"}:
+        return True
+    if path.startswith(("shop/category/", "category/", "collections/", "collection/", "brands/", "brand/")):
+        return True
+    return any(segment in {"cart", "checkout", "contact", "about", "blog", "privacy", "terms"} for segment in segments)
 
 
 def _dynamic_root_url(account: GoogleAdsAccount, drafts: list[AdDraft], urls: list[str]) -> str:
@@ -734,14 +756,14 @@ def _iter_dynamic_search_editor_rows(
         target_roas=target_roas,
     )
     yield _dynamic_search_ad_group_row(campaign_name=campaign_name, ad_group_name=ad_group_name)
-    for url in urls[:500]:
+    for url in urls:
         yield _dynamic_url_inclusion_row(campaign_name=campaign_name, ad_group_name=ad_group_name, url=url)
     yield _dynamic_expanded_search_ad_row(account, campaign_name=campaign_name, ad_group_name=ad_group_name, root_url=root_url)
     if root_url:
         yield _dynamic_rsa_companion_row(account, campaign_name=campaign_name, ad_group_name=ad_group_name, root_url=root_url)
 
 
-def _keyword_terms(draft: AdDraft, *, limit: int = 200) -> list[str]:
+def _keyword_terms(draft: AdDraft, *, limit: Optional[int] = None) -> list[str]:
     assets = _assets(draft)
     terms: list[str] = []
     seen: set[str] = set()
@@ -754,14 +776,14 @@ def _keyword_terms(draft: AdDraft, *, limit: int = 200) -> list[str]:
             if text and text not in seen:
                 seen.add(text)
                 terms.append(text)
-            if len(terms) >= limit:
+            if limit and len(terms) >= limit:
                 return terms
     for term in assets.get("source_terms") or []:
         text = _clean_cell(term, max_len=80).lower()
         if text and text not in seen:
             seen.add(text)
             terms.append(text)
-        if len(terms) >= limit:
+        if limit and len(terms) >= limit:
             return terms
     return terms
 
