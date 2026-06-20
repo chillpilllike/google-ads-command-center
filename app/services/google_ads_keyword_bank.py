@@ -264,6 +264,7 @@ def sync_account_keyword_candidates(
     *,
     scope_key: str = "",
     source_job_id: Optional[int] = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     pulled_at = utcnow()
     fresh_cutoff = pulled_at - timedelta(hours=24)
@@ -273,7 +274,7 @@ def sync_account_keyword_candidates(
             func.max(GoogleAdsKeywordCandidate.last_pulled_at),
         ).where(GoogleAdsKeywordCandidate.account_id == account.id)
     ).one()
-    if existing_count and existing_last_pulled_at and existing_last_pulled_at >= fresh_cutoff:
+    if not force and existing_count and existing_last_pulled_at and existing_last_pulled_at >= fresh_cutoff:
         return {
             "account_id": account.id,
             "customer_id": account.customer_id,

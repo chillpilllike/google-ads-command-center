@@ -12,6 +12,7 @@ from app.database import get_session
 from app.dependencies import require_user, settings, templates
 from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
 from app.runtime_role import primary_instance_required_result, runtime_role_status
+from app.app_settings import get_sync_setting_map
 from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
 from app.services.google_ads_automation import (
     automation_strategy_summary,
@@ -28,6 +29,7 @@ from app.services.google_ads_automation import (
 
 router = APIRouter()
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
+DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK = 5
 
 
 def _checked(value: Optional[str]) -> bool:
@@ -365,6 +367,7 @@ async def automation_scheduler_tick(
     request: Request,
     recompute: int = 1,
     force: int = 0,
+    max_accounts: Optional[int] = None,
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
     runtime_block = primary_instance_required_result()
@@ -440,6 +443,24 @@ async def automation_scheduler_tick(
             due_account_ids.append(preference.account_id)
             due_reasons[preference.account_id] = reasons
     due_account_ids = list(dict.fromkeys(due_account_ids))
+    original_due_account_ids = list(due_account_ids)
+    scheduler_settings = await session.run_sync(lambda sync_session: get_sync_setting_map(sync_session))
+    configured_max_accounts = clamp_int(
+        max_accounts
+        if max_accounts is not None
+        else scheduler_settings.get(
+            "automation.scheduler_max_accounts_per_tick",
+            DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK,
+        ),
+        DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK,
+        1,
+        100,
+    )
+    deferred_account_ids: list[int] = []
+    if len(due_account_ids) > configured_max_accounts:
+        deferred_account_ids = due_account_ids[configured_max_accounts:]
+        due_account_ids = due_account_ids[:configured_max_accounts]
+        due_reasons = {account_id: due_reasons[account_id] for account_id in due_account_ids}
     budget_only_reasons = {"budget_guard", "peak_budget"}
     budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(budget_only_reasons) for account_id in due_account_ids)
     if not due_account_ids:
@@ -484,6 +505,9 @@ async def automation_scheduler_tick(
                 "active_job_id": active_job.id,
                 "active_status": active_job.status.value,
                 "due_account_ids": due_account_ids,
+                "original_due_account_ids": original_due_account_ids,
+                "deferred_account_ids": deferred_account_ids,
+                "scheduler_max_accounts_per_tick": configured_max_accounts,
                 "due_reasons": due_reasons,
                 "budget_only": budget_only,
                 "schedule_decisions": decisions,
@@ -500,6 +524,9 @@ async def automation_scheduler_tick(
             "budget_only": budget_only,
             "queued_by": "local_scheduler_tick",
             "due_reasons": due_reasons,
+            "deferred_account_ids": deferred_account_ids,
+            "scheduler_max_accounts_per_tick": configured_max_accounts,
+            "original_due_count": len(original_due_account_ids),
             "schedule_decisions": decisions,
         },
     )
@@ -516,6 +543,9 @@ async def automation_scheduler_tick(
             "queued": True,
             "job_id": job.id,
             "due_account_ids": due_account_ids,
+            "original_due_account_ids": original_due_account_ids,
+            "deferred_account_ids": deferred_account_ids,
+            "scheduler_max_accounts_per_tick": configured_max_accounts,
             "due_reasons": due_reasons,
             "budget_only": budget_only,
             "schedule_decisions": decisions,
