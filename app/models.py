@@ -792,6 +792,7 @@ class GoogleAdsAutomationPreference(Base):
     auto_apply_negatives_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     auto_create_campaigns_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     auto_pause_campaigns_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    manual_first_run_criteria_csv_enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     auto_peak_budget_enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     testing_bootstrap_enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     testing_bootstrap_days: Mapped[int] = mapped_column(Integer, default=15)

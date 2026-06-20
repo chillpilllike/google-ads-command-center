@@ -1871,6 +1871,84 @@ def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = Non
     return urls
 
 
+def _manual_first_run_criteria_csv_pending(preference: GoogleAdsAutomationPreference, draft: AdDraft) -> bool:
+    if not bool(getattr(preference, "manual_first_run_criteria_csv_enabled", False)):
+        return False
+    assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    manual_upload = assets.get("manual_upload") if isinstance(assets.get("manual_upload"), dict) else {}
+    live_publish = assets.get("live_publish") if isinstance(assets.get("live_publish"), dict) else {}
+    return str(manual_upload.get("status") or "").lower() != "confirmed" and str(
+        live_publish.get("status") or ""
+    ).lower() != "manual_uploaded_confirmed"
+
+
+def _manual_csv_deferred_keyword_result(draft: AdDraft) -> dict[str, Any]:
+    keywords = _keyword_texts_from_draft(draft)
+    return {
+        "keyword_count": len(keywords),
+        "existing_keyword_count": 0,
+        "new_keyword_count": len(keywords),
+        "keyword_resources": [],
+        "manual_csv_deferred": True,
+        "manual_csv_deferred_entities": ["keywords"],
+        "manual_csv_export_kind": "keywords",
+        "manual_csv_reason": "First-run bulk criteria CSV mode is enabled and manual upload is not confirmed.",
+    }
+
+
+def _manual_csv_deferred_negative_keyword_result(draft: AdDraft) -> dict[str, Any]:
+    keywords = _negative_keyword_texts_from_draft(draft)
+    return {
+        "negative_keyword_count": len(keywords),
+        "existing_negative_keyword_count": 0,
+        "new_negative_keyword_count": len(keywords),
+        "negative_keyword_resources": [],
+        "manual_csv_deferred": True,
+        "manual_csv_deferred_entities": ["negative_keywords"],
+        "manual_csv_export_kind": "negative_keywords",
+        "manual_csv_reason": "First-run bulk criteria CSV mode is enabled and manual upload is not confirmed.",
+    }
+
+
+def _manual_csv_deferred_negative_page_result(draft: AdDraft) -> dict[str, Any]:
+    urls = _negative_page_urls_from_draft(draft)
+    return {
+        "negative_page_count": len(urls),
+        "existing_negative_page_count": 0,
+        "new_negative_page_count": len(urls),
+        "negative_page_resources": [],
+        "manual_csv_deferred": True,
+        "manual_csv_deferred_entities": ["url_exclusions"],
+        "manual_csv_export_kind": "url_exclusions",
+        "manual_csv_reason": "First-run bulk criteria CSV mode is enabled and manual upload is not confirmed.",
+    }
+
+
+def _manual_csv_deferred_url_inclusion_result(draft: AdDraft) -> dict[str, Any]:
+    urls = _url_inclusion_urls_from_draft(draft)
+    return {
+        "url_inclusion_count": len(urls),
+        "existing_url_inclusion_count": 0,
+        "new_url_inclusion_count": len(urls),
+        "url_inclusion_resources": [],
+        "manual_csv_deferred": True,
+        "manual_csv_deferred_entities": ["url_inclusions"],
+        "manual_csv_export_kind": "url_inclusions",
+        "manual_csv_reason": "First-run bulk criteria CSV mode is enabled and manual upload is not confirmed.",
+    }
+
+
+def _append_manual_csv_deferred_operation(operations: list[dict[str, str]], entity: str, count: int) -> None:
+    if count <= 0:
+        return
+    operations.append(
+        {
+            "operation": f"defer_{entity}_to_manual_csv",
+            "resource_name": f"{count} planned rows",
+        }
+    )
+
+
 def _existing_ad_group_webpage_inclusions(client: Any, account: GoogleAdsAccount, ad_group_id: int) -> set[str]:
     if not ad_group_id:
         return set()
@@ -3528,6 +3606,7 @@ def publish_dsa_draft(
         page_targeting.get("mode") or ""
     ).startswith("core_scale")
     planned_url_inclusions = _url_inclusion_urls_from_draft(draft)
+    criteria_csv_pending = _manual_first_run_criteria_csv_pending(preference, draft)
     if requires_url_inclusions and not planned_url_inclusions:
         return {
             "draft_id": draft.id,
@@ -3630,24 +3709,40 @@ def publish_dsa_draft(
             }
         )
     checkpoint("dsa_negative_keywords")
-    negative_result = _apply_campaign_negative_keywords(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
+    if criteria_csv_pending:
+        negative_result = _manual_csv_deferred_negative_keyword_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_negative_keywords",
+            int(negative_result.get("negative_keyword_count") or 0),
+        )
+    else:
+        negative_result = _apply_campaign_negative_keywords(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
     checkpoint("dsa_negative_keywords", "done", created=len(negative_result.get("negative_keyword_resources") or []))
     checkpoint("dsa_page_exclusions")
-    page_result = _apply_campaign_negative_webpages(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
+    if criteria_csv_pending:
+        page_result = _manual_csv_deferred_negative_page_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_url_exclusions",
+            int(page_result.get("negative_page_count") or 0),
+        )
+    else:
+        page_result = _apply_campaign_negative_webpages(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
     checkpoint("dsa_page_exclusions", "done", created=len(page_result.get("negative_page_resources") or []))
     if negative_result["negative_keyword_resources"]:
         operations.append(
@@ -3701,31 +3796,39 @@ def publish_dsa_draft(
         enabled_ad_resource = _enable_ad_group_ad_if_needed(client, account, dsa_ad, validate_only=validate_only)
         if enabled_ad_resource:
             operations.append({"operation": "enable_existing_dynamic_search_ad", "resource_name": enabled_ad_resource})
-        try:
-            inclusion_result = _apply_ad_group_webpage_inclusions(
-                client,
-                account,
-                draft,
-                ad_group_id=ad_group_id,
-                ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
-                validate_only=validate_only,
+        if criteria_csv_pending:
+            inclusion_result = _manual_csv_deferred_url_inclusion_result(draft)
+            _append_manual_csv_deferred_operation(
+                operations,
+                "ad_group_url_inclusions",
+                int(inclusion_result.get("url_inclusion_count") or 0),
             )
-        except GoogleAdsException as exc:
-            inclusion_result = {
-                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-                "existing_url_inclusion_count": 0,
-                "new_url_inclusion_count": 0,
-                "url_inclusion_resources": [],
-                "url_inclusion_error": summarize_google_ads_exception(exc),
-            }
-        except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill DSA creation.
-            inclusion_result = {
-                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-                "existing_url_inclusion_count": 0,
-                "new_url_inclusion_count": 0,
-                "url_inclusion_resources": [],
-                "url_inclusion_error": {"message": str(exc)[:500]},
-            }
+        else:
+            try:
+                inclusion_result = _apply_ad_group_webpage_inclusions(
+                    client,
+                    account,
+                    draft,
+                    ad_group_id=ad_group_id,
+                    ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+                    validate_only=validate_only,
+                )
+            except GoogleAdsException as exc:
+                inclusion_result = {
+                    "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                    "existing_url_inclusion_count": 0,
+                    "new_url_inclusion_count": 0,
+                    "url_inclusion_resources": [],
+                    "url_inclusion_error": summarize_google_ads_exception(exc),
+                }
+            except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill DSA creation.
+                inclusion_result = {
+                    "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                    "existing_url_inclusion_count": 0,
+                    "new_url_inclusion_count": 0,
+                    "url_inclusion_resources": [],
+                    "url_inclusion_error": {"message": str(exc)[:500]},
+                }
         if inclusion_result["url_inclusion_resources"]:
             operations.append(
                 {
@@ -3816,31 +3919,39 @@ def publish_dsa_draft(
     if enabled_ad_resource:
         operations.append({"operation": "enable_existing_ad_group_ad", "resource_name": enabled_ad_resource})
 
-    try:
-        inclusion_result = _apply_ad_group_webpage_inclusions(
-            client,
-            account,
-            draft,
-            ad_group_id=ad_group_id,
-            ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
-            validate_only=validate_only,
+    if criteria_csv_pending:
+        inclusion_result = _manual_csv_deferred_url_inclusion_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "ad_group_url_inclusions",
+            int(inclusion_result.get("url_inclusion_count") or 0),
         )
-    except GoogleAdsException as exc:
-        inclusion_result = {
-            "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-            "existing_url_inclusion_count": 0,
-            "new_url_inclusion_count": 0,
-            "url_inclusion_resources": [],
-            "url_inclusion_error": summarize_google_ads_exception(exc),
-        }
-    except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill DSA creation.
-        inclusion_result = {
-            "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-            "existing_url_inclusion_count": 0,
-            "new_url_inclusion_count": 0,
-            "url_inclusion_resources": [],
-            "url_inclusion_error": {"message": str(exc)[:500]},
-        }
+    else:
+        try:
+            inclusion_result = _apply_ad_group_webpage_inclusions(
+                client,
+                account,
+                draft,
+                ad_group_id=ad_group_id,
+                ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+                validate_only=validate_only,
+            )
+        except GoogleAdsException as exc:
+            inclusion_result = {
+                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                "existing_url_inclusion_count": 0,
+                "new_url_inclusion_count": 0,
+                "url_inclusion_resources": [],
+                "url_inclusion_error": summarize_google_ads_exception(exc),
+            }
+        except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill DSA creation.
+            inclusion_result = {
+                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                "existing_url_inclusion_count": 0,
+                "new_url_inclusion_count": 0,
+                "url_inclusion_resources": [],
+                "url_inclusion_error": {"message": str(exc)[:500]},
+            }
     if inclusion_result["url_inclusion_resources"]:
         operations.append(
             {
@@ -3919,6 +4030,7 @@ def publish_rsa_draft(
     ad_group_name = _rsa_ad_group_name_from_assets(assets, campaign_code)
     legacy_ad_group_name = f"AUTO | Testing / Discovery | RSA Keywords | {campaign_code}"
     ai_max_final_url_expansion = "core / scale" not in str(campaign_name or "").lower()
+    criteria_csv_pending = _manual_first_run_criteria_csv_pending(preference, draft)
 
     operations: list[dict[str, str]] = []
     existing_campaign = _campaign_by_code(client, account, campaign_code)
@@ -3987,22 +4099,38 @@ def publish_rsa_draft(
                 "resource_name": str(location_result.get("geo_target_constant") or ""),
             }
         )
-    negative_result = _apply_campaign_negative_keywords(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
-    page_result = _apply_campaign_negative_webpages(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
+    if criteria_csv_pending:
+        negative_result = _manual_csv_deferred_negative_keyword_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_negative_keywords",
+            int(negative_result.get("negative_keyword_count") or 0),
+        )
+    else:
+        negative_result = _apply_campaign_negative_keywords(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
+    if criteria_csv_pending:
+        page_result = _manual_csv_deferred_negative_page_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_url_exclusions",
+            int(page_result.get("negative_page_count") or 0),
+        )
+    else:
+        page_result = _apply_campaign_negative_webpages(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
     if negative_result["negative_keyword_resources"]:
         operations.append(
             {
@@ -4077,82 +4205,114 @@ def publish_rsa_draft(
     if enabled_ad_resource:
         operations.append({"operation": "enable_existing_ad_group_ad", "resource_name": enabled_ad_resource})
 
-    keywords = _keyword_texts_from_draft(draft)
-    existing_keyword_map = _existing_exact_keyword_map(client, account, ad_group_id) if ad_group_id else {}
-    existing_keywords = set(existing_keyword_map)
-    desired_keywords = set(keywords)
-    keywords_to_create = [keyword for keyword in keywords if keyword not in existing_keywords]
-    keywords_to_enable = [
-        info["resource_name"]
-        for keyword, info in existing_keyword_map.items()
-        if keyword in keywords and str(info.get("status") or "").upper() != "ENABLED"
-    ]
-    keywords_to_pause = [
-        info["resource_name"]
-        for keyword, info in existing_keyword_map.items()
-        if keyword not in desired_keywords and str(info.get("status") or "").upper() == "ENABLED"
-    ]
-    enabled_keyword_resources = _enable_ad_group_criteria_if_needed(
-        client,
-        account,
-        criterion_resource_names=keywords_to_enable,
-        validate_only=validate_only,
-    )
-    paused_keyword_resources = _pause_ad_group_criteria_if_needed(
-        client,
-        account,
-        criterion_resource_names=keywords_to_pause,
-        validate_only=validate_only,
-    )
-    keyword_resources = _create_exact_keywords(
-        client,
-        account,
-        ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
-        keywords=keywords_to_create,
-        validate_only=validate_only,
-    )
-    if enabled_keyword_resources:
-        operations.append(
-            {
-                "operation": "enable_existing_exact_keywords",
-                "resource_name": f"{len(enabled_keyword_resources)} keywords",
-            }
+    if criteria_csv_pending:
+        keyword_result = {
+            **_manual_csv_deferred_keyword_result(draft),
+            "enabled_existing_keyword_count": 0,
+            "paused_stale_keyword_count": 0,
+            "enabled_keyword_resources": [],
+            "paused_keyword_resources": [],
+        }
+        _append_manual_csv_deferred_operation(
+            operations,
+            "exact_keywords",
+            int(keyword_result.get("keyword_count") or 0),
         )
-    if paused_keyword_resources:
-        operations.append(
-            {
-                "operation": "pause_stale_exact_keywords",
-                "resource_name": f"{len(paused_keyword_resources)} keywords",
-            }
-        )
-    if keyword_resources:
-        operations.append({"operation": "create_enabled_exact_keywords", "resource_name": f"{len(keyword_resources)} keywords"})
-
-    try:
-        inclusion_result = _apply_ad_group_webpage_inclusions(
+    else:
+        keywords = _keyword_texts_from_draft(draft)
+        existing_keyword_map = _existing_exact_keyword_map(client, account, ad_group_id) if ad_group_id else {}
+        existing_keywords = set(existing_keyword_map)
+        desired_keywords = set(keywords)
+        keywords_to_create = [keyword for keyword in keywords if keyword not in existing_keywords]
+        keywords_to_enable = [
+            info["resource_name"]
+            for keyword, info in existing_keyword_map.items()
+            if keyword in keywords and str(info.get("status") or "").upper() != "ENABLED"
+        ]
+        keywords_to_pause = [
+            info["resource_name"]
+            for keyword, info in existing_keyword_map.items()
+            if keyword not in desired_keywords and str(info.get("status") or "").upper() == "ENABLED"
+        ]
+        enabled_keyword_resources = _enable_ad_group_criteria_if_needed(
             client,
             account,
-            draft,
-            ad_group_id=ad_group_id,
-            ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+            criterion_resource_names=keywords_to_enable,
             validate_only=validate_only,
         )
-    except GoogleAdsException as exc:
-        inclusion_result = {
-            "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-            "existing_url_inclusion_count": 0,
-            "new_url_inclusion_count": 0,
-            "url_inclusion_resources": [],
-            "url_inclusion_error": summarize_google_ads_exception(exc),
+        paused_keyword_resources = _pause_ad_group_criteria_if_needed(
+            client,
+            account,
+            criterion_resource_names=keywords_to_pause,
+            validate_only=validate_only,
+        )
+        keyword_resources = _create_exact_keywords(
+            client,
+            account,
+            ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+            keywords=keywords_to_create,
+            validate_only=validate_only,
+        )
+        keyword_result = {
+            "keyword_count": len(keywords),
+            "existing_keyword_count": len(existing_keywords),
+            "enabled_existing_keyword_count": len(enabled_keyword_resources),
+            "paused_stale_keyword_count": len(paused_keyword_resources),
+            "new_keyword_count": len(keywords_to_create),
+            "keyword_resources": keyword_resources,
+            "enabled_keyword_resources": enabled_keyword_resources,
+            "paused_keyword_resources": paused_keyword_resources,
         }
-    except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill RSA creation.
-        inclusion_result = {
-            "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
-            "existing_url_inclusion_count": 0,
-            "new_url_inclusion_count": 0,
-            "url_inclusion_resources": [],
-            "url_inclusion_error": {"message": str(exc)[:500]},
-        }
+        if enabled_keyword_resources:
+            operations.append(
+                {
+                    "operation": "enable_existing_exact_keywords",
+                    "resource_name": f"{len(enabled_keyword_resources)} keywords",
+                }
+            )
+        if paused_keyword_resources:
+            operations.append(
+                {
+                    "operation": "pause_stale_exact_keywords",
+                    "resource_name": f"{len(paused_keyword_resources)} keywords",
+                }
+            )
+        if keyword_resources:
+            operations.append({"operation": "create_enabled_exact_keywords", "resource_name": f"{len(keyword_resources)} keywords"})
+
+    if criteria_csv_pending:
+        inclusion_result = _manual_csv_deferred_url_inclusion_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "ad_group_url_inclusions",
+            int(inclusion_result.get("url_inclusion_count") or 0),
+        )
+    else:
+        try:
+            inclusion_result = _apply_ad_group_webpage_inclusions(
+                client,
+                account,
+                draft,
+                ad_group_id=ad_group_id,
+                ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+                validate_only=validate_only,
+            )
+        except GoogleAdsException as exc:
+            inclusion_result = {
+                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                "existing_url_inclusion_count": 0,
+                "new_url_inclusion_count": 0,
+                "url_inclusion_resources": [],
+                "url_inclusion_error": summarize_google_ads_exception(exc),
+            }
+        except Exception as exc:  # noqa: BLE001 - URL inclusions should not kill RSA creation.
+            inclusion_result = {
+                "url_inclusion_count": len(_url_inclusion_urls_from_draft(draft)),
+                "existing_url_inclusion_count": 0,
+                "new_url_inclusion_count": 0,
+                "url_inclusion_resources": [],
+                "url_inclusion_error": {"message": str(exc)[:500]},
+            }
     if inclusion_result["url_inclusion_resources"]:
         operations.append(
             {
@@ -4175,14 +4335,7 @@ def publish_rsa_draft(
         "country_target": location_result,
         "ad_group": ad_group,
         "ad": rsa_ad,
-        "keyword_count": len(keywords),
-        "existing_keyword_count": len(existing_keywords),
-        "enabled_existing_keyword_count": len(enabled_keyword_resources),
-        "paused_stale_keyword_count": len(paused_keyword_resources),
-        "new_keyword_count": len(keywords_to_create),
-        "keyword_resources": keyword_resources,
-        "enabled_keyword_resources": enabled_keyword_resources,
-        "paused_keyword_resources": paused_keyword_resources,
+        **keyword_result,
         **inclusion_result,
         **negative_result,
         **page_result,
@@ -4253,6 +4406,7 @@ def publish_pmax_draft(
     daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
     effective_daily_budget = max(daily_budget, _float_value(preference.minimum_daily_budget_amount, 1.0), 1.0)
     target_roas = _float_value(bidding.get("target_roas"), 3.5)
+    criteria_csv_pending = _manual_first_run_criteria_csv_pending(preference, draft)
 
     operations: list[dict[str, Any]] = []
     checkpoint("pmax_campaign_lookup")
@@ -4319,22 +4473,38 @@ def publish_pmax_draft(
                 "resource_name": str(location_result.get("geo_target_constant") or ""),
             }
         )
-    negative_result = _apply_campaign_negative_keywords(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
-    page_result = _apply_campaign_negative_webpages(
-        client,
-        account,
-        draft,
-        campaign_id=campaign_id,
-        campaign_resource_name=campaign_resource,
-        validate_only=validate_only,
-    )
+    if criteria_csv_pending:
+        negative_result = _manual_csv_deferred_negative_keyword_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_negative_keywords",
+            int(negative_result.get("negative_keyword_count") or 0),
+        )
+    else:
+        negative_result = _apply_campaign_negative_keywords(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
+    if criteria_csv_pending:
+        page_result = _manual_csv_deferred_negative_page_result(draft)
+        _append_manual_csv_deferred_operation(
+            operations,
+            "campaign_url_exclusions",
+            int(page_result.get("negative_page_count") or 0),
+        )
+    else:
+        page_result = _apply_campaign_negative_webpages(
+            client,
+            account,
+            draft,
+            campaign_id=campaign_id,
+            campaign_resource_name=campaign_resource,
+            validate_only=validate_only,
+        )
     if negative_result["negative_keyword_resources"]:
         operations.append(
             {
@@ -4375,13 +4545,15 @@ def publish_pmax_draft(
     all_text_asset_resources: set[str] = set()
     settings_map = get_sync_setting_map(session)
     legacy_defer_signal_mutations = parse_bool(settings_map.get(DEFER_PMAX_SIGNAL_MUTATIONS_SETTING, False))
-    defer_search_theme_mutations = parse_bool(settings_map.get(DEFER_PMAX_SEARCH_THEME_MUTATIONS_SETTING, False))
+    defer_search_theme_mutations = criteria_csv_pending or parse_bool(
+        settings_map.get(DEFER_PMAX_SEARCH_THEME_MUTATIONS_SETTING, False)
+    )
     defer_audience_signal_mutations = parse_bool(
         settings_map.get(DEFER_PMAX_AUDIENCE_SIGNAL_MUTATIONS_SETTING, legacy_defer_signal_mutations)
     )
     search_theme_signals_blocked_reason: Optional[str] = None
     audience_signals_blocked_reason: Optional[str] = None
-    campaign_search_theme_keys = _existing_campaign_search_theme_keys(client, account, campaign_id)
+    campaign_search_theme_keys = set() if defer_search_theme_mutations else _existing_campaign_search_theme_keys(client, account, campaign_id)
     search_theme_backfill_terms = _pmax_search_theme_backfill_terms(assets)
     category_label = str((assets.get("campaign_identity") or {}).get("category") or "Core / Scale").strip() or "Core / Scale"
     pmax_final_urls = _pmax_final_urls_from_assets(assets, final_url)
@@ -4453,18 +4625,30 @@ def publish_pmax_draft(
             limit=80,
             max_items=PMAX_SEARCH_THEME_SIGNAL_LIMIT,
         )
-        search_themes_to_create, existing_search_theme_count, missing_search_theme_count = _search_themes_needed_for_asset_group(
-            client,
-            account,
-            asset_group_resource_name=group_resource,
-            planned_terms=search_themes,
-            campaign_theme_keys=campaign_search_theme_keys,
-            backfill_terms=search_theme_backfill_terms,
-        )
+        if defer_search_theme_mutations:
+            search_themes_to_create = search_themes[:PMAX_SEARCH_THEME_SIGNAL_LIMIT]
+            existing_search_theme_count = 0
+            missing_search_theme_count = len(search_themes_to_create)
+        else:
+            search_themes_to_create, existing_search_theme_count, missing_search_theme_count = _search_themes_needed_for_asset_group(
+                client,
+                account,
+                asset_group_resource_name=group_resource,
+                planned_terms=search_themes,
+                campaign_theme_keys=campaign_search_theme_keys,
+                backfill_terms=search_theme_backfill_terms,
+            )
         search_theme_error: dict[str, Any] | None = None
         if defer_search_theme_mutations:
             signal_resources = []
-            search_theme_error = {"deferred": "PMax search-theme signal mutations are deferred by setting."}
+            if criteria_csv_pending:
+                _append_manual_csv_deferred_operation(operations, "pmax_search_themes", len(search_themes_to_create))
+                search_theme_error = {
+                    "deferred": "First-run bulk criteria CSV mode is enabled; PMax search themes are in the Keywords CSV.",
+                    "manual_csv_export_kind": "keywords",
+                }
+            else:
+                search_theme_error = {"deferred": "PMax search-theme signal mutations are deferred by setting."}
         elif search_theme_signals_blocked_reason:
             signal_resources = []
             search_theme_error = {"skipped_after_previous_timeout": search_theme_signals_blocked_reason}
@@ -4764,6 +4948,10 @@ def _compact_live_result(result: dict[str, Any]) -> dict[str, Any]:
         "error_count",
         "result_count",
         "validate_only",
+        "manual_csv_deferred",
+        "manual_csv_deferred_entities",
+        "manual_csv_export_kind",
+        "manual_csv_reason",
     }
     compact = {key: result.get(key) for key in scalar_keys if key in result}
     for key in ("campaign", "ad_group", "ad"):

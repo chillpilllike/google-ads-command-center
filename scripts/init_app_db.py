@@ -790,6 +790,12 @@ async def init_app_db() -> None:
             text("CREATE INDEX IF NOT EXISTS ix_google_ads_automation_preferences_auto_pause_campaigns_enabled ON google_ads_automation_preferences (auto_pause_campaigns_enabled)")
         )
         await conn.execute(
+            text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS manual_first_run_criteria_csv_enabled BOOLEAN NOT NULL DEFAULT false")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_google_ads_automation_preferences_manual_first_run_criteria_csv_enabled ON google_ads_automation_preferences (manual_first_run_criteria_csv_enabled)")
+        )
+        await conn.execute(
             text("ALTER TABLE google_ads_automation_preferences ADD COLUMN IF NOT EXISTS auto_peak_budget_enabled BOOLEAN NOT NULL DEFAULT true")
         )
         await conn.execute(

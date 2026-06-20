@@ -206,6 +206,7 @@ async def save_automation_preferences(
     auto_apply_negatives_enabled: Optional[str] = Form(None),
     auto_create_campaigns_enabled: Optional[str] = Form(None),
     auto_pause_campaigns_enabled: Optional[str] = Form(None),
+    manual_first_run_criteria_csv_enabled: Optional[str] = Form(None),
     auto_peak_budget_enabled: Optional[str] = Form(None),
     testing_bootstrap_enabled: Optional[str] = Form(None),
     testing_bootstrap_days: int = Form(15),
@@ -256,6 +257,7 @@ async def save_automation_preferences(
     preference.auto_apply_negatives_enabled = _checked(auto_apply_negatives_enabled)
     preference.auto_create_campaigns_enabled = _checked(auto_create_campaigns_enabled)
     preference.auto_pause_campaigns_enabled = _checked(auto_pause_campaigns_enabled)
+    preference.manual_first_run_criteria_csv_enabled = _checked(manual_first_run_criteria_csv_enabled)
     preference.auto_peak_budget_enabled = _checked(auto_peak_budget_enabled)
     preference.testing_bootstrap_enabled = _checked(testing_bootstrap_enabled)
     preference.testing_bootstrap_days = clamp_int(testing_bootstrap_days, 15, 1, 60)
