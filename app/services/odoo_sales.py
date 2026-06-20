@@ -80,7 +80,7 @@ def _authenticate_store(store: OdooStore) -> tuple[str, int, xmlrpc.client.Serve
 
 
 def sync_store_websites(session: Session, store: OdooStore) -> int:
-    _base_url, uid, models = _authenticate_store(store)
+    base_url, uid, models = _authenticate_store(store)
     fields = ["id", "name", "domain"]
     try:
         rows = models.execute_kw(
@@ -108,6 +108,11 @@ def sync_store_websites(session: Session, store: OdooStore) -> int:
         .where(OdooWebsite.store_id == store.id)
         .values(is_active=False)
     )
+    if len(rows) == 1 and not bool(store.is_multisite):
+        row_domain = str(rows[0].get("domain") or "").strip().rstrip("/")
+        if row_domain and _normalize_url(row_domain) != base_url:
+            rows[0]["domain"] = base_url
+
     saved = 0
     for row in rows:
         stmt = insert(OdooWebsite).values(
