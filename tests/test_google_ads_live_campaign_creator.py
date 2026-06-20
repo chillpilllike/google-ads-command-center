@@ -9,6 +9,7 @@ from google.ads.googleads.v24.errors.types.errors import GoogleAdsFailure
 from app.services.google_ads_live_campaign_creator import (
     _clean_search_theme,
     _create_ad_group_webpage_inclusions,
+    _campaign_by_code_or_lane,
     _contains_shipping_offer_text,
     _create_search_campaign,
     _create_search_theme_signals,
@@ -445,6 +446,44 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         self.assertTrue(campaign.ai_max_setting.enable_ai_max)
         self.assertEqual(campaign.dynamic_search_ads_setting.domain_name, "nutricity.ca")
         self.assertEqual(campaign.maximize_conversion_value.target_roas, 5.0)
+
+    def test_campaign_lookup_falls_back_to_live_lane_match(self) -> None:
+        client = self.FakeGoogleAdsClient()
+        account = SimpleNamespace(customer_id="8976162539")
+        desired_name = "AUTO | Core / Scale | RSA Target ROAS Scale Keywords | AUTO-BBBBBBBBBB"
+        rows = [
+            SimpleNamespace(
+                campaign=SimpleNamespace(
+                    id=101,
+                    name="AUTO | Core / Scale | RSA Target ROAS Scale Keywords | AUTO-AAAAAAAAAA",
+                    resource_name="customers/8976162539/campaigns/101",
+                    status=SimpleNamespace(name="PAUSED"),
+                    advertising_channel_type=SimpleNamespace(name="SEARCH"),
+                ),
+                campaign_budget=SimpleNamespace(amount_micros=50_000_000),
+            ),
+            SimpleNamespace(
+                campaign=SimpleNamespace(
+                    id=202,
+                    name="AUTO | Core / Scale | RSA Target ROAS Scale Keywords | AUTO-CCCCCCCCCC",
+                    resource_name="customers/8976162539/campaigns/202",
+                    status=SimpleNamespace(name="ENABLED"),
+                    advertising_channel_type=SimpleNamespace(name="SEARCH"),
+                ),
+                campaign_budget=SimpleNamespace(amount_micros=21_970_000),
+            ),
+        ]
+
+        with patch("app.services.google_ads_live_campaign_creator._campaign_by_code", return_value=None), patch(
+            "app.services.google_ads_live_campaign_creator._google_ads_search",
+            return_value=rows,
+        ):
+            campaign = _campaign_by_code_or_lane(client, account, "AUTO-BBBBBBBBBB", desired_name)
+
+        self.assertIsNotNone(campaign)
+        self.assertEqual(campaign["campaign_id"], 202)
+        self.assertEqual(campaign["campaign_code"], "AUTO-CCCCCCCCCC")
+        self.assertEqual(campaign["matched_by"], "campaign_lane_live_fallback")
 
     def test_successful_resource_names_ignores_mutate_operation_partial_failures(self) -> None:
         failure = GoogleAdsFailure()

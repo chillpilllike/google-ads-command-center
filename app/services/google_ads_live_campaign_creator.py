@@ -679,6 +679,72 @@ def _campaign_by_code(client: Any, account: GoogleAdsAccount, campaign_code: str
     return None
 
 
+def _campaign_lane_prefix(campaign_name: str) -> str:
+    name = re.sub(r"\s+", " ", str(campaign_name or "").strip())
+    return re.sub(r"\s*\|\s*AUTO-[A-F0-9]{10}\s*$", "", name, flags=re.I).strip()
+
+
+def _campaign_code_from_name(campaign_name: str) -> str:
+    match = re.search(r"\bAUTO-[A-F0-9]{10}\b", str(campaign_name or "").upper())
+    return match.group(0) if match else ""
+
+
+def _campaign_by_lane_name(client: Any, account: GoogleAdsAccount, campaign_name: str) -> Optional[dict[str, Any]]:
+    lane_prefix = _campaign_lane_prefix(campaign_name)
+    if not lane_prefix or not lane_prefix.startswith("AUTO |") or not hasattr(client, "get_service"):
+        return None
+    query = f"""
+        SELECT
+          campaign.id,
+          campaign.name,
+          campaign.resource_name,
+          campaign.status,
+          campaign.advertising_channel_type,
+          campaign_budget.amount_micros
+        FROM campaign
+        WHERE campaign.name LIKE {gaql_string(lane_prefix + ' | AUTO-%')}
+          AND campaign.status != REMOVED
+    """
+    service = client.get_service("GoogleAdsService")
+    candidates: list[dict[str, Any]] = []
+    for row in _google_ads_search(service, account, query):
+        candidates.append(
+            {
+                "campaign_id": int(row.campaign.id),
+                "campaign_name": str(row.campaign.name or ""),
+                "campaign_resource_name": str(row.campaign.resource_name or ""),
+                "campaign_status": enum_name(row.campaign.status),
+                "channel_type": enum_name(row.campaign.advertising_channel_type),
+                "matched_by": "campaign_lane_live_fallback",
+                "campaign_code": _campaign_code_from_name(str(row.campaign.name or "")),
+                "budget_amount_micros": int(row.campaign_budget.amount_micros or 0),
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("campaign_status") or "").upper() == "ENABLED",
+            int(item.get("budget_amount_micros") or 0),
+            int(item.get("campaign_id") or 0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _campaign_by_code_or_lane(
+    client: Any,
+    account: GoogleAdsAccount,
+    campaign_code: str,
+    campaign_name: str,
+) -> Optional[dict[str, Any]]:
+    campaign = _campaign_by_code(client, account, campaign_code)
+    if campaign is not None:
+        return campaign
+    return _campaign_by_lane_name(client, account, campaign_name)
+
+
 def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
     currency = str(account.currency_code or "").upper()
     if currency == "INR":
@@ -3639,7 +3705,7 @@ def publish_dsa_draft(
         except Exception:
             pass
 
-    existing_campaign = _campaign_by_code(client, account, campaign_code)
+    existing_campaign = _campaign_by_code_or_lane(client, account, campaign_code, campaign_name)
     campaign = existing_campaign
     created_campaign = False
     if campaign is None:
@@ -4033,7 +4099,7 @@ def publish_rsa_draft(
     criteria_csv_pending = _manual_first_run_criteria_csv_pending(preference, draft)
 
     operations: list[dict[str, str]] = []
-    existing_campaign = _campaign_by_code(client, account, campaign_code)
+    existing_campaign = _campaign_by_code_or_lane(client, account, campaign_code, campaign_name)
     campaign = existing_campaign
     created_campaign = False
     if campaign is None:
@@ -4366,7 +4432,7 @@ def publish_pmax_draft(
     pmax_gate = pmax_activation_gate(session, account, preference)
     if not bool(pmax_gate.get("allowed")):
         operations: list[dict[str, Any]] = []
-        existing_campaign = _campaign_by_code(client, account, campaign_code)
+        existing_campaign = _campaign_by_code_or_lane(client, account, campaign_code, campaign_name)
         if existing_campaign and str(existing_campaign.get("campaign_status") or "").upper() == "ENABLED":
             paused = _pause_campaign_if_needed(client, account, existing_campaign, validate_only=validate_only)
             if paused:
@@ -4410,7 +4476,7 @@ def publish_pmax_draft(
 
     operations: list[dict[str, Any]] = []
     checkpoint("pmax_campaign_lookup")
-    existing_campaign = _campaign_by_code(client, account, campaign_code)
+    existing_campaign = _campaign_by_code_or_lane(client, account, campaign_code, campaign_name)
     checkpoint("pmax_campaign_lookup", "found" if existing_campaign else "missing")
     campaign = existing_campaign
     if campaign is None:
