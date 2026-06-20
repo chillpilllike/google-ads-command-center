@@ -8,6 +8,7 @@ from google.ads.googleads.errors import GoogleAdsException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.app_settings import get_sync_setting_map, parse_bool
 from app.models import GoogleAdsAccount, GoogleAdsGeneratedAsset
 
 
@@ -570,6 +571,8 @@ def publish_generated_assets(
     validate_only: bool = False,
     max_assets: int = 500,
 ) -> dict[str, Any]:
+    settings_map = get_sync_setting_map(session)
+    defer_non_account_links = parse_bool(settings_map.get("asset_publisher.defer_campaign_and_ad_group_links", True))
     rows = session.scalars(
         select(GoogleAdsGeneratedAsset)
         .where(
@@ -605,6 +608,17 @@ def publish_generated_assets(
             payload = row.payload_json if isinstance(row.payload_json, dict) else {}
             scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {"level": "account"}
             scope_level = str(scope.get("level") or "account").strip()
+            if defer_non_account_links and scope_level in {"campaign", "ad_group"}:
+                result["skipped"] += 1
+                result["errors"].append(
+                    {
+                        "asset_id": row.id,
+                        "asset_type": row.asset_type,
+                        "status": "deferred_non_account_scope",
+                        "scope_level": scope_level,
+                    }
+                )
+                continue
             if row.asset_type == "promotion":
                 result["skipped"] += 1
                 continue
