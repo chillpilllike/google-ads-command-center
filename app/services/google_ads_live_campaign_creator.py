@@ -3802,7 +3802,63 @@ def sync_restricted_policy_terms(
     *,
     validate_only: bool = False,
 ) -> dict[str, Any]:
-    scan = _disapproved_policy_term_candidates(client, account)
+    settings_map = get_sync_setting_map(session)
+    if not parse_bool(settings_map.get("live_campaign_creator.restricted_policy_scan_enabled", True)):
+        return {
+            "name": "restricted_policy_terms",
+            "status": "skipped_disabled",
+            "term_count": 0,
+            "terms": [],
+            "new_postgres_terms": [],
+            "shared_set_name": RESTRICTED_SHARED_SET_NAME,
+            "shared_set_resource_name": None,
+            "created_shared_set": False,
+            "new_shared_keyword_count": 0,
+            "new_shared_keyword_resources": [],
+            "evidence_rows": [],
+            "errors": [],
+        }
+    try:
+        timeout_seconds = int(float(settings_map.get("live_campaign_creator.restricted_policy_scan_timeout_seconds", 20) or 20))
+    except (TypeError, ValueError):
+        timeout_seconds = 20
+    timeout_seconds = min(max(timeout_seconds, 5), 60)
+    try:
+        scan = _call_with_alarm(
+            lambda: _disapproved_policy_term_candidates(client, account),
+            seconds=timeout_seconds,
+            label="restricted policy scan",
+        )
+    except TimeoutError as exc:
+        return {
+            "name": "restricted_policy_terms",
+            "status": "skipped_timeout",
+            "term_count": 0,
+            "terms": [],
+            "new_postgres_terms": [],
+            "shared_set_name": RESTRICTED_SHARED_SET_NAME,
+            "shared_set_resource_name": None,
+            "created_shared_set": False,
+            "new_shared_keyword_count": 0,
+            "new_shared_keyword_resources": [],
+            "evidence_rows": [],
+            "errors": [str(exc)],
+        }
+    except Exception as exc:  # noqa: BLE001 - policy sync should not block live publishing.
+        return {
+            "name": "restricted_policy_terms",
+            "status": "skipped_error",
+            "term_count": 0,
+            "terms": [],
+            "new_postgres_terms": [],
+            "shared_set_name": RESTRICTED_SHARED_SET_NAME,
+            "shared_set_resource_name": None,
+            "created_shared_set": False,
+            "new_shared_keyword_count": 0,
+            "new_shared_keyword_resources": [],
+            "evidence_rows": [],
+            "errors": [str(exc)[:500]],
+        }
     terms = [term for term in scan["terms"] if _valid_exact_keyword(term)]
     setting_result = _append_restricted_terms_setting(session, terms)
     shared_set_resource = None if validate_only else _shared_negative_set_by_name(client, account, RESTRICTED_SHARED_SET_NAME)
