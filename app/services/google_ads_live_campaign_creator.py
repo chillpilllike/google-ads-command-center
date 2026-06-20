@@ -16,7 +16,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.protobuf.json_format import MessageToDict
 import requests
 from sqlalchemy import select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.app_settings import get_sync_setting_map, parse_bool
 from app.models import (
@@ -311,7 +311,7 @@ def _limit_daily_criteria_items(
     return items[:allowed], reservation
 
 
-def _google_ads_search(service: Any, account: GoogleAdsAccount, query: str, *, timeout: int = 30) -> Any:
+def _google_ads_search(service: Any, account: GoogleAdsAccount, query: str, *, timeout: int = 8) -> Any:
     try:
         return service.search(customer_id=account.customer_id, query=query, timeout=timeout)
     except TypeError as exc:
@@ -340,6 +340,14 @@ def _google_ads_mutate(service: Any, method_name: str, request: Any, *, timeout:
                 raise
             time.sleep(5 * (attempt + 1))
     return method(request=request, timeout=timeout)
+
+
+def _sync_setting_value(session: Session, key: str, default: Any = None) -> Any:
+    try:
+        value = session.scalar(select(AppSetting.value).where(AppSetting.key == key).limit(1))
+    except Exception:
+        return default
+    return default if value is None else value
 
 
 def root_domain(url: str) -> str:
@@ -538,7 +546,7 @@ def _budget_block_result(
 ) -> Optional[dict[str, Any]]:
     daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
     budget_blocked = bool(bidding.get("budget_blocked"))
-    force_minimum = parse_bool(get_sync_setting_map(session).get(FORCE_MINIMUM_BUDGET_SETTING, False))
+    force_minimum = parse_bool(_sync_setting_value(session, FORCE_MINIMUM_BUDGET_SETTING, False))
     if force_minimum:
         return None
     if not budget_blocked and daily_budget > 0:
@@ -1167,9 +1175,8 @@ def enforce_automation_campaign_revisions(
         return {"name": "automation_campaign_revisions", "status": "skipped", "reason": "Missing Google Ads account."}
     if preference.monitor_only and not validate_only:
         return {"name": "automation_campaign_revisions", "status": "blocked", "reason": "Monitor-only is enabled."}
-    settings = get_sync_setting_map(session)
-    allow_mutations = parse_bool(settings.get("optimizer.allow_mutations", False))
-    dry_run = parse_bool(settings.get("optimizer.dry_run", True))
+    allow_mutations = parse_bool(_sync_setting_value(session, "optimizer.allow_mutations", False))
+    dry_run = parse_bool(_sync_setting_value(session, "optimizer.dry_run", True))
     if not validate_only and (not allow_mutations or dry_run):
         return {
             "name": "automation_campaign_revisions",
@@ -4863,13 +4870,12 @@ def publish_pmax_draft(
     asset_group_results: list[dict[str, Any]] = []
     media_links = _media_asset_links_for_pmax(media_assets)
     all_text_asset_resources: set[str] = set()
-    settings_map = get_sync_setting_map(session)
-    legacy_defer_signal_mutations = parse_bool(settings_map.get(DEFER_PMAX_SIGNAL_MUTATIONS_SETTING, False))
+    legacy_defer_signal_mutations = parse_bool(_sync_setting_value(session, DEFER_PMAX_SIGNAL_MUTATIONS_SETTING, False))
     defer_search_theme_mutations = criteria_csv_pending or parse_bool(
-        settings_map.get(DEFER_PMAX_SEARCH_THEME_MUTATIONS_SETTING, False)
+        _sync_setting_value(session, DEFER_PMAX_SEARCH_THEME_MUTATIONS_SETTING, False)
     )
     defer_audience_signal_mutations = parse_bool(
-        settings_map.get(DEFER_PMAX_AUDIENCE_SIGNAL_MUTATIONS_SETTING, legacy_defer_signal_mutations)
+        _sync_setting_value(session, DEFER_PMAX_AUDIENCE_SIGNAL_MUTATIONS_SETTING, legacy_defer_signal_mutations)
     )
     search_theme_signals_blocked_reason: Optional[str] = None
     audience_signals_blocked_reason: Optional[str] = None
@@ -5434,9 +5440,8 @@ def publish_automation_campaigns(
         return {"name": "live_campaign_creation", "status": "skipped", "reason": "Missing Google Ads account."}
     if preference.monitor_only and not validate_only:
         return {"name": "live_campaign_creation", "status": "blocked", "reason": "Monitor-only is enabled."}
-    settings = get_sync_setting_map(session)
-    allow_mutations = parse_bool(settings.get("optimizer.allow_mutations", False))
-    dry_run = parse_bool(settings.get("optimizer.dry_run", True))
+    allow_mutations = parse_bool(_sync_setting_value(session, "optimizer.allow_mutations", False))
+    dry_run = parse_bool(_sync_setting_value(session, "optimizer.dry_run", True))
     if not validate_only and (not allow_mutations or dry_run):
         return {
             "name": "live_campaign_creation",
@@ -5457,12 +5462,29 @@ def publish_automation_campaigns(
         }
 
     batch_limit = max(int(limit or 10), 1)
+    supported_ad_types = set(SUPPORTED_AD_TYPES)
+    pmax_gate = pmax_activation_gate(session, account, preference)
+    if not bool(pmax_gate.get("allowed")):
+        supported_ad_types.discard("pmax")
     drafts = list(
         session.scalars(
             select(AdDraft)
-            .where(AdDraft.account_id == preference.account_id, AdDraft.ad_type.in_(SUPPORTED_AD_TYPES))
+            .options(
+                load_only(
+                    AdDraft.id,
+                    AdDraft.account_id,
+                    AdDraft.ad_type,
+                    AdDraft.status,
+                    AdDraft.website_url,
+                    AdDraft.final_url,
+                    AdDraft.business_name,
+                    AdDraft.generated_assets,
+                    AdDraft.created_at,
+                )
+            )
+            .where(AdDraft.account_id == preference.account_id, AdDraft.ad_type.in_(supported_ad_types))
             .order_by(AdDraft.created_at.desc(), AdDraft.id.desc())
-            .limit(max(batch_limit * 4, LIVE_CAMPAIGN_PUBLISH_BATCH_LIMIT))
+            .limit(min(max(batch_limit * 2, batch_limit), LIVE_CAMPAIGN_PUBLISH_BATCH_LIMIT))
         ).all()
     )
     drafts = sorted(
@@ -5481,7 +5503,7 @@ def publish_automation_campaigns(
     previous_scope_count = session_info.get("live_criteria_scope_count")
     criteria_scope_count = _planned_criteria_scope_count(drafts)
     session_info["live_criteria_scope_count"] = criteria_scope_count
-    client = build_client(settings, account.manager_customer_id, account.connection)
+    client = build_client({}, account.manager_customer_id, account.connection)
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 

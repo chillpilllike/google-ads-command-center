@@ -8,9 +8,9 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.ads.googleads.errors import GoogleAdsException
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect as sa_inspect, select, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer, noload
 
 from app.app_settings import get_sync_setting_map, parse_bool
 from app.models import (
@@ -101,6 +101,8 @@ WASTE_RECOVERY_TARGET_ROAS = 2.0
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
 DEFAULT_TESTING_KEYWORD_LIMIT = 0
 DEFAULT_TESTING_LANDING_PAGE_LIMIT = 0
+DEFAULT_CRITERIA_PLANNING_WINDOW = 1000
+CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.criteria_daily_item_limit"
 CAMPAIGN_PLANNING_REQUIRED_DATASETS = {DATASET_CAMPAIGN_INSIGHTS, DATASET_LANDING_PAGES}
 CAMPAIGN_PLANNING_KEYWORD_DATASETS = {
     DATASET_SEARCH_TERMS,
@@ -1333,6 +1335,29 @@ def _row_total_value(row: Any) -> float:
     return float(getattr(row, "conversion_value", 0) or 0) + float(getattr(row, "all_conversions_value", 0) or 0)
 
 
+def _row_source_json(row: Any) -> dict[str, Any]:
+    try:
+        if "source_json" in sa_inspect(row).unloaded:
+            return {}
+    except Exception:  # noqa: BLE001 - non-SQLAlchemy rows can still expose source_json.
+        pass
+    value = getattr(row, "source_json", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _criteria_planning_window(session: Session) -> int:
+    try:
+        value = int(
+            session.scalar(
+                select(AppSetting.value).where(AppSetting.key == CRITERIA_DAILY_ITEM_LIMIT_SETTING).limit(1)
+            )
+            or DEFAULT_CRITERIA_PLANNING_WINDOW
+        )
+    except Exception:  # noqa: BLE001 - planning must remain usable if settings are unavailable.
+        value = DEFAULT_CRITERIA_PLANNING_WINDOW
+    return max(value, 1)
+
+
 def best_keyword_candidates_for_testing(
     session: Session,
     account: GoogleAdsAccount,
@@ -1341,10 +1366,16 @@ def best_keyword_candidates_for_testing(
     allow_cross_account_fallback: bool = True,
 ) -> tuple[list[GoogleAdsKeywordCandidate], str]:
     target_limit = int(limit or 0)
-    target_limit = target_limit if target_limit > 0 else None
+    if target_limit <= 0:
+        target_limit = _criteria_planning_window(session)
     quality_order = ["revenue", "converting", "clicked"]
     query = (
         select(GoogleAdsKeywordCandidate)
+        .options(
+            defer(GoogleAdsKeywordCandidate.source_json),
+            noload(GoogleAdsKeywordCandidate.account),
+            noload(GoogleAdsKeywordCandidate.last_source_job),
+        )
         .where(
             GoogleAdsKeywordCandidate.account_id == account.id,
             GoogleAdsKeywordCandidate.quality_label.in_(quality_order),
@@ -1367,6 +1398,11 @@ def best_keyword_candidates_for_testing(
         seen = {row.normalized_keyword for row in rows}
         fallback_query = (
             select(GoogleAdsKeywordCandidate)
+            .options(
+                defer(GoogleAdsKeywordCandidate.source_json),
+                noload(GoogleAdsKeywordCandidate.account),
+                noload(GoogleAdsKeywordCandidate.last_source_job),
+            )
             .where(
                 GoogleAdsKeywordCandidate.account_id != account.id,
                 GoogleAdsKeywordCandidate.quality_label.in_(quality_order),
@@ -1403,10 +1439,16 @@ def best_landing_page_candidates_for_testing(
     limit: Optional[int] = DEFAULT_TESTING_LANDING_PAGE_LIMIT,
 ) -> tuple[list[GoogleAdsLandingPageCandidate], str]:
     target_limit = int(limit or 0)
-    target_limit = target_limit if target_limit > 0 else None
+    if target_limit <= 0:
+        target_limit = _criteria_planning_window(session)
     quality_order = ["revenue", "converting", "clicked", "watch"]
     query = (
         select(GoogleAdsLandingPageCandidate)
+        .options(
+            defer(GoogleAdsLandingPageCandidate.source_json),
+            noload(GoogleAdsLandingPageCandidate.account),
+            noload(GoogleAdsLandingPageCandidate.last_source_job),
+        )
         .where(
             GoogleAdsLandingPageCandidate.account_id == account.id,
             GoogleAdsLandingPageCandidate.quality_label.in_(quality_order),
@@ -1422,11 +1464,16 @@ def best_landing_page_candidates_for_testing(
         query = query.limit(target_limit)
     rows = session.scalars(query).all()
     source = "same_account_landing_page_bank"
-    if website_url and ((target_limit and len(rows) < target_limit) or (target_limit is None and not rows)):
+    if website_url and not rows:
         host_root = _root_domain(urlsplit(website_url).netloc)
         seen = {row.normalized_url_hash for row in rows}
         fallback_query = (
             select(GoogleAdsLandingPageCandidate)
+            .options(
+                defer(GoogleAdsLandingPageCandidate.source_json),
+                noload(GoogleAdsLandingPageCandidate.account),
+                noload(GoogleAdsLandingPageCandidate.last_source_job),
+            )
             .where(
                 GoogleAdsLandingPageCandidate.account_id != account.id,
                 GoogleAdsLandingPageCandidate.quality_label.in_(quality_order),
@@ -1491,6 +1538,11 @@ def keyword_candidates_for_waste_review(
     return list(
         session.scalars(
             select(GoogleAdsKeywordCandidate)
+            .options(
+                defer(GoogleAdsKeywordCandidate.source_json),
+                noload(GoogleAdsKeywordCandidate.account),
+                noload(GoogleAdsKeywordCandidate.last_source_job),
+            )
             .where(
                 GoogleAdsKeywordCandidate.account_id == account.id,
                 GoogleAdsKeywordCandidate.review_status != "rejected",
@@ -1517,6 +1569,11 @@ def landing_page_candidates_for_waste_review(
     return list(
         session.scalars(
             select(GoogleAdsLandingPageCandidate)
+            .options(
+                defer(GoogleAdsLandingPageCandidate.source_json),
+                noload(GoogleAdsLandingPageCandidate.account),
+                noload(GoogleAdsLandingPageCandidate.last_source_job),
+            )
             .where(
                 GoogleAdsLandingPageCandidate.account_id == account.id,
                 GoogleAdsLandingPageCandidate.review_status != "rejected",
@@ -2519,7 +2576,7 @@ def _keyword_payload(rows: list[GoogleAdsKeywordCandidate]) -> list[dict[str, An
 
 
 def _landing_page_engagement_metrics(row: Any) -> dict[str, float]:
-    source = getattr(row, "source_json", None) if isinstance(getattr(row, "source_json", None), dict) else {}
+    source = _row_source_json(row)
     source_rows = [item for item in (source.get("source_rows") or []) if isinstance(item, dict)]
     add_to_carts = 0.0
     checkouts = 0.0
@@ -2640,7 +2697,7 @@ def _keyword_row_policy_text(row: GoogleAdsKeywordCandidate) -> str:
         getattr(row, "quality_label", ""),
         " ".join(str(item or "") for item in (getattr(row, "campaign_names", None) or [])),
     ]
-    source_json = getattr(row, "source_json", None)
+    source_json = _row_source_json(row)
     if isinstance(source_json, dict):
         for key in ("product_name", "item_name", "page_title", "landing_page", "final_url", "raw_url"):
             parts.append(source_json.get(key) or "")
@@ -2709,7 +2766,7 @@ def _page_key(value: Any) -> str:
 
 
 def _scale_landing_page_evidence(row: GoogleAdsLandingPageCandidate) -> dict[str, Any]:
-    source = getattr(row, "source_json", None) if isinstance(getattr(row, "source_json", None), dict) else {}
+    source = _row_source_json(row)
     source_rows = [item for item in (source.get("source_rows") or []) if isinstance(item, dict)]
     scale_rows = []
     for source_row in source_rows:
@@ -3231,7 +3288,7 @@ def _is_waste_recovery_campaign_name(value: Any) -> bool:
 
 
 def _scale_search_theme_evidence(row: GoogleAdsKeywordCandidate) -> dict[str, Any]:
-    source = getattr(row, "source_json", None) if isinstance(getattr(row, "source_json", None), dict) else {}
+    source = _row_source_json(row)
     source_rows = [item for item in (source.get("source_rows") or []) if isinstance(item, dict)]
     scale_rows = []
     for source_row in source_rows:
@@ -3605,6 +3662,58 @@ def _compact_list(value: Any, *, limit: int) -> list[Any]:
     return value[: max(int(limit or 0), 0)]
 
 
+def _compact_url_targets(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    compacted: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, dict):
+            url = canonical_landing_page_url(str(item.get("url") or item.get("final_url") or item.get("landing_page") or ""))
+            source = str(item.get("source") or "")
+            page_key = str(item.get("page_key") or _page_key(url) or "")
+            payload = {
+                "url": url,
+                "page_key": page_key,
+                "source": source,
+                "score": float(item.get("score") or 0),
+                "conversions": float(item.get("conversions") or item.get("purchases") or 0),
+                "conversion_value": float(item.get("conversion_value") or item.get("revenue") or 0),
+                "quality_label": str(item.get("quality_label") or ""),
+            }
+        else:
+            url = canonical_landing_page_url(str(item or ""))
+            payload = {"url": url, "page_key": _page_key(url), "source": "url_target"}
+        key = _page_key(url)
+        if not url or not usable_landing_page_url(url) or not key or key in seen:
+            continue
+        seen.add(key)
+        compacted.append(payload)
+    return compacted
+
+
+def _compact_page_targeting(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    compact = dict(value)
+    for key in ("url_inclusions", "best_landing_pages"):
+        if isinstance(compact.get(key), list):
+            compact[f"{key}_count"] = len(_compact_url_targets(compact.get(key)))
+            compact.pop(key, None)
+    return compact
+
+
+def _compact_signal_matrix(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "status": value.get("status"),
+        "summary": value.get("summary") if isinstance(value.get("summary"), dict) else {},
+        "basis": value.get("basis"),
+        "compacted": True,
+    }
+
+
 def _planning_items(value: Any, limit: Optional[int] = None) -> list[Any]:
     if value is None:
         return []
@@ -3628,9 +3737,24 @@ def _compact_generated_assets_for_storage(generated_assets: dict[str, Any]) -> d
     for key, limit in evidence_limits.items():
         if isinstance(compact.get(key), list):
             compact[key] = _compact_list(compact.get(key), limit=limit)
+    for key in ("url_inclusion_targets", "page_feed_targets"):
+        if isinstance(compact.get(key), list):
+            compact[key] = _compact_url_targets(compact.get(key))
+    if isinstance(compact.get("page_targeting"), dict):
+        compact["page_targeting"] = _compact_page_targeting(compact.get("page_targeting"))
+    for key in (
+        "ga4_ads_signal_matrix",
+        "search_console_ads_signal_matrix",
+        "landing_page_governance_plan",
+        "waste_management_plan",
+    ):
+        if isinstance(compact.get(key), dict):
+            compact[key] = _compact_signal_matrix(compact.get(key))
     automation = compact.get("automation") if isinstance(compact.get("automation"), dict) else None
     if automation:
         compact_automation = dict(automation)
+        if isinstance(compact_automation.get("page_targeting"), dict):
+            compact_automation["page_targeting"] = _compact_page_targeting(compact_automation.get("page_targeting"))
         for key in (
             "ga4_ads_signal_matrix",
             "search_console_ads_signal_matrix",
@@ -3639,12 +3763,7 @@ def _compact_generated_assets_for_storage(generated_assets: dict[str, Any]) -> d
         ):
             value = compact_automation.get(key)
             if isinstance(value, dict):
-                compact_automation[key] = {
-                    "status": value.get("status"),
-                    "summary": value.get("summary") if isinstance(value.get("summary"), dict) else {},
-                    "basis": value.get("basis"),
-                    "compacted": True,
-                }
+                compact_automation[key] = _compact_signal_matrix(value)
         compact["automation"] = compact_automation
     return compact
 

@@ -257,7 +257,9 @@ async def save_automation_preferences(
     preference.auto_apply_negatives_enabled = _checked(auto_apply_negatives_enabled)
     preference.auto_create_campaigns_enabled = _checked(auto_create_campaigns_enabled)
     preference.auto_pause_campaigns_enabled = _checked(auto_pause_campaigns_enabled)
-    preference.manual_first_run_criteria_csv_enabled = _checked(manual_first_run_criteria_csv_enabled)
+    # Criteria publishing is paced by the daily API item limiter. Keep the legacy
+    # first-run CSV deferral off so campaigns are not left empty after enable.
+    preference.manual_first_run_criteria_csv_enabled = False
     preference.auto_peak_budget_enabled = _checked(auto_peak_budget_enabled)
     preference.testing_bootstrap_enabled = _checked(testing_bootstrap_enabled)
     preference.testing_bootstrap_days = clamp_int(testing_bootstrap_days, 15, 1, 60)

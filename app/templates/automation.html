@@ -176,11 +176,11 @@
                   <input class="form-check-input" type="checkbox" name="auto_apply_negatives_enabled" {% if preference.auto_apply_negatives_enabled %}checked{% endif %}>
                   <span class="form-check-label">Auto add negatives</span>
                 </label>
-                <label class="form-check form-switch mt-2">
-                  <input class="form-check-input" type="checkbox" name="manual_first_run_criteria_csv_enabled" {% if preference.manual_first_run_criteria_csv_enabled %}checked{% endif %}>
+                <label class="form-check form-switch mt-2 text-muted">
+                  <input class="form-check-input" type="checkbox" name="manual_first_run_criteria_csv_enabled" disabled>
                   <span class="form-check-label">First run bulk via CSV</span>
                 </label>
-                <div class="form-hint">Defers first-run keywords, negatives, URL inclusions, and URL exclusions to the manual CSV downloads until the upload is confirmed.</div>
+                <div class="form-hint">Disabled by default. First-run keywords, negatives, URL inclusions, URL exclusions, and search themes are now added through the daily API pacing limit.</div>
               </div>
               <div class="col-md-6">
                 <label class="form-check form-switch">
