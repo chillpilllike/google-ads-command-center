@@ -255,12 +255,17 @@
               </div>
             </div>
             {% if peak_decision.status %}
+            {% set peak_time = peak_decision.get("peak_time") %}
+            {% set peak_time_zone = peak_decision.get("time_zone") %}
+            {% set boost_start_time = peak_decision.get("boost_start_time") %}
+            {% set restore_time = peak_decision.get("restore_time") %}
+            {% set peak_hour_conversions = peak_decision.get("peak_hour_conversions") %}
             <div class="alert alert-info mt-3 mb-0 automation-live-warning" role="alert">
-              Conversion peak: {{ peak_decision.peak_time or "not decided" }} {{ peak_decision.time_zone or preference.schedule_timezone or "UTC" }}.
-              Boost: {{ peak_decision.boost_start_time or "not decided" }}.
-              Restore: {{ peak_decision.restore_time or "not decided" }}.
-              {% if peak_decision.peak_hour_conversions is not none %}
-              Peak conversions: {{ "%.2f"|format(peak_decision.peak_hour_conversions) }}.
+              Conversion peak: {{ peak_time or "not decided" }} {{ peak_time_zone or preference.schedule_timezone or "UTC" }}.
+              Boost: {{ boost_start_time or "not decided" }}.
+              Restore: {{ restore_time or "not decided" }}.
+              {% if peak_hour_conversions is not none %}
+              Peak conversions: {{ "%.2f"|format(peak_hour_conversions) }}.
               {% endif %}
             </div>
             {% endif %}
