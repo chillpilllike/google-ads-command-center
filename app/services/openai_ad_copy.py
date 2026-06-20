@@ -8,9 +8,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.app_settings import get_sync_setting_map, parse_bool
+from app.app_settings import parse_bool
+from app.models import AppSetting
 
 
 ASSET_REQUIREMENTS: dict[str, dict[str, Any]] = {
@@ -47,6 +49,14 @@ BAD_GENERIC_ASSETS = {
 }
 
 DEFAULT_OPENAI_COPY_TIMEOUT_SECONDS = 12
+
+
+def _setting_value(session: Session, key: str, default: Any = None) -> Any:
+    try:
+        value = session.scalar(select(AppSetting.value).where(AppSetting.key == key).limit(1))
+    except Exception:
+        return default
+    return default if value is None else value
 
 STOPWORDS = {
     "about",
@@ -535,12 +545,14 @@ def generate_ad_copy(
     generic_page_feed_copy: bool = False,
     keyword_terms: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
-    settings = get_sync_setting_map(session)
-    api_key = str(settings.get("openai.api_key") or "")
-    model = str(settings.get("openai.model") or "gpt-5.2")
-    ai_mode = parse_bool(settings.get("ad_factory.ai_mode_default", True))
+    api_key = str(_setting_value(session, "openai.api_key", "") or "")
+    model = str(_setting_value(session, "openai.model", "gpt-5.2") or "gpt-5.2")
+    ai_mode = parse_bool(_setting_value(session, "ad_factory.ai_mode_default", True))
     try:
-        openai_timeout = int(settings.get("openai.ad_copy_timeout_seconds") or DEFAULT_OPENAI_COPY_TIMEOUT_SECONDS)
+        openai_timeout = int(
+            _setting_value(session, "openai.ad_copy_timeout_seconds", DEFAULT_OPENAI_COPY_TIMEOUT_SECONDS)
+            or DEFAULT_OPENAI_COPY_TIMEOUT_SECONDS
+        )
     except (TypeError, ValueError):
         openai_timeout = DEFAULT_OPENAI_COPY_TIMEOUT_SECONDS
     openai_timeout = max(3, min(openai_timeout, 20))

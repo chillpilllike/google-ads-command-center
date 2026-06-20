@@ -8,9 +8,9 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.ads.googleads.errors import GoogleAdsException
-from sqlalchemy import func, inspect as sa_inspect, select, text
+from sqlalchemy import func, inspect as sa_inspect, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session, defer, noload
+from sqlalchemy.orm import Session, defer, load_only, noload
 
 from app.app_settings import get_sync_setting_map, parse_bool
 from app.models import (
@@ -2535,18 +2535,17 @@ def _existing_automation_draft(
     ad_type: str,
     source_key: str,
 ) -> Optional[AdDraft]:
-    rows = session.scalars(
+    return session.scalar(
         select(AdDraft)
-        .where(AdDraft.account_id == account_id, AdDraft.ad_type == ad_type)
+        .options(load_only(AdDraft.id, AdDraft.status))
+        .where(
+            AdDraft.account_id == account_id,
+            AdDraft.ad_type == ad_type,
+            AdDraft.generated_assets["automation"]["source_key"].as_string() == source_key,
+        )
         .order_by(AdDraft.created_at.desc(), AdDraft.id.desc())
-        .limit(80)
-    ).all()
-    for row in rows:
-        assets = row.generated_assets if isinstance(row.generated_assets, dict) else {}
-        automation = assets.get("automation") if isinstance(assets.get("automation"), dict) else {}
-        if automation.get("source_key") == source_key:
-            return row
-    return None
+        .limit(1)
+    )
 
 
 def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
@@ -3804,25 +3803,33 @@ def upsert_automation_ad_draft(
         )
         session.add(draft)
         session.flush()
+        draft_id = draft.id
+        draft_status = draft.status
         created = True
     else:
-        draft = existing
-        draft.status = status
-        draft.website_url = website_url
-        draft.final_url = final_url
-        draft.business_name = business_name
-        draft.prompt = prompt
-        draft.generated_assets = generated_assets
-        draft.validation_json = validation_json
-        session.flush()
+        draft_id = existing.id
+        session.execute(
+            update(AdDraft)
+            .where(AdDraft.id == draft_id)
+            .values(
+                status=status,
+                website_url=website_url,
+                final_url=final_url,
+                business_name=business_name,
+                prompt=prompt,
+                generated_assets=generated_assets,
+                validation_json=validation_json,
+            )
+        )
+        draft_status = status
         created = False
     assets = generated_assets if isinstance(generated_assets, dict) else {}
     automation = assets.get("automation") if isinstance(assets.get("automation"), dict) else {}
     identity = assets.get("campaign_identity") if isinstance(assets.get("campaign_identity"), dict) else {}
     return {
-        "draft_id": draft.id,
+        "draft_id": draft_id,
         "ad_type": ad_type,
-        "status": draft.status,
+        "status": draft_status,
         "created": created,
         "source_key": source_key,
         "campaign_name": identity.get("campaign_name") or assets.get("campaign_name") or "",
@@ -4121,11 +4128,38 @@ def run_testing_campaign_automation(
             if target_limit > 0 and len(target_terms) >= target_limit:
                 return
 
-    fill_with_search_console_terms(core_rsa_terms, limit=keyword_limit)
-    fill_with_search_console_terms(core_max_clicks_terms, limit=keyword_limit)
-    fill_with_search_console_terms(testing_terms, limit=keyword_limit)
-    fill_with_search_console_terms(testing_max_clicks_terms, limit=keyword_limit)
-    fill_with_search_console_terms(fix_watch_terms, limit=keyword_limit)
+    def distribute_search_console_terms(*targets: list[str], limit: Optional[int] = None) -> None:
+        active_targets = [target for target in targets if isinstance(target, list)]
+        if not active_targets:
+            return
+        target_limit = int(limit or 0)
+        target_index = 0
+        for term in search_console_terms:
+            key = _term_key_from_text(term)
+            if not term or not key or key in term_ledger_keys:
+                continue
+            attempts = 0
+            selected_target: Optional[list[str]] = None
+            while attempts < len(active_targets):
+                candidate = active_targets[target_index % len(active_targets)]
+                target_index += 1
+                attempts += 1
+                if target_limit <= 0 or len(candidate) < target_limit:
+                    selected_target = candidate
+                    break
+            if selected_target is None:
+                return
+            term_ledger_keys.add(key)
+            selected_target.append(term)
+
+    distribute_search_console_terms(
+        core_rsa_terms,
+        core_max_clicks_terms,
+        testing_terms,
+        testing_max_clicks_terms,
+        fix_watch_terms,
+        limit=keyword_limit,
+    )
     testing_pmax_source_rows = available_keyword_rows_for_terms(keyword_rows, term_ledger_keys)
     testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(testing_pmax_theme_plan))
