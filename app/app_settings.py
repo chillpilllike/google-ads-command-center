@@ -224,6 +224,14 @@ SETTING_DEFINITIONS = [
         env_name="GOOGLE_ADS_ALLOW_TOTAL_BUDGET_INCREASE",
     ),
     SettingDefinition(
+        "live_campaign_creator.criteria_daily_item_limit",
+        "Daily criteria item limit",
+        "Safety controls",
+        "number",
+        1000,
+        "Maximum new keyword, URL inclusion, URL exclusion, negative keyword, and PMax search-theme items the live publisher may add per account per UTC day.",
+    ),
+    SettingDefinition(
         "optimizer.change_cooldown_hours",
         "Change cooldown hours",
         "Safety controls",

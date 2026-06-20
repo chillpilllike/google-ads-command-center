@@ -11,6 +11,7 @@ from app.services.google_ads_live_campaign_creator import (
     _create_ad_group_webpage_inclusions,
     _campaign_by_code_or_lane,
     _contains_shipping_offer_text,
+    _criteria_daily_reservation_plan,
     _create_search_campaign,
     _create_search_theme_signals,
     _draft_live_creation_control,
@@ -267,7 +268,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             ],
         )
 
-    def test_url_inclusion_urls_keeps_large_source_pool_for_progressive_sync(self) -> None:
+    def test_url_inclusion_urls_keeps_full_source_pool_for_progressive_sync(self) -> None:
         draft = SimpleNamespace(
             generated_assets={
                 "url_inclusion_targets": [
@@ -278,9 +279,9 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
 
         urls = _url_inclusion_urls_from_draft(draft)
 
-        self.assertEqual(len(urls), 500)
+        self.assertEqual(len(urls), 510)
         self.assertEqual(urls[0], "https://nutricity.ca/products/item-0")
-        self.assertEqual(urls[-1], "https://nutricity.ca/products/item-499")
+        self.assertEqual(urls[-1], "https://nutricity.ca/products/item-509")
 
     def test_url_inclusion_urls_drop_private_order_pages(self) -> None:
         draft = SimpleNamespace(
@@ -317,7 +318,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             ],
         )
 
-    def test_pmax_final_urls_are_capped_for_asset_group_payload(self) -> None:
+    def test_pmax_final_urls_keep_full_core_target_pool(self) -> None:
         urls = _pmax_final_urls_from_assets(
             {
                 "url_inclusion_targets": [
@@ -327,9 +328,9 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             "https://nutricity.ca",
         )
 
-        self.assertEqual(len(urls), 10)
+        self.assertEqual(len(urls), 25)
         self.assertEqual(urls[0], "https://nutricity.ca/shop/category-0")
-        self.assertEqual(urls[-1], "https://nutricity.ca/shop/category-9")
+        self.assertEqual(urls[-1], "https://nutricity.ca/shop/category-24")
 
     def test_dynamic_url_inclusions_use_exact_url_operator(self) -> None:
         class FakeAdGroupCriterionOperation:
@@ -576,6 +577,38 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             _clean_search_theme("5% Off A&B | Immune-Support (Canada) with Extra Long Product Title"),
             "5 Off A B Immune Support Canada with Extra Long",
         )
+
+    def test_daily_criteria_reservation_spreads_budget_across_scopes(self) -> None:
+        allowed_one, state = _criteria_daily_reservation_plan(
+            {},
+            limit=1000,
+            scope_count=4,
+            scope_key="exact_keywords:adgroup-1",
+            kind="exact_keywords",
+            requested=900,
+        )
+        allowed_two, state = _criteria_daily_reservation_plan(
+            state,
+            limit=1000,
+            scope_count=4,
+            scope_key="ad_group_url_inclusions:adgroup-2",
+            kind="ad_group_url_inclusions",
+            requested=900,
+        )
+        allowed_one_again, state = _criteria_daily_reservation_plan(
+            state,
+            limit=1000,
+            scope_count=4,
+            scope_key="exact_keywords:adgroup-1",
+            kind="exact_keywords",
+            requested=900,
+        )
+
+        self.assertEqual(allowed_one, 250)
+        self.assertEqual(allowed_two, 250)
+        self.assertEqual(allowed_one_again, 0)
+        self.assertEqual(state["used_items"], 500)
+        self.assertEqual(state["remaining_items"], 500)
 
     def test_pmax_group_copy_is_theme_specific_and_filters_shipping_offer(self) -> None:
         account = SimpleNamespace(name="Nutricity CA")

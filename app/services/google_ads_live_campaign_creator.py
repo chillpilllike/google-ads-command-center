@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import re
 import signal
 import threading
@@ -14,7 +15,7 @@ from google.ads.googleads.v24.errors.types.errors import GoogleAdsFailure
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.protobuf.json_format import MessageToDict
 import requests
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.app_settings import get_sync_setting_map, parse_bool
@@ -47,6 +48,9 @@ LIVE_PUBLISH_STATUSES = {
 SUPPORTED_AD_TYPES = {"dsa", "rsa", "pmax"}
 DSA_DISABLED_SETTING_PREFIX = "live_campaign_creator.dsa_disabled"
 LIVE_CREATION_QUOTA_COOLDOWN_PREFIX = "live_campaign_creator.quota_cooldown"
+CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.criteria_daily_item_limit"
+CRITERIA_DAILY_ITEM_STATE_PREFIX = "live_campaign_creator.criteria_daily_items"
+DEFAULT_CRITERIA_DAILY_ITEM_LIMIT = 1000
 LIVE_CAMPAIGN_PUBLISH_BATCH_LIMIT = 50
 URL_INCLUSION_MUTATION_BATCH_LIMIT = 100
 KEYWORD_MUTATION_BATCH_LIMIT = 100
@@ -115,6 +119,196 @@ def utcnow() -> datetime:
 
 def gaql_string(value: str) -> str:
     return "'" + str(value or "").replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _criteria_daily_state_key(account: GoogleAdsAccount, now: Optional[datetime] = None) -> str:
+    current = now or utcnow()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    day = current.astimezone(timezone.utc).date().isoformat()
+    customer_id = str(getattr(account, "customer_id", "") or getattr(account, "id", "") or "unknown")
+    return f"{CRITERIA_DAILY_ITEM_STATE_PREFIX}.{customer_id}.{day}"
+
+
+def _parse_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, 1)
+
+
+def _session_info(session: Any) -> dict[str, Any]:
+    info = getattr(session, "info", None)
+    if isinstance(info, dict):
+        return info
+    return {}
+
+
+def _criteria_daily_item_limit(session: Session) -> int:
+    info = _session_info(session)
+    cached = info.get("live_criteria_daily_item_limit")
+    if cached is not None:
+        return _parse_positive_int(cached, DEFAULT_CRITERIA_DAILY_ITEM_LIMIT)
+    if not hasattr(session, "scalar"):
+        return DEFAULT_CRITERIA_DAILY_ITEM_LIMIT
+    setting = session.scalar(select(AppSetting).where(AppSetting.key == CRITERIA_DAILY_ITEM_LIMIT_SETTING))
+    limit = _parse_positive_int(setting.value if setting is not None else None, DEFAULT_CRITERIA_DAILY_ITEM_LIMIT)
+    info["live_criteria_daily_item_limit"] = limit
+    return limit
+
+
+def _criteria_daily_scope_count(session: Session) -> int:
+    return _parse_positive_int(_session_info(session).get("live_criteria_scope_count"), 1)
+
+
+def _criteria_daily_reservation_plan(
+    state: dict[str, Any],
+    *,
+    limit: int,
+    scope_count: int,
+    scope_key: str,
+    kind: str,
+    requested: int,
+    now: Optional[datetime] = None,
+) -> tuple[int, dict[str, Any]]:
+    requested = max(int(requested or 0), 0)
+    limit = _parse_positive_int(limit, DEFAULT_CRITERIA_DAILY_ITEM_LIMIT)
+    scope_count = _parse_positive_int(scope_count, 1)
+    next_state = dict(state or {})
+    scopes = dict(next_state.get("scopes") or {})
+    used_items = max(int(next_state.get("used_items") or 0), 0)
+    remaining = max(limit - used_items, 0)
+    scope_key = str(scope_key or kind or "criteria")
+    scope_state = dict(scopes.get(scope_key) or {})
+    scope_used = max(int(scope_state.get("used_items") or 0), 0)
+    per_scope_cap = max(1, math.ceil(limit / scope_count))
+    scope_remaining = max(per_scope_cap - scope_used, 0)
+    allowed = min(requested, remaining, scope_remaining)
+    current = now or utcnow()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    scopes[scope_key] = {
+        **scope_state,
+        "kind": kind,
+        "used_items": scope_used + allowed,
+        "last_requested_items": requested,
+        "last_allowed_items": allowed,
+        "updated_at": current.isoformat(),
+    }
+    next_state.update(
+        {
+            "limit": limit,
+            "scope_count": scope_count,
+            "used_items": used_items + allowed,
+            "remaining_items": max(limit - used_items - allowed, 0),
+            "scopes": scopes,
+            "updated_at": current.isoformat(),
+        }
+    )
+    return allowed, next_state
+
+
+def _reserve_daily_criteria_items(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    scope_key: str,
+    requested: int,
+    validate_only: bool,
+) -> dict[str, Any]:
+    requested = max(int(requested or 0), 0)
+    if requested <= 0:
+        return {
+            "kind": kind,
+            "scope_key": scope_key,
+            "requested_items": 0,
+            "allowed_items": 0,
+            "daily_deferred_items": 0,
+            "remaining_items": 0,
+        }
+    if validate_only:
+        return {
+            "kind": kind,
+            "scope_key": scope_key,
+            "requested_items": requested,
+            "allowed_items": requested,
+            "daily_deferred_items": 0,
+            "remaining_items": None,
+            "validate_only": True,
+        }
+    if not hasattr(session, "execute") or not hasattr(session, "scalar"):
+        return {
+            "kind": kind,
+            "scope_key": scope_key,
+            "requested_items": requested,
+            "allowed_items": requested,
+            "daily_deferred_items": 0,
+            "remaining_items": None,
+            "non_db_session": True,
+        }
+    state_key = _criteria_daily_state_key(account)
+    lock_name = f"{CRITERIA_DAILY_ITEM_STATE_PREFIX}.{getattr(account, 'customer_id', '') or getattr(account, 'id', '')}"
+    session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"), {"lock_name": lock_name})
+    setting = session.scalar(select(AppSetting).where(AppSetting.key == state_key).with_for_update())
+    state = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    limit = _criteria_daily_item_limit(session)
+    allowed, next_state = _criteria_daily_reservation_plan(
+        state,
+        limit=limit,
+        scope_count=_criteria_daily_scope_count(session),
+        scope_key=scope_key,
+        kind=kind,
+        requested=requested,
+    )
+    if setting is None:
+        setting = AppSetting(
+            key=state_key,
+            value=next_state,
+            category="Automation pacing",
+            label=f"Daily criteria pacing {getattr(account, 'customer_id', '') or getattr(account, 'id', '')}",
+            help_text="Tracks daily Google Ads criteria additions so first-run keyword and URL sync does not exhaust API quota.",
+            input_type="json",
+            sensitive=False,
+        )
+        session.add(setting)
+    else:
+        setting.value = next_state
+    session.flush()
+    return {
+        "kind": kind,
+        "scope_key": scope_key,
+        "requested_items": requested,
+        "allowed_items": allowed,
+        "daily_deferred_items": max(requested - allowed, 0),
+        "limit": limit,
+        "scope_count": _criteria_daily_scope_count(session),
+        "used_items": int(next_state.get("used_items") or 0),
+        "remaining_items": int(next_state.get("remaining_items") or 0),
+        "state_key": state_key,
+    }
+
+
+def _limit_daily_criteria_items(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    scope_key: str,
+    items: list[Any],
+    validate_only: bool,
+) -> tuple[list[Any], dict[str, Any]]:
+    reservation = _reserve_daily_criteria_items(
+        session,
+        account,
+        kind=kind,
+        scope_key=scope_key,
+        requested=len(items),
+        validate_only=validate_only,
+    )
+    allowed = int(reservation.get("allowed_items") or 0)
+    return items[:allowed], reservation
 
 
 def _google_ads_search(service: Any, account: GoogleAdsAccount, query: str, *, timeout: int = 30) -> Any:
@@ -2081,6 +2275,7 @@ def _apply_ad_group_webpage_inclusions(
     account: GoogleAdsAccount,
     draft: AdDraft,
     *,
+    session: Session,
     ad_group_id: int,
     ad_group_resource_name: str,
     validate_only: bool,
@@ -2095,6 +2290,15 @@ def _apply_ad_group_webpage_inclusions(
         }
     existing = _existing_ad_group_webpage_inclusions(client, account, ad_group_id) if ad_group_id else set()
     to_create = [url for url in urls if _webpage_url_key(url) not in existing]
+    planned_to_create = len(to_create)
+    to_create, reservation = _limit_daily_criteria_items(
+        session,
+        account,
+        kind="ad_group_url_inclusions",
+        scope_key=f"ad_group_url_inclusions:{ad_group_resource_name}",
+        items=to_create,
+        validate_only=validate_only,
+    )
     resources = _create_ad_group_webpage_inclusions(
         client,
         account,
@@ -2105,7 +2309,10 @@ def _apply_ad_group_webpage_inclusions(
     return {
         "url_inclusion_count": len(urls),
         "existing_url_inclusion_count": len(existing),
+        "planned_new_url_inclusion_count": planned_to_create,
         "new_url_inclusion_count": len(to_create),
+        "daily_deferred_url_inclusion_count": max(planned_to_create - len(to_create), 0),
+        "url_inclusion_daily_budget": reservation,
         "url_inclusion_resources": resources,
     }
 
@@ -2361,6 +2568,7 @@ def _apply_campaign_negative_keywords(
     account: GoogleAdsAccount,
     draft: AdDraft,
     *,
+    session: Session,
     campaign_id: int,
     campaign_resource_name: str,
     validate_only: bool,
@@ -2375,6 +2583,15 @@ def _apply_campaign_negative_keywords(
         }
     existing = _existing_campaign_negative_exact_keywords(client, account, campaign_id) if campaign_id else set()
     to_create = [keyword for keyword in keywords if keyword not in existing]
+    planned_to_create = len(to_create)
+    to_create, reservation = _limit_daily_criteria_items(
+        session,
+        account,
+        kind="campaign_negative_keywords",
+        scope_key=f"campaign_negative_keywords:{campaign_resource_name}",
+        items=to_create,
+        validate_only=validate_only,
+    )
     resources = _create_campaign_negative_exact_keywords(
         client,
         account,
@@ -2385,7 +2602,10 @@ def _apply_campaign_negative_keywords(
     return {
         "negative_keyword_count": len(keywords),
         "existing_negative_keyword_count": len(existing),
+        "planned_new_negative_keyword_count": planned_to_create,
         "new_negative_keyword_count": len(to_create),
+        "daily_deferred_negative_keyword_count": max(planned_to_create - len(to_create), 0),
+        "negative_keyword_daily_budget": reservation,
         "negative_keyword_resources": resources,
     }
 
@@ -2395,6 +2615,7 @@ def _apply_campaign_negative_webpages(
     account: GoogleAdsAccount,
     draft: AdDraft,
     *,
+    session: Session,
     campaign_id: int,
     campaign_resource_name: str,
     validate_only: bool,
@@ -2409,6 +2630,15 @@ def _apply_campaign_negative_webpages(
         }
     existing = _existing_campaign_negative_webpages(client, account, campaign_id) if campaign_id else set()
     to_create = [url for url in urls if url.rstrip("/") not in existing]
+    planned_to_create = len(to_create)
+    to_create, reservation = _limit_daily_criteria_items(
+        session,
+        account,
+        kind="campaign_url_exclusions",
+        scope_key=f"campaign_url_exclusions:{campaign_resource_name}",
+        items=to_create,
+        validate_only=validate_only,
+    )
     resources = _create_campaign_negative_webpages(
         client,
         account,
@@ -2419,7 +2649,10 @@ def _apply_campaign_negative_webpages(
     return {
         "negative_page_count": len(urls),
         "existing_negative_page_count": len(existing),
+        "planned_new_negative_page_count": planned_to_create,
         "new_negative_page_count": len(to_create),
+        "daily_deferred_negative_page_count": max(planned_to_create - len(to_create), 0),
+        "negative_page_daily_budget": reservation,
         "negative_page_resources": resources,
     }
 
@@ -3787,6 +4020,7 @@ def publish_dsa_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -3805,6 +4039,7 @@ def publish_dsa_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -3875,6 +4110,7 @@ def publish_dsa_draft(
                     client,
                     account,
                     draft,
+                    session=session,
                     ad_group_id=ad_group_id,
                     ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
                     validate_only=validate_only,
@@ -3998,6 +4234,7 @@ def publish_dsa_draft(
                 client,
                 account,
                 draft,
+                session=session,
                 ad_group_id=ad_group_id,
                 ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
                 validate_only=validate_only,
@@ -4177,6 +4414,7 @@ def publish_rsa_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -4193,6 +4431,7 @@ def publish_rsa_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -4300,6 +4539,15 @@ def publish_rsa_draft(
             for keyword, info in existing_keyword_map.items()
             if keyword not in desired_keywords and str(info.get("status") or "").upper() == "ENABLED"
         ]
+        planned_keywords_to_create = len(keywords_to_create)
+        keywords_to_create, keyword_daily_budget = _limit_daily_criteria_items(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key=f"exact_keywords:{ad_group['ad_group_resource_name']}",
+            items=keywords_to_create,
+            validate_only=validate_only,
+        )
         enabled_keyword_resources = _enable_ad_group_criteria_if_needed(
             client,
             account,
@@ -4325,6 +4573,9 @@ def publish_rsa_draft(
             "enabled_existing_keyword_count": len(enabled_keyword_resources),
             "paused_stale_keyword_count": len(paused_keyword_resources),
             "new_keyword_count": len(keywords_to_create),
+            "planned_new_keyword_count": planned_keywords_to_create,
+            "daily_deferred_keyword_count": max(planned_keywords_to_create - len(keywords_to_create), 0),
+            "keyword_daily_budget": keyword_daily_budget,
             "keyword_resources": keyword_resources,
             "enabled_keyword_resources": enabled_keyword_resources,
             "paused_keyword_resources": paused_keyword_resources,
@@ -4359,6 +4610,7 @@ def publish_rsa_draft(
                 client,
                 account,
                 draft,
+                session=session,
                 ad_group_id=ad_group_id,
                 ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
                 validate_only=validate_only,
@@ -4551,6 +4803,7 @@ def publish_pmax_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -4567,6 +4820,7 @@ def publish_pmax_draft(
             client,
             account,
             draft,
+            session=session,
             campaign_id=campaign_id,
             campaign_resource_name=campaign_resource,
             validate_only=validate_only,
@@ -4720,6 +4974,15 @@ def publish_pmax_draft(
             search_theme_error = {"skipped_after_previous_timeout": search_theme_signals_blocked_reason}
         else:
             try:
+                planned_search_theme_signal_count = len(search_themes_to_create)
+                search_themes_to_create, search_theme_daily_budget = _limit_daily_criteria_items(
+                    session,
+                    account,
+                    kind="pmax_search_themes",
+                    scope_key=f"pmax_search_themes:{group_resource}",
+                    items=search_themes_to_create,
+                    validate_only=validate_only,
+                )
                 checkpoint("pmax_search_themes", "started", group_code=group_code, planned=len(search_themes_to_create))
                 signal_resources = _create_search_theme_signals(
                     client,
@@ -4728,9 +4991,16 @@ def publish_pmax_draft(
                     search_themes=search_themes_to_create,
                     campaign_theme_keys=campaign_search_theme_keys,
                     validate_only=validate_only,
-                    max_successes=missing_search_theme_count,
+                    max_successes=min(missing_search_theme_count, len(search_themes_to_create)),
                 )
                 checkpoint("pmax_search_themes", "done", group_code=group_code, created=len(signal_resources))
+                if len(search_themes_to_create) < planned_search_theme_signal_count:
+                    search_theme_error = {
+                        "daily_paced": True,
+                        "planned_new_search_theme_count": planned_search_theme_signal_count,
+                        "daily_deferred_search_theme_count": planned_search_theme_signal_count - len(search_themes_to_create),
+                        "search_theme_daily_budget": search_theme_daily_budget,
+                    }
             except GoogleAdsException as exc:
                 signal_resources = []
                 search_theme_error = {"google_ads_error": summarize_google_ads_exception(exc)}
@@ -4905,6 +5175,26 @@ def _live_publish_sort_key(draft: AdDraft) -> tuple[int, int, int]:
         LIVE_PUBLISH_AD_TYPE_PRIORITY.get(str(draft.ad_type or "").lower(), 99),
         -int(getattr(draft, "id", 0) or 0),
     )
+
+
+def _planned_criteria_scope_count(drafts: list[AdDraft]) -> int:
+    total = 0
+    for draft in drafts:
+        assets = dict(getattr(draft, "generated_assets", None) or {})
+        ad_type = str(getattr(draft, "ad_type", "") or "").lower()
+        if ad_type in {"dsa", "rsa", "pmax"} and _negative_keyword_texts_from_draft(draft):
+            total += 1
+        if ad_type in {"dsa", "rsa", "pmax"} and _negative_page_urls_from_draft(draft):
+            total += 1
+        if ad_type in {"dsa", "rsa"} and _url_inclusion_urls_from_draft(draft):
+            total += 1
+        if ad_type == "rsa" and _keyword_texts_from_draft(draft):
+            total += 1
+        if ad_type == "pmax":
+            for group in _pmax_asset_group_plan(assets):
+                if group.get("search_themes"):
+                    total += 1
+    return max(total, 1)
 
 
 def _compact_resource(value: Any) -> Any:
@@ -5187,6 +5477,10 @@ def publish_automation_campaigns(
     if not drafts:
         return {"name": "live_campaign_creation", "status": "skipped", "reason": "No eligible automation DSA/RSA drafts."}
 
+    session_info = _session_info(session)
+    previous_scope_count = session_info.get("live_criteria_scope_count")
+    criteria_scope_count = _planned_criteria_scope_count(drafts)
+    session_info["live_criteria_scope_count"] = criteria_scope_count
     client = build_client(settings, account.manager_customer_id, account.connection)
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -5366,12 +5660,17 @@ def publish_automation_campaigns(
         )
     )
     session.flush()
+    if previous_scope_count is None:
+        session_info.pop("live_criteria_scope_count", None)
+    else:
+        session_info["live_criteria_scope_count"] = previous_scope_count
     return {
         "name": "live_campaign_creation",
         "status": status,
         "validate_only": validate_only,
         "result_count": len(results),
         "error_count": len(errors),
+        "daily_criteria_scope_count": criteria_scope_count,
         "results": [_compact_live_result(item) for item in results],
         "errors": [_compact_live_result(item) for item in errors],
         "restricted_policy_terms": restricted_policy_result,
