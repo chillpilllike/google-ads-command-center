@@ -300,10 +300,15 @@
               </div>
             </div>
             {% if schedule_decision.status %}
+            {% set recommended_time = schedule_decision.get("recommended_time") %}
+            {% set schedule_time_zone = schedule_decision.get("time_zone") %}
+            {% set low_hour_impressions = schedule_decision.get("low_hour_impressions") %}
+            {% set peak_hour = schedule_decision.get("peak_hour") %}
+            {% set peak_hour_impressions = schedule_decision.get("peak_hour_impressions") %}
             <div class="alert alert-info mt-3 mb-0 automation-live-warning" role="alert">
-              Low-traffic runtime: {{ schedule_decision.recommended_time }} {{ schedule_decision.time_zone }}.
-              {% if schedule_decision.low_hour_impressions is not none %}
-              Lowest hour had {{ "{:,}".format(schedule_decision.low_hour_impressions) }} impressions; peak hour {{ schedule_decision.peak_hour }} had {{ "{:,}".format(schedule_decision.peak_hour_impressions) }}.
+              Low-traffic runtime: {{ recommended_time or "not decided" }} {{ schedule_time_zone or preference.schedule_timezone or "UTC" }}.
+              {% if low_hour_impressions is not none and peak_hour_impressions is not none %}
+              Lowest hour had {{ "{:,}".format(low_hour_impressions) }} impressions; peak hour {{ peak_hour or "not decided" }} had {{ "{:,}".format(peak_hour_impressions) }}.
               {% endif %}
             </div>
             {% endif %}
