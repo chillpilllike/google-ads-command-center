@@ -7,8 +7,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
-# Bust Docker cache whenever the public GitHub main branch changes.
-ADD https://api.github.com/repos/chillpilllike/google-ads-command-center/commits/main /tmp/github-version.json
+# Bust Docker cache whenever the public GitHub main branch changes. Use the
+# public commits feed instead of api.github.com because Coolify builds can fail
+# hard when the API endpoint returns a transient 5xx.
+ADD https://github.com/chillpilllike/google-ads-command-center/commits/main.atom /tmp/github-version.xml
 
 WORKDIR /src
 RUN git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" .
