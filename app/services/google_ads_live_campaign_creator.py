@@ -1189,6 +1189,7 @@ def enforce_automation_campaign_revisions(
                 "validate_only": bool(validate_only),
             },
         }
+    settings = get_sync_setting_map(session)
     client = build_client(settings, account.manager_customer_id, account.connection)
     rows = _automation_campaign_revision_rows(client, account)
     has_core_scale_s001_pmax = any(
