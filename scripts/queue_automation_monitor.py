@@ -9,9 +9,9 @@ import sys
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount
+from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount
 from app.runtime_role import primary_instance_required_result
 from app.services.google_ads_automation import (
     budget_guard_due_now,
@@ -25,6 +25,16 @@ from app.tasks import SessionLocal, run_google_ads_automation_monitor
 
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
 STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
+
+
+def automation_first_run_missing(session, account_id: int) -> bool:
+    active_draft_count = session.scalar(
+        select(func.count(AdDraft.id)).where(
+            AdDraft.account_id == int(account_id),
+            AdDraft.status.notin_(["retired", "removed"]),
+        )
+    )
+    return int(active_draft_count or 0) == 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +107,8 @@ def main() -> None:
                 reasons.append("budget_guard")
             if peak_due:
                 reasons.append("peak_budget")
+            if automation_first_run_missing(session, preference.account_id):
+                reasons.append("first_run_bootstrap")
             if reasons:
                 due_account_ids.append(preference.account_id)
                 due_reasons[preference.account_id] = reasons

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.dependencies import require_user, settings, templates
-from app.models import BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
+from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
 from app.runtime_role import primary_instance_required_result, runtime_role_status
 from app.app_settings import get_sync_setting_map
 from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
@@ -78,6 +78,48 @@ async def _preference_for(session: AsyncSession, account: GoogleAdsAccount) -> G
     await session.commit()
     await session.refresh(preference)
     return preference
+
+
+async def _automation_first_run_missing(session: AsyncSession, account_id: int) -> bool:
+    active_draft_count = await session.scalar(
+        select(func.count(AdDraft.id)).where(
+            AdDraft.account_id == int(account_id),
+            AdDraft.status.notin_(["retired", "removed"]),
+        )
+    )
+    return int(active_draft_count or 0) == 0
+
+
+async def _queue_automation_monitor_job(
+    session: AsyncSession,
+    *,
+    account_ids: list[int],
+    label: str,
+    requested_by_id: Optional[int],
+    force: bool = False,
+    budget_only: bool = False,
+    payload_extra: Optional[dict] = None,
+) -> BackgroundJob:
+    job = await create_background_job(
+        session,
+        job_type="google_ads_automation_monitor",
+        label=label,
+        requested_by_id=requested_by_id,
+        payload={
+            "account_ids": account_ids,
+            "force": bool(force),
+            "budget_only": bool(budget_only),
+            **(payload_extra or {}),
+        },
+    )
+    try:
+        from app.tasks import run_google_ads_automation_monitor
+
+        message = run_google_ads_automation_monitor.send(job.id, account_ids, bool(force), budget_only)
+        await save_job_message_id(session, job, str(message.message_id))
+    except Exception as exc:  # noqa: BLE001
+        await mark_job_dispatch_failed(session, job, str(exc))
+    return job
 
 
 @router.get("/automation", response_class=HTMLResponse)
@@ -318,7 +360,40 @@ async def save_automation_preferences(
                 fetch_time_zone=False,
             )
         )
-    return RedirectResponse(f"/automation?account_id={account.id}&saved=1", status_code=status.HTTP_303_SEE_OTHER)
+    queued_job_id = ""
+    if preference.automation_enabled and not was_enabled and primary_instance_required_result() is None:
+        first_run_missing = await _automation_first_run_missing(session, account.id)
+        active_job = await session.scalar(
+            select(BackgroundJob)
+            .where(
+                BackgroundJob.job_type == "google_ads_automation_monitor",
+                BackgroundJob.status.in_(
+                    [
+                        BackgroundJobStatus.queued,
+                        BackgroundJobStatus.running,
+                        BackgroundJobStatus.cancel_requested,
+                    ]
+                ),
+            )
+            .order_by(desc(BackgroundJob.created_at), desc(BackgroundJob.id))
+            .limit(1)
+        )
+        if first_run_missing and active_job is None:
+            job = await _queue_automation_monitor_job(
+                session,
+                account_ids=[account.id],
+                label=f"Automation first run: {account.name}",
+                requested_by_id=user.id,
+                force=True,
+                payload_extra={
+                    "customer_id": account.customer_id,
+                    "queued_by": "automation_preferences_enable",
+                    "due_reasons": {account.id: ["first_run_bootstrap"]},
+                },
+            )
+            queued_job_id = str(job.id)
+    job_query = f"&job_id={queued_job_id}" if queued_job_id else ""
+    return RedirectResponse(f"/automation?account_id={account.id}&saved=1{job_query}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.post("/automation/run")
@@ -338,25 +413,17 @@ async def queue_automation_monitor(
         preference.automation_enabled = True
         preference.last_keyword_pull_at = None
         await session.commit()
-    job = await create_background_job(
+    job = await _queue_automation_monitor_job(
         session,
-        job_type="google_ads_automation_monitor",
+        account_ids=[account.id],
         label=f"Automation monitor: {account.name}",
         requested_by_id=user.id,
-        payload={
-            "account_ids": [account.id],
+        force=_checked(force),
+        payload_extra={
             "customer_id": account.customer_id,
-            "force": _checked(force),
             "monitor_only": preference.monitor_only,
         },
     )
-    try:
-        from app.tasks import run_google_ads_automation_monitor
-
-        message = run_google_ads_automation_monitor.send(job.id, [account.id], _checked(force))
-        await save_job_message_id(session, job, str(message.message_id))
-    except Exception as exc:  # noqa: BLE001
-        await mark_job_dispatch_failed(session, job, str(exc))
     return RedirectResponse(
         f"/automation?account_id={account.id}&job_id={job.id}",
         status_code=status.HTTP_303_SEE_OTHER,
@@ -438,6 +505,9 @@ async def automation_scheduler_tick(
             reasons.append("budget_guard")
         if peak_due:
             reasons.append("peak_budget")
+        first_run_missing = await _automation_first_run_missing(session, preference.account_id)
+        if first_run_missing:
+            reasons.append("first_run_bootstrap")
         if force and not reasons:
             reasons.append("manual_force")
         if reasons:
