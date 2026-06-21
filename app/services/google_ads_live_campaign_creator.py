@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import re
@@ -46,6 +47,7 @@ LIVE_PUBLISH_STATUSES = {
     "published_paused",
 }
 SUPPORTED_AD_TYPES = {"dsa", "rsa", "pmax"}
+GOOGLE_ADS_API_QUOTA_PREFIX = "google_ads_asset_publish_quota"
 DSA_DISABLED_SETTING_PREFIX = "live_campaign_creator.dsa_disabled"
 LIVE_CREATION_QUOTA_COOLDOWN_PREFIX = "live_campaign_creator.quota_cooldown"
 CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.criteria_daily_item_limit"
@@ -1815,6 +1817,25 @@ def quota_cooldown_setting_key(account_id: int) -> str:
     return f"{LIVE_CREATION_QUOTA_COOLDOWN_PREFIX}:{int(account_id)}"
 
 
+def _developer_token_hash(account: GoogleAdsAccount) -> str:
+    token = ""
+    if account.connection is not None:
+        token = str(account.connection.developer_token or "")
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+def _api_quota_setting_matches_account(setting: AppSetting, account: GoogleAdsAccount) -> bool:
+    if setting.key == f"{GOOGLE_ADS_API_QUOTA_PREFIX}.{account.customer_id}":
+        return True
+    value = setting.value if isinstance(setting.value, dict) else {}
+    if value.get("connection_id") and account.connection_id and int(value["connection_id"]) == int(account.connection_id):
+        return True
+    token_hash = _developer_token_hash(account)
+    if token_hash and value.get("developer_token_hash") == token_hash:
+        return True
+    return False
+
+
 def _parse_retry_seconds(text: str) -> int:
     match = re.search(r"retry\s+in\s+(\d+)\s+seconds", str(text or ""), flags=re.IGNORECASE)
     if not match:
@@ -1838,26 +1859,44 @@ def _is_quota_exhausted_error(value: Any) -> bool:
     )
 
 
-def live_creation_quota_cooldown(session: Session, account_id: int) -> Optional[dict[str, Any]]:
+def live_creation_quota_cooldown(session: Session, account: Any) -> Optional[dict[str, Any]]:
     if not hasattr(session, "scalar"):
         return None
+    rows: list[AppSetting] = []
+    account_id = int(account.id if isinstance(account, GoogleAdsAccount) else account)
     setting = session.scalar(select(AppSetting).where(AppSetting.key == quota_cooldown_setting_key(account_id)))
-    if setting is None or not isinstance(setting.value, dict):
-        return None
-    payload = setting.value
-    retry_at_raw = str(payload.get("retry_at") or "")
-    try:
-        retry_at = datetime.fromisoformat(retry_at_raw)
-    except ValueError:
-        return None
+    if setting is not None:
+        rows.append(setting)
+    if isinstance(account, GoogleAdsAccount) and hasattr(session, "scalars"):
+        rows.extend(
+            item
+            for item in session.scalars(select(AppSetting).where(AppSetting.key.like(f"{GOOGLE_ADS_API_QUOTA_PREFIX}.%"))).all()
+            if _api_quota_setting_matches_account(item, account)
+        )
+    active: list[tuple[datetime, AppSetting]] = []
     now = utcnow()
-    if retry_at <= now:
+    for item in rows:
+        if item is None or not isinstance(item.value, dict):
+            continue
+        retry_at_raw = str(item.value.get("retry_at") or item.value.get("retry_not_before") or "")
+        try:
+            retry_at = datetime.fromisoformat(retry_at_raw)
+        except ValueError:
+            continue
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        if retry_at > now:
+            active.append((retry_at, item))
+    if not active:
         return None
+    retry_at, setting = max(active, key=lambda pair: pair[0])
+    payload = setting.value if isinstance(setting.value, dict) else {}
     return {
         "status": "deferred_quota",
         "retry_at": retry_at.isoformat(),
         "retry_seconds_remaining": int((retry_at - now).total_seconds()),
         "reason": str(payload.get("reason") or "Google Ads mutation quota is cooling down."),
+        "quota_key": setting.key,
     }
 
 
@@ -1886,6 +1925,33 @@ def defer_live_creation_for_quota(session: Session, account: GoogleAdsAccount, e
         )
     else:
         setting.value = payload
+    if account.connection_id:
+        connection_payload = {
+            "reason": "Google Ads API basic-access operations quota exhausted during live campaign/asset automation.",
+            "connection_id": account.connection_id,
+            "developer_token_hash": _developer_token_hash(account),
+            "customer_id": account.customer_id,
+            "account_id": account.id,
+            "recorded_at": utcnow().isoformat(),
+            "retry_not_before": retry_at.isoformat(),
+            "retry_after_seconds": retry_seconds,
+            "error": error_text[:1000],
+        }
+        connection_key = f"{GOOGLE_ADS_API_QUOTA_PREFIX}.connection.{account.connection_id}"
+        connection_setting = session.scalar(select(AppSetting).where(AppSetting.key == connection_key))
+        if connection_setting is None:
+            session.add(
+                AppSetting(
+                    key=connection_key,
+                    value=connection_payload,
+                    category="automation",
+                    label="Google Ads API connection quota cooldown",
+                    help_text="Automatically set when Google Ads basic-access operations quota is exhausted for a shared connection.",
+                    input_type="json",
+                )
+            )
+        else:
+            connection_setting.value = connection_payload
     session.flush()
     browser_queue: dict[str, Any] = {}
     try:
@@ -5859,7 +5925,7 @@ def publish_automation_campaigns(
                 "validate_only": bool(validate_only),
             },
         }
-    quota_cooldown = None if validate_only else live_creation_quota_cooldown(session, account.id)
+    quota_cooldown = None if validate_only else live_creation_quota_cooldown(session, account)
     if quota_cooldown is not None:
         return {
             "name": "live_campaign_creation",
@@ -6029,7 +6095,7 @@ def publish_automation_campaigns(
                 break
 
     restricted_policy_result: Optional[dict[str, Any]] = None
-    quota_cooldown = None if validate_only else live_creation_quota_cooldown(session, account.id)
+    quota_cooldown = None if validate_only else live_creation_quota_cooldown(session, account)
     if quota_cooldown is not None:
         restricted_policy_result = {"name": "restricted_policy_terms", **quota_cooldown}
     else:
