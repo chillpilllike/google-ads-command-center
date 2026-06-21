@@ -7814,6 +7814,15 @@ def run_account_automation_monitor(
     summary["steps"].append(campaign_plan_step)
 
     live_campaign_creation_step: Optional[dict[str, Any]] = None
+    def step_has_suspended_account_error(step: Optional[dict[str, Any]]) -> bool:
+        if not isinstance(step, dict):
+            return False
+        try:
+            payload = json.dumps(step, default=str)
+        except Exception:
+            payload = str(step)
+        return "ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT" in payload or "account is suspended" in payload.lower()
+
     if preference.auto_create_campaigns_enabled:
         if google_ads_api_blocked:
             live_campaign_creation_step = {
@@ -7867,7 +7876,13 @@ def run_account_automation_monitor(
             settings_map = get_sync_setting_map(session)
             allow_mutations = parse_bool(settings_map.get("optimizer.allow_mutations", False))
             dry_run = parse_bool(settings_map.get("optimizer.dry_run", True))
-            if google_ads_api_blocked:
+            if step_has_suspended_account_error(live_campaign_creation_step):
+                asset_publication_step = {
+                    "name": "live_asset_publication",
+                    "status": "blocked_by_suspended_account",
+                    "reason": "Skipped asset mutations because Google Ads rejected campaign creation with ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT.",
+                }
+            elif google_ads_api_blocked:
                 asset_publication_step = {
                     "name": "live_asset_publication",
                     "status": "blocked_by_google_quota",
@@ -8047,11 +8062,25 @@ def run_account_automation_monitor(
         live_switch_status(switch_name)
         for switch_name in enabled_live_switches
     ]
+    suspended_account_block = step_has_suspended_account_error(live_campaign_creation_step) or step_has_suspended_account_error(asset_publication_step)
+    if suspended_account_block:
+        summary["status"] = "blocked_by_suspended_account"
+        summary["google_ads_account_suspended"] = True
+        preference.monitor_only = True
+        preference.auto_create_campaigns_enabled = False
+        preference.auto_apply_keywords_enabled = False
+        preference.auto_apply_negatives_enabled = False
+        preference.auto_pause_campaigns_enabled = False
+        preference.last_error = (
+            "Google Ads rejected live automation because this account is suspended "
+            "(ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT). Automation was switched to monitor-only for this account."
+        )
+    else:
+        preference.last_error = None
     summary["finished_at"] = utcnow().isoformat()
     preference.last_run_at = utcnow()
     preference.last_analysis_at = preference.last_run_at
     preference.strategy_summary_json = summary
-    preference.last_error = None
     session.commit()
     return summary
 
