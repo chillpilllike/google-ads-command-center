@@ -1309,6 +1309,85 @@ def enforce_automation_campaign_revisions(
     }
 
 
+def pause_automation_campaigns_for_account(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    if account is None:
+        return {"name": "pause_automation_campaigns", "status": "skipped", "reason": "Missing Google Ads account."}
+    allow_mutations = parse_bool(_sync_setting_value(session, "optimizer.allow_mutations", False))
+    dry_run = parse_bool(_sync_setting_value(session, "optimizer.dry_run", True))
+    if not validate_only and (not allow_mutations or dry_run):
+        return {
+            "name": "pause_automation_campaigns",
+            "status": "blocked_by_mutation_guard",
+            "reason": "Global mutation guards block live campaign pausing until Allow mutations is on and Dry run is off.",
+            "guard": {
+                "optimizer_allow_mutations": allow_mutations,
+                "optimizer_dry_run": dry_run,
+                "validate_only": bool(validate_only),
+            },
+        }
+    settings = get_sync_setting_map(session)
+    client = build_client(settings, account.manager_customer_id, account.connection)
+    rows = _automation_campaign_revision_rows(client, account)
+    paused: list[dict[str, Any]] = []
+    already_paused: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for campaign in rows:
+        if str(campaign.get("campaign_status") or "").upper() == "PAUSED":
+            already_paused.append(
+                {
+                    "campaign_id": campaign.get("campaign_id"),
+                    "campaign_name": campaign.get("campaign_name"),
+                    "campaign_status": campaign.get("campaign_status"),
+                }
+            )
+            continue
+        try:
+            resource_name = _pause_campaign_if_needed(client, account, campaign, validate_only=validate_only)
+            paused.append(
+                {
+                    "campaign_id": campaign.get("campaign_id"),
+                    "campaign_name": campaign.get("campaign_name"),
+                    "resource_name": resource_name,
+                }
+            )
+        except GoogleAdsException as exc:
+            errors.append(
+                {
+                    "campaign_id": campaign.get("campaign_id"),
+                    "campaign_name": campaign.get("campaign_name"),
+                    "error": summarize_google_ads_exception(exc),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(
+                {
+                    "campaign_id": campaign.get("campaign_id"),
+                    "campaign_name": campaign.get("campaign_name"),
+                    "error": str(exc)[:500],
+                }
+            )
+    status = "failed" if errors and not paused else "partial" if errors else "paused"
+    if not rows:
+        status = "skipped"
+    return {
+        "name": "pause_automation_campaigns",
+        "status": status,
+        "validate_only": bool(validate_only),
+        "automation_campaign_count": len(rows),
+        "paused_count": len(paused),
+        "already_paused_count": len(already_paused),
+        "error_count": len(errors),
+        "paused": paused,
+        "already_paused": already_paused,
+        "errors": errors,
+    }
+
+
 def _ad_group_by_name(client: Any, account: GoogleAdsAccount, campaign_id: int, name: str) -> Optional[dict[str, Any]]:
     query = f"""
         SELECT

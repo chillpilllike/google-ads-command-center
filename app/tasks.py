@@ -53,6 +53,7 @@ from app.services.google_ads_assets import generate_account_assets
 from app.services.google_ads_automation import enabled_automation_preferences, run_account_automation_monitor
 from app.services.google_ads_autopilot import run_account_autopilot
 from app.services.google_ads_brand_lists import sync_account_brand_list_candidates
+from app.services.google_ads_live_campaign_creator import pause_automation_campaigns_for_account
 from app.services.campaign_optimizer import run_campaign_optimization
 from app.services.google_ads_goals import sync_account_conversion_goals
 from app.services.google_ads_page_feed_publisher import publish_page_feeds_for_mappings
@@ -2085,6 +2086,110 @@ def run_google_ads_automation_monitor(
                     with SessionLocal() as finish_session:
                         mark_job_finished(finish_session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
                 raise
+
+
+@dramatiq.actor(max_retries=0, time_limit=30 * 60 * 1000)
+def pause_google_ads_automation_campaigns(
+    job_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    validate_only: bool = False,
+) -> None:
+    with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+        with SessionLocal() as session:
+            runtime_block = primary_instance_required_result()
+            if runtime_block is not None:
+                mark_job_started(session, job_id, total=0)
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.succeeded,
+                    current=0,
+                    error=str(runtime_block.get("message")),
+                )
+                return
+            if not mark_job_started(session, job_id, total=1):
+                return
+            account = session.get(GoogleAdsAccount, int(account_id or 0))
+            if account is None:
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=0, error="Google Ads account not found.")
+                return
+            api_lease = acquire_google_ads_api_account_lease(
+                session,
+                account,
+                job_id=job_id,
+                purpose="pause_google_ads_automation_campaigns",
+            )
+            if not api_lease.get("acquired"):
+                job = session.get(BackgroundJob, job_id) if job_id else None
+                if job is not None:
+                    payload = dict(job.payload or {})
+                    payload["result"] = {
+                        "name": "pause_automation_campaigns",
+                        "status": api_lease.get("status") or "skipped",
+                        "reason": api_lease.get("reason"),
+                        "active_job_id": api_lease.get("active_job_id"),
+                        "active_purpose": api_lease.get("active_purpose"),
+                        "retry_not_before": api_lease.get("retry_not_before"),
+                    }
+                    job.payload = payload
+                    session.commit()
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.failed,
+                    current=0,
+                    error=str(api_lease.get("reason") or "Google Ads API account lease is active."),
+                )
+                return
+            try:
+                result = pause_automation_campaigns_for_account(session, account, validate_only=validate_only)
+                job = session.get(BackgroundJob, job_id) if job_id else None
+                if job is not None:
+                    payload = dict(job.payload or {})
+                    payload["result"] = result
+                    job.payload = payload
+                    session.commit()
+                status = (
+                    BackgroundJobStatus.failed
+                    if result.get("status") in {"failed", "blocked_by_mutation_guard"}
+                    else BackgroundJobStatus.succeeded
+                )
+                mark_job_finished(
+                    session,
+                    job_id,
+                    status,
+                    current=1,
+                    error=None
+                    if status == BackgroundJobStatus.succeeded
+                    else str(result.get("reason") or result.get("errors") or "Pause failed.")[:2000],
+                )
+            except GoogleAdsException as exc:
+                session.rollback()
+                record_google_ads_api_error(
+                    session,
+                    exc,
+                    account=account,
+                    job_id=job_id,
+                    context="pause_google_ads_automation_campaigns",
+                    severity="manual_action_required",
+                )
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=0, error=str(exc)[:2000])
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                record_google_ads_generic_error(
+                    session,
+                    exc,
+                    account=account,
+                    job_id=job_id,
+                    context="pause_google_ads_automation_campaigns",
+                    severity="manual_action_required",
+                )
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=0, error=str(exc)[:2000])
+            finally:
+                try:
+                    release_google_ads_api_account_lease(session, account, job_id=job_id)
+                except Exception:
+                    session.rollback()
 
 
 @dramatiq.actor(max_retries=0, time_limit=60 * 60 * 1000)

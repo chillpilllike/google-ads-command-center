@@ -122,6 +122,36 @@ async def _queue_automation_monitor_job(
     return job
 
 
+async def _queue_pause_automation_campaigns_job(
+    session: AsyncSession,
+    *,
+    account: GoogleAdsAccount,
+    requested_by_id: Optional[int],
+    validate_only: bool = False,
+    payload_extra: Optional[dict] = None,
+) -> BackgroundJob:
+    job = await create_background_job(
+        session,
+        job_type="google_ads_pause_automation_campaigns",
+        label=f"Pause automation campaigns: {account.name}",
+        requested_by_id=requested_by_id,
+        payload={
+            "account_id": account.id,
+            "customer_id": account.customer_id,
+            "validate_only": bool(validate_only),
+            **(payload_extra or {}),
+        },
+    )
+    try:
+        from app.tasks import pause_google_ads_automation_campaigns
+
+        message = pause_google_ads_automation_campaigns.send(job.id, account.id, bool(validate_only))
+        await save_job_message_id(session, job, str(message.message_id))
+    except Exception as exc:  # noqa: BLE001
+        await mark_job_dispatch_failed(session, job, str(exc))
+    return job
+
+
 @router.get("/automation", response_class=HTMLResponse)
 async def automation_page(
     request: Request,
@@ -361,7 +391,15 @@ async def save_automation_preferences(
             )
         )
     queued_job_id = ""
-    if preference.automation_enabled and not was_enabled and primary_instance_required_result() is None:
+    if was_enabled and not preference.automation_enabled and primary_instance_required_result() is None:
+        job = await _queue_pause_automation_campaigns_job(
+            session,
+            account=account,
+            requested_by_id=user.id,
+            payload_extra={"queued_by": "automation_preferences_disable"},
+        )
+        queued_job_id = str(job.id)
+    elif preference.automation_enabled and not was_enabled and primary_instance_required_result() is None:
         first_run_missing = await _automation_first_run_missing(session, account.id)
         active_job = await session.scalar(
             select(BackgroundJob)
