@@ -409,23 +409,23 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             ["customers/3495463031/assets/1", "customers/3495463031/assets/3"],
         )
 
-    def test_create_search_campaign_uses_max_clicks_cpc_cap(self) -> None:
+    def test_create_search_campaign_defaults_to_conversion_value_not_max_clicks(self) -> None:
         client = self.FakeGoogleAdsClient()
         account = SimpleNamespace(customer_id="3495463031")
 
         resource_name = _create_search_campaign(
             client,
             account,
-            name="AUTO | Testing / Discovery | RSA Max Clicks CPC Cap Keywords | AUTO-TST",
+            name="AUTO | Testing / Discovery | RSA Target ROAS Keywords | AUTO-TST",
             budget_resource_name="customers/3495463031/campaignBudgets/1",
             max_cpc_micros=2_500_000,
-            bidding={"strategy": "maximize_clicks_cpc_cap", "max_cpc_bid_limit": 2.5},
+            bidding={},
             validate_only=False,
         )
 
         campaign = client.campaign_service.last_request.operations[0].create
         self.assertEqual(resource_name, "customers/3495463031/campaigns/123")
-        self.assertEqual(campaign.target_spend.cpc_bid_ceiling_micros, 2_500_000)
+        self.assertEqual(campaign.target_spend.cpc_bid_ceiling_micros, 0)
 
     def test_create_search_campaign_can_enable_ai_max_for_dsa_lane(self) -> None:
         client = self.FakeGoogleAdsClient()

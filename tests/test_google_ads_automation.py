@@ -31,6 +31,7 @@ from app.services.google_ads_automation import (
     peak_budget_due_now,
     peak_budget_restore_due_now,
     claim_keyword_terms,
+    core_owned_keyword_rows_for_scale_migration,
     pmax_search_theme_plan,
     preference_due_now,
     refresh_peak_budget_decision,
@@ -302,7 +303,17 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         self.assertIn("20.0%", intervals["Peak conversion budget"]["detail"])
         self.assertIn("rolling 7-day window", intervals["Odoo sales guard"]["detail"])
         self.assertIn("Target ROAS RSA", intervals["Testing campaign bootstrap"]["detail"])
-        self.assertIn("Maximize Clicks CPC-cap RSA", intervals["Testing campaign bootstrap"]["detail"])
+        self.assertNotIn("Maximize Clicks", intervals["Testing campaign bootstrap"]["detail"])
+
+    def test_inr_waste_budget_uses_currency_specific_fixed_amount(self) -> None:
+        account = GoogleAdsAccount(id=640, name="Nutricity India", customer_id="7373005276", currency_code="INR")
+        preference = GoogleAdsAutomationPreference(account_id=640, account=account, automation_enabled=True)
+
+        summary = automation_strategy_summary(preference)
+        categories = {item["name"]: item for item in summary["campaign_categories"]}
+
+        self.assertEqual(categories["Waste / Recovery"]["badge"], "Fixed 4,000 INR")
+        self.assertEqual(summary["quota"]["waste_fixed_daily_budget"], 4000.0)
 
     def test_live_creation_control_holds_only_pmax_until_search_conversion_gate(self) -> None:
         thin_decision = {
@@ -596,6 +607,31 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         self.assertEqual(first_terms, ["theme 3", "theme 4", "theme 5"])
         self.assertEqual(second_terms, ["theme 6", "theme 7"])
         self.assertEqual(len(set(first_terms + second_terms)), 5)
+
+    def test_scale_migration_uses_same_account_keywords_only(self) -> None:
+        account = GoogleAdsAccount(id=637, customer_id="3495463031", name="Nutricity CA")
+        rows = [
+            GoogleAdsKeywordCandidate(
+                id=1,
+                account_id=637,
+                keyword="vitamin c canada",
+                normalized_keyword="vitamin c canada",
+                quality_label="converting",
+                score=100,
+            ),
+            GoogleAdsKeywordCandidate(
+                id=2,
+                account_id=999,
+                keyword="cross account winner",
+                normalized_keyword="cross account winner",
+                quality_label="converting",
+                score=500,
+            ),
+        ]
+
+        owned = core_owned_keyword_rows_for_scale_migration(rows, account)
+
+        self.assertEqual([row.keyword for row in owned], ["vitamin c canada"])
 
     def test_pmax_search_theme_plan_starts_new_campaign_after_100_asset_groups(self) -> None:
         rows = [

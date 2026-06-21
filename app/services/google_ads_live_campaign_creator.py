@@ -1007,7 +1007,7 @@ def _automation_campaign_revision_plan(name: str) -> Optional[dict[str, Any]]:
     if "| rsa " not in lowered and " rsa " not in lowered:
         return None
     if "cpc cap" in lowered:
-        return {**ai_max_plan, "strategy": "max_clicks_cpc_cap", "lane": "rsa_max_clicks_cpc_cap"}
+        return {**ai_max_plan, "strategy": "retired_max_clicks", "lane": "legacy_max_clicks_paused"}
     if is_core_scale:
         desired_name = re.sub(r"RSA Max Clicks Scale Keywords", "RSA Target ROAS Scale Keywords", str(name), flags=re.I)
         return {**ai_max_plan, "strategy": "target_roas", "target_roas": CORE_SCALE_TARGET_ROAS, "desired_name": desired_name, "lane": "core_rsa_target_roas"}
@@ -1021,6 +1021,30 @@ def _automation_campaign_revision_plan(name: str) -> Optional[dict[str, Any]]:
         desired_name = re.sub(r"RSA Max Clicks Recovery Keywords", "RSA Target ROAS Recovery Keywords", str(name), flags=re.I)
         return {**ai_max_plan, "strategy": "target_roas", "target_roas": WASTE_RECOVERY_TARGET_ROAS, "desired_name": desired_name, "lane": "waste_rsa_target_roas"}
     return None
+
+
+def _is_legacy_max_clicks_auto_campaign(campaign: dict[str, Any], plan: dict[str, Any] | None) -> bool:
+    name = str(campaign.get("campaign_name") or "").lower()
+    strategy = str(campaign.get("bidding_strategy_type") or "").upper()
+    lane = str((plan or {}).get("lane") or "").lower()
+    return (
+        "auto |" in name
+        and (
+            "max clicks" in name
+            or "cpc cap" in name
+            or "max_clicks" in lane
+            or strategy in {"TARGET_SPEND", "MAXIMIZE_CLICKS"}
+        )
+    )
+
+
+def _legacy_max_clicks_paused_name(name: str) -> str:
+    text = str(name or "").strip() or "AUTO | Legacy Max Clicks"
+    text = re.sub(r"RSA Max Clicks CPC Cap", "RSA Legacy Paused", text, flags=re.I)
+    text = re.sub(r"RSA Max Clicks", "RSA Legacy Paused", text, flags=re.I)
+    if "legacy paused" not in text.lower():
+        text = f"{text} Legacy Paused"
+    return text[:255]
 
 
 def _automation_campaign_revision_rows(client: Any, account: GoogleAdsAccount) -> list[dict[str, Any]]:
@@ -1163,10 +1187,6 @@ def _apply_campaign_revision(
             update._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)
         operation.update_mask.paths.append("maximize_conversion_value.target_roas")
         changed.append("target_roas")
-    elif strategy == "max_clicks_cpc_cap":
-        update.target_spend.cpc_bid_ceiling_micros = _micros(_max_cpc_bid_limit_for_account(account))
-        operation.update_mask.paths.append("target_spend.cpc_bid_ceiling_micros")
-        changed.append("max_clicks_cpc_cap")
     if not operation.update_mask.paths:
         return []
     request = client.get_type("MutateCampaignsRequest")
@@ -1219,6 +1239,13 @@ def enforce_automation_campaign_revisions(
         if not plan:
             skipped += 1
             continue
+        if _is_legacy_max_clicks_auto_campaign(campaign, plan):
+            plan = {
+                **plan,
+                "lane": "legacy_max_clicks_paused",
+                "pause": True,
+                "desired_name": _legacy_max_clicks_paused_name(str(campaign.get("campaign_name") or "")),
+            }
         campaign_name_lower = str(campaign.get("campaign_name") or "").lower()
         if (
             has_core_scale_s001_pmax
@@ -1946,18 +1973,11 @@ def _create_search_campaign(
             )
         except Exception:  # noqa: BLE001 - older client/test doubles may not expose AI Max yet.
             pass
-    if strategy == "maximize_conversion_value_target_roas":
-        if target_roas > 0:
-            campaign.maximize_conversion_value.target_roas = float(target_roas)
-        else:
-            maximize_conversion_value = client.get_type("MaximizeConversionValue")
-            campaign._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)
+    if strategy == "maximize_conversion_value_target_roas" and target_roas > 0:
+        campaign.maximize_conversion_value.target_roas = float(target_roas)
     else:
-        if domain_name:
-            manual_cpc = client.get_type("ManualCpc")
-            campaign._pb.manual_cpc.CopyFrom(manual_cpc._pb)
-        else:
-            campaign.target_spend.cpc_bid_ceiling_micros = int(max_cpc_micros)
+        maximize_conversion_value = client.get_type("MaximizeConversionValue")
+        campaign._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)
     _set_campaign_safety_fields(client, campaign)
     request = client.get_type("MutateCampaignsRequest")
     request.customer_id = account.customer_id
@@ -2463,25 +2483,29 @@ def _create_campaign_negative_exact_keywords(
     keywords: list[str],
     validate_only: bool,
 ) -> list[str]:
-    operations = []
-    for keyword in keywords[:100]:
-        operation = client.get_type("CampaignCriterionOperation")
-        criterion = operation.create
-        criterion.campaign = campaign_resource_name
-        criterion.negative = True
-        criterion.status = client.enums.CampaignCriterionStatusEnum.ENABLED
-        criterion.keyword.text = keyword
-        criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
-        operations.append(operation)
-    if not operations:
-        return []
-    request = client.get_type("MutateCampaignCriteriaRequest")
-    request.customer_id = account.customer_id
-    request.operations.extend(operations)
-    request.partial_failure = True
-    request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("CampaignCriterionService"), "mutate_campaign_criteria", request)
-    return _successful_resource_names(response)
+    resources: list[str] = []
+    service = client.get_service("CampaignCriterionService")
+    for start in range(0, len(keywords), KEYWORD_MUTATION_BATCH_LIMIT):
+        operations = []
+        for keyword in keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]:
+            operation = client.get_type("CampaignCriterionOperation")
+            criterion = operation.create
+            criterion.campaign = campaign_resource_name
+            criterion.negative = True
+            criterion.status = client.enums.CampaignCriterionStatusEnum.ENABLED
+            criterion.keyword.text = keyword
+            criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
+            operations.append(operation)
+        if not operations:
+            continue
+        request = client.get_type("MutateCampaignCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations)
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(service, "mutate_campaign_criteria", request)
+        resources.extend(_successful_resource_names(response))
+    return resources
 
 
 def _create_campaign_negative_webpages(
@@ -2492,28 +2516,32 @@ def _create_campaign_negative_webpages(
     urls: list[str],
     validate_only: bool,
 ) -> list[str]:
-    operations = []
-    for url in urls[:100]:
-        operation = client.get_type("CampaignCriterionOperation")
-        criterion = operation.create
-        criterion.campaign = campaign_resource_name
-        criterion.negative = True
-        criterion.status = client.enums.CampaignCriterionStatusEnum.ENABLED
-        criterion.webpage.criterion_name = _clip(f"AUTO excluded page | {url}", 255)
-        condition = client.get_type("WebpageConditionInfo")
-        condition.operand = client.enums.WebpageConditionOperandEnum.URL
-        condition.argument = url
-        criterion.webpage.conditions.append(condition)
-        operations.append(operation)
-    if not operations:
-        return []
-    request = client.get_type("MutateCampaignCriteriaRequest")
-    request.customer_id = account.customer_id
-    request.operations.extend(operations)
-    request.partial_failure = True
-    request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("CampaignCriterionService"), "mutate_campaign_criteria", request)
-    return _successful_resource_names(response)
+    resources: list[str] = []
+    service = client.get_service("CampaignCriterionService")
+    for start in range(0, len(urls), URL_INCLUSION_MUTATION_BATCH_LIMIT):
+        operations = []
+        for url in urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]:
+            operation = client.get_type("CampaignCriterionOperation")
+            criterion = operation.create
+            criterion.campaign = campaign_resource_name
+            criterion.negative = True
+            criterion.status = client.enums.CampaignCriterionStatusEnum.ENABLED
+            criterion.webpage.criterion_name = _clip(f"AUTO excluded page | {url}", 255)
+            condition = client.get_type("WebpageConditionInfo")
+            condition.operand = client.enums.WebpageConditionOperandEnum.URL
+            condition.argument = url
+            criterion.webpage.conditions.append(condition)
+            operations.append(operation)
+        if not operations:
+            continue
+        request = client.get_type("MutateCampaignCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations)
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(service, "mutate_campaign_criteria", request)
+        resources.extend(_successful_resource_names(response))
+    return resources
 
 
 def _existing_campaign_location_targets(client: Any, account: GoogleAdsAccount, campaign_id: int) -> list[dict[str, str]]:

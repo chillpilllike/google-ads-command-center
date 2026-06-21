@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
@@ -22,6 +22,9 @@ from app.services.google_ads_automation import (
     refresh_peak_budget_decision,
 )
 from app.tasks import SessionLocal, run_google_ads_automation_monitor
+
+STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
+STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +108,34 @@ def main() -> None:
             if decisions:
                 print({"schedule_decisions": decisions})
             return
+        stale_queued_before = now - STALE_QUEUED_AUTOMATION_JOB_AFTER
+        stale_jobs = session.scalars(
+            select(BackgroundJob).where(
+                BackgroundJob.job_type == "google_ads_automation_monitor",
+                BackgroundJob.status == BackgroundJobStatus.queued,
+                BackgroundJob.started_at.is_(None),
+                BackgroundJob.created_at < stale_queued_before,
+            )
+        ).all()
+        for stale_job in stale_jobs:
+            stale_job.status = BackgroundJobStatus.failed
+            stale_job.finished_at = now
+            stale_job.error = "Stale queued automation job never started; marked failed so scheduler can resume."
+        stale_running_before = now - STALE_RUNNING_AUTOMATION_JOB_AFTER
+        stale_running_jobs = session.scalars(
+            select(BackgroundJob).where(
+                BackgroundJob.job_type == "google_ads_automation_monitor",
+                BackgroundJob.status.in_([BackgroundJobStatus.running, BackgroundJobStatus.cancel_requested]),
+                BackgroundJob.started_at.is_not(None),
+                BackgroundJob.started_at < stale_running_before,
+            )
+        ).all()
+        for stale_job in stale_running_jobs:
+            stale_job.status = BackgroundJobStatus.failed
+            stale_job.finished_at = now
+            stale_job.error = "Stale running automation job exceeded the worker lease window; marked failed so scheduler can resume."
+        if stale_jobs or stale_running_jobs:
+            session.commit()
         active_job = session.scalar(
             select(BackgroundJob)
             .where(

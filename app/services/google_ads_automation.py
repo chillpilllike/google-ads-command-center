@@ -140,6 +140,9 @@ SCALE_NEGATIVE_MIGRATION_HOLD_DAYS = 3
 SCALE_PAGE_MIGRATION_HOLD_DAYS = 3
 WASTE_RECOVERY_HOLD_DAYS = 7
 WASTE_FIXED_DAILY_BUDGET_AMOUNT = 50.0
+WASTE_FIXED_DAILY_BUDGET_BY_CURRENCY = {
+    "INR": 4000.0,
+}
 MINIMUM_DAILY_BUDGET_BY_CURRENCY = {
     "INR": 1000.0,
 }
@@ -168,7 +171,9 @@ def currency_minimum_daily_budget(account: GoogleAdsAccount | None, configured: 
 
 
 def waste_fixed_daily_budget(account: GoogleAdsAccount | None) -> float:
-    return currency_minimum_daily_budget(account, WASTE_FIXED_DAILY_BUDGET_AMOUNT)
+    currency_code = str(getattr(account, "currency_code", "") or "").upper()
+    configured = WASTE_FIXED_DAILY_BUDGET_BY_CURRENCY.get(currency_code, WASTE_FIXED_DAILY_BUDGET_AMOUNT)
+    return currency_minimum_daily_budget(account, configured)
 
 
 def _asset_publish_quota_retry_state(session: Session, account: GoogleAdsAccount, now: datetime | None = None) -> dict[str, Any] | None:
@@ -3526,6 +3531,13 @@ def available_keyword_rows_for_terms(
     return available
 
 
+def core_owned_keyword_rows_for_scale_migration(
+    rows: list[GoogleAdsKeywordCandidate],
+    account: GoogleAdsAccount,
+) -> list[GoogleAdsKeywordCandidate]:
+    return [row for row in rows if getattr(row, "account_id", None) == account.id]
+
+
 def claim_keyword_terms(
     rows: list[GoogleAdsKeywordCandidate],
     used_keys: set[str],
@@ -3651,7 +3663,7 @@ def testing_scale_negative_keyword_plan(
         base = {
             "keyword": term,
             "match_type": "exact",
-            "source": "core_scale_pmax_search_theme",
+            "source": "core_scale_keyword_or_search_theme",
             "theme_key": key,
             "promoted_at_utc": state.get("promoted_at_utc"),
             "age_days": round(age_days, 2),
@@ -3665,17 +3677,17 @@ def testing_scale_negative_keyword_plan(
                 {
                     **base,
                     "reason": (
-                        f"Scale PMax has conversion evidence and the {hold_days}-day migration hold has passed; "
+                        f"Core / Scale has conversion evidence and the {hold_days}-day migration hold has passed; "
                         "exclude from Testing / Discovery to reduce internal competition."
                     ),
                 }
             )
         else:
-            reason = "Waiting for Scale PMax conversion evidence."
+            reason = "Waiting for Core / Scale conversion evidence."
             if has_scale_conversion and age_days < hold_days:
-                reason = f"Scale PMax has conversion evidence, but the {hold_days}-day migration hold has not passed."
+                reason = f"Core / Scale has conversion evidence, but the {hold_days}-day migration hold has not passed."
             elif not has_scale_conversion and age_days < hold_days:
-                reason = f"Waiting for both the {hold_days}-day migration hold and Scale PMax conversion evidence."
+                reason = f"Waiting for both the {hold_days}-day migration hold and Core / Scale conversion evidence."
             pending.append({**base, "reason": reason})
     return {
         "enabled": bool(negatives),
@@ -3688,7 +3700,7 @@ def testing_scale_negative_keyword_plan(
         "pending_keyword_count": len(pending),
         "basis": (
             f"Testing keeps newly promoted winners during a {hold_days}-day migration hold. A term becomes a Testing "
-            "negative only after Core / Scale PMax has conversion evidence for it."
+            "negative only after Core / Scale has conversion evidence for it."
         ),
     }
 
@@ -3998,6 +4010,54 @@ def block_automation_campaign_drafts_for_data_freshness(
     return blocked
 
 
+LEGACY_MAX_CLICKS_AUTOMATION_DRAFT_KINDS = (
+    "testing_keyword_rsa_max_clicks_cpc_cap",
+    "core_scale_keyword_rsa_max_clicks_cpc_cap",
+)
+
+
+def retire_legacy_max_clicks_automation_drafts(
+    session: Session,
+    preference: GoogleAdsAutomationPreference,
+) -> int:
+    if preference.account is None:
+        return 0
+    source_keys = {
+        _automation_draft_source_key(preference.account, kind)
+        for kind in LEGACY_MAX_CLICKS_AUTOMATION_DRAFT_KINDS
+    }
+    rows = session.scalars(
+        select(AdDraft)
+        .where(
+            AdDraft.account_id == preference.account_id,
+            AdDraft.ad_type == "rsa",
+        )
+        .order_by(AdDraft.created_at.desc(), AdDraft.id.desc())
+        .limit(500)
+    ).all()
+    retired = 0
+    for draft in rows:
+        assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+        automation = assets.get("automation") if isinstance(assets.get("automation"), dict) else {}
+        source_key = str(automation.get("source_key") or "").strip()
+        if source_key not in source_keys or str(draft.status or "").lower() == "retired":
+            continue
+        validation = dict(draft.validation_json or {})
+        warnings = list(validation.get("warnings") or [])
+        warning = "Legacy Max Clicks automation lane retired; automation now uses Target ROAS RSA/DSA only."
+        if warning not in warnings:
+            warnings.append(warning)
+        validation["ok"] = False
+        validation["warnings"] = warnings
+        validation["legacy_max_clicks_retired"] = True
+        draft.status = "retired"
+        draft.validation_json = validation
+        retired += 1
+    if retired:
+        session.flush()
+    return retired
+
+
 def run_testing_campaign_automation(
     session: Session,
     preference: GoogleAdsAutomationPreference,
@@ -4148,13 +4208,12 @@ def run_testing_campaign_automation(
         ]
     pmax_policy_terms = _pmax_policy_terms(session)
     term_ledger_keys: set[str] = set()
-    pmax_source_rows = [row for row in keyword_rows if getattr(row, "account_id", None) == account.id] or list(keyword_rows)
+    same_account_keyword_rows = core_owned_keyword_rows_for_scale_migration(keyword_rows, account)
+    pmax_source_rows = same_account_keyword_rows or list(keyword_rows)
     pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows, policy_terms=pmax_policy_terms)
     pmax_search_themes = list(pmax_theme_plan["active_terms"])
     core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
-    core_max_clicks_terms, core_max_clicks_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
-    testing_max_clicks_terms, testing_max_clicks_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
     search_console_terms = search_console_keyword_terms(search_console_matrix, limit=0)
 
@@ -4195,9 +4254,7 @@ def run_testing_campaign_automation(
 
     distribute_search_console_terms(
         core_rsa_terms,
-        core_max_clicks_terms,
         testing_terms,
-        testing_max_clicks_terms,
         fix_watch_terms,
         limit=keyword_limit,
     )
@@ -4227,40 +4284,33 @@ def run_testing_campaign_automation(
         ga4_matrix=ga4_matrix,
         search_console_matrix=search_console_matrix,
     )
-    if decision.get("pmax_allowed"):
-        scale_migration_state = sync_scale_search_theme_migration_state(session, account, pmax_theme_plan)
-        scale_negative_plan = testing_scale_negative_keyword_plan(
-            pmax_theme_plan,
-            migration_state=scale_migration_state,
-        )
-        scale_page_migration_state = sync_scale_landing_page_migration_state(session, account, scale_page_plan)
-        scale_page_exclusion_plan = testing_scale_page_exclusion_plan(
-            scale_page_plan,
-            migration_state=scale_page_migration_state,
-        )
-    else:
-        scale_migration_state = {}
-        scale_page_migration_state = {}
+    core_owned_theme_plan = pmax_search_theme_plan(same_account_keyword_rows, policy_terms=pmax_policy_terms)
+    scale_migration_state = sync_scale_search_theme_migration_state(session, account, core_owned_theme_plan)
+    scale_negative_plan = testing_scale_negative_keyword_plan(
+        core_owned_theme_plan,
+        migration_state=scale_migration_state,
+    )
+    scale_page_migration_state = sync_scale_landing_page_migration_state(session, account, scale_page_plan)
+    scale_page_exclusion_plan = testing_scale_page_exclusion_plan(
+        scale_page_plan,
+        migration_state=scale_page_migration_state,
+    )
+    if not decision.get("pmax_allowed"):
         scale_negative_plan = {
-            "enabled": False,
-            "applies_to": ["testing_rsa", "testing_dsa", "testing_pmax"],
-            "hold_days": SCALE_NEGATIVE_MIGRATION_HOLD_DAYS,
-            "negative_keywords": [],
-            "negative_keyword_count": 0,
-            "pending_keywords": [],
-            "pending_keyword_count": 0,
-            "basis": "No Core / Scale PMax search-theme terms are active yet.",
+            **scale_negative_plan,
+            "pmax_gate": decision.get("pmax_gate") or {},
+            "basis": (
+                scale_negative_plan.get("basis", "")
+                + " PMax live publishing is still gated, but Core / Scale Search-owned terms remain tracked for Testing negatives."
+            ).strip(),
         }
         scale_page_exclusion_plan = {
-            "enabled": False,
-            "applies_to": ["testing_dsa", "testing_pmax"],
-            "rsa_handling": "Do not use excluded Scale-owned URLs as Testing RSA final URLs.",
-            "hold_days": SCALE_PAGE_MIGRATION_HOLD_DAYS,
-            "page_exclusions": [],
-            "page_exclusion_count": 0,
-            "pending_pages": [],
-            "pending_page_count": 0,
-            "basis": "No Core / Scale landing pages are active yet.",
+            **scale_page_exclusion_plan,
+            "pmax_gate": decision.get("pmax_gate") or {},
+            "basis": (
+                scale_page_exclusion_plan.get("basis", "")
+                + " PMax live publishing is still gated, but Core / Scale Search-owned URLs remain tracked for Testing URL exclusions."
+            ).strip(),
         }
     testing_negative_keywords = merge_negative_keywords(
         scale_negative_plan["negative_keywords"],
@@ -4389,20 +4439,11 @@ def run_testing_campaign_automation(
         "sales_budget_ratio": budget["ratio"],
         "sales_budget_ratio_pct": budget["ratio_pct"],
     }
-    max_clicks_bidding = {
-        "strategy": "maximize_clicks_cpc_cap",
-        "strategy_label": "Maximize Clicks with CPC cap",
-        "currency_code": budget["currency_code"],
-        "daily_budget": round(float(budget["daily_budget"] or 0), 2),
-        "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
-        "sales_budget_ratio": budget["ratio"],
-        "sales_budget_ratio_pct": budget["ratio_pct"],
-    }
-
     drafts: list[dict[str, Any]] = []
+    retired_max_clicks_drafts = retire_legacy_max_clicks_automation_drafts(session, preference)
     warnings = [
         "Automation draft only; live creation still requires monitor-only off, dry-run off, and mutation settings enabled.",
-        "Testing Search campaigns use Target ROAS plus a separate Maximize Clicks CPC-cap RSA lane. PMax/Core/Fix/Waste can be drafted but are held from live on thin accounts.",
+        "Testing Search campaigns use Target ROAS RSA/DSA lanes only. Legacy Max Clicks CPC-cap RSA lanes are retired and paused by campaign revisions.",
         "Campaign names include category and a stable AUTO code so reconnects can resume existing campaigns.",
     ]
 
@@ -4582,105 +4623,6 @@ def run_testing_campaign_automation(
                 "copy_strategy": {
                     "mode": "automation_keyword_bank_rsa",
                     "reason": "No recent account delivery, so RSA starts from best saved keyword-bank terms.",
-                },
-            }
-            drafts.append(
-                upsert_automation_ad_draft(
-                    session,
-                    preference=preference,
-                    ad_type="rsa",
-                    source_key=automation["source_key"],
-                    website_url=website_url,
-                    final_url=testing_final_url,
-                    business_name=account.name,
-                    generated_assets=assets,
-                    validation_json=_automation_validation(validation, warnings),
-                    prompt=prompt,
-                )
-            )
-
-        if testing_max_clicks_terms:
-            assets, validation, prompt = generate_ad_copy(
-                session,
-                ad_type="rsa",
-                website_url=website_url,
-                business_name=account.name,
-                generic_page_feed_copy=False,
-                keyword_terms=testing_max_clicks_terms,
-            )
-            automation = attach_campaign_identity(
-                session,
-                account,
-                automation={
-                    "source_key": _automation_draft_source_key(account, "testing_keyword_rsa_max_clicks_cpc_cap"),
-                    "decision": decision,
-                    "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(_planning_items(testing_max_clicks_rows, keyword_limit)),
-                    "scale_negative_keyword_plan": scale_negative_plan,
-                    "scale_page_exclusion_plan": scale_page_exclusion_plan,
-                    "landing_page_governance_plan": draft_landing_page_governance,
-                    "audience_signal_plan": audience_signal_plan,
-                    "waste_management_plan": draft_waste_plan,
-                    "ga4_ads_signal_matrix": ga4_matrix,
-                    "page_targeting": {
-                        "mode": "testing_discovery_final_url",
-                        "website_url": website_url,
-                        "final_url": testing_final_url,
-                        "url_inclusions": testing_discovery_url_targets,
-                        "note": "Testing Max Clicks RSA uses a separate non-duplicate exact keyword pool with a CPC cap.",
-                    },
-                    "created_by": "automation_monitor",
-                    "source_job_id": source_job_id,
-                },
-                category="Testing / Discovery",
-                campaign_intent="maximize_clicks_rsa_testing_cpc_cap",
-                channel_label="RSA Max Clicks CPC Cap Keywords",
-                website_url=website_url,
-            )
-            campaign_identity = automation["campaign_identity"]
-            assets = {
-                **assets,
-                "automation": automation,
-                "campaign_identity": campaign_identity,
-                "campaign_name": campaign_identity["campaign_name"],
-                "campaign_code": campaign_identity["campaign_code"],
-                "existing_google_campaign": automation["existing_google_campaign"],
-                "planned_operation": automation["planned_operation"],
-                "live_creation": automation_live_creation_control(decision, category="Testing / Discovery", ad_type="rsa"),
-                "bidding": max_clicks_bidding,
-                "final_url": testing_final_url,
-                "page_targeting": automation["page_targeting"],
-                "scale_negative_keyword_plan": scale_negative_plan,
-                "waste_management_plan": draft_waste_plan,
-                "ga4_ads_signal_matrix": ga4_matrix,
-                "audience_signal_plan": audience_signal_plan,
-                "waste_negative_keyword_plan": waste_negative_plan,
-                "negative_keywords": testing_negative_keywords,
-                "scale_page_exclusion_plan": scale_page_exclusion_plan,
-                "waste_page_exclusion_plan": waste_page_exclusion_plan,
-                "landing_page_governance_plan": draft_landing_page_governance,
-                "url_inclusion_targets": testing_discovery_url_targets,
-                "blocked_final_urls": [item["url"] for item in testing_page_exclusions],
-                "source_terms": _planning_items(testing_max_clicks_terms, keyword_limit),
-                "google_keyword_plan": {
-                    "source": keyword_source,
-                    "terms": _planning_items(testing_max_clicks_terms, keyword_limit),
-                    "candidate_count": len(keyword_rows),
-                },
-                "keyword_clusters": [
-                    {
-                        "ad_group_name": f"AUTO | Testing / Discovery | RSA Max Clicks Keywords | {campaign_identity['campaign_code']}",
-                        "source": keyword_source,
-                        "match_type": "exact",
-                        "exact_terms": _planning_items(testing_max_clicks_terms, keyword_limit),
-                    }
-                ],
-                "copy_strategy": {
-                    "mode": "testing_max_clicks_cpc_cap_rsa",
-                    "reason": (
-                        "Testing / Discovery includes a separate Maximize Clicks RSA lane with a maximum CPC cap. "
-                        "It only uses keywords not already claimed by PMax, Target ROAS RSA, Core, Fix, or Waste lanes."
-                    ),
                 },
             }
             drafts.append(
@@ -5105,105 +5047,6 @@ def run_testing_campaign_automation(
                 )
             )
 
-        if core_max_clicks_terms:
-            assets, validation, prompt = generate_ad_copy(
-                session,
-                ad_type="rsa",
-                website_url=website_url,
-                business_name=account.name,
-                generic_page_feed_copy=False,
-                keyword_terms=core_max_clicks_terms,
-            )
-            automation = attach_campaign_identity(
-                session,
-                account,
-                automation={
-                    "source_key": _automation_draft_source_key(account, "core_scale_keyword_rsa_max_clicks_cpc_cap"),
-                    "decision": decision,
-                    "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(_planning_items(core_max_clicks_rows, keyword_limit)),
-                    "pmax_search_theme_plan": pmax_theme_plan,
-                    "scale_landing_page_plan": scale_page_plan,
-                    "landing_page_governance_plan": draft_landing_page_governance,
-                    "audience_signal_plan": audience_signal_plan,
-                    "waste_management_plan": draft_waste_plan,
-                    "ga4_ads_signal_matrix": ga4_matrix,
-                    "page_targeting": {
-                        "mode": "core_scale_proven_final_url",
-                        "website_url": website_url,
-                        "final_url": core_scale_final_url,
-                        "url_inclusions": core_scale_url_targets,
-                        "note": "Core / Scale Max Clicks RSA uses proven exact keyword targets, a CPC cap, and a proven Core URL as the ad final URL.",
-                    },
-                    "created_by": "automation_monitor",
-                    "source_job_id": source_job_id,
-                },
-                category="Core / Scale",
-                campaign_intent="maximize_clicks_rsa_scale_cpc_cap",
-                channel_label="RSA Max Clicks CPC Cap Scale Keywords",
-                website_url=website_url,
-            )
-            campaign_identity = automation["campaign_identity"]
-            assets = {
-                **assets,
-                "automation": automation,
-                "campaign_identity": campaign_identity,
-                "campaign_name": campaign_identity["campaign_name"],
-                "campaign_code": campaign_identity["campaign_code"],
-                "existing_google_campaign": automation["existing_google_campaign"],
-                "planned_operation": automation["planned_operation"],
-                "live_creation": automation_live_creation_control(decision, category="Core / Scale", ad_type="rsa"),
-                "bidding": max_clicks_bidding,
-                "final_url": core_scale_final_url,
-                "page_targeting": automation["page_targeting"],
-                "scale_landing_page_plan": scale_page_plan,
-                "scale_negative_keyword_plan": scale_negative_plan,
-                "waste_management_plan": draft_waste_plan,
-                "ga4_ads_signal_matrix": ga4_matrix,
-                "audience_signal_plan": audience_signal_plan,
-                "waste_negative_keyword_plan": waste_negative_plan,
-                "negative_keywords": core_scale_negative_keywords,
-                "waste_page_exclusion_plan": waste_page_exclusion_plan,
-                "landing_page_governance_plan": draft_landing_page_governance,
-                "url_inclusion_targets": core_scale_url_targets,
-                "blocked_final_urls": [item["url"] for item in core_scale_page_exclusions],
-                "source_terms": _planning_items(core_max_clicks_terms, keyword_limit),
-                "google_keyword_plan": {
-                    "source": keyword_source,
-                    "terms": _planning_items(core_max_clicks_terms, keyword_limit),
-                    "candidate_count": int(pmax_theme_plan.get("candidate_count") or len(keyword_rows)),
-                },
-                "keyword_clusters": [
-                    {
-                        "ad_group_name": f"AUTO | Core / Scale | RSA Max Clicks Keywords | {campaign_identity['campaign_code']}",
-                        "source": keyword_source,
-                        "match_type": "exact",
-                        "exact_terms": _planning_items(core_max_clicks_terms, keyword_limit),
-                    }
-                ],
-                "copy_strategy": {
-                    "mode": "core_scale_max_clicks_cpc_cap_rsa",
-                    "reason": (
-                        "Core / Scale includes a separate Maximize Clicks RSA lane with a maximum CPC cap. "
-                        "It uses the same Scale URL inclusion, negative, waste, and dedupe governance as Core Target ROAS RSA."
-                    ),
-                },
-            }
-            drafts.append(
-                upsert_automation_ad_draft(
-                    session,
-                    preference=preference,
-                    ad_type="rsa",
-                    source_key=automation["source_key"],
-                    website_url=website_url,
-                    final_url=core_scale_final_url,
-                    business_name=account.name,
-                    generated_assets=assets,
-                    validation_json=_automation_validation(validation, warnings),
-                    prompt=prompt,
-                )
-            )
-
         campaign_plans = [item for item in (pmax_theme_plan.get("campaign_plans") or []) if isinstance(item, dict)]
         if not campaign_plans:
             campaign_plans = [
@@ -5512,12 +5355,13 @@ def run_testing_campaign_automation(
             "testing_pmax_source_row_count": len(testing_pmax_source_rows),
             "testing_pmax_term_count": int(testing_pmax_theme_plan.get("candidate_count") or 0),
             "core_rsa_term_count": len(core_rsa_terms),
-            "core_max_clicks_rsa_term_count": len(core_max_clicks_terms),
+            "core_max_clicks_rsa_term_count": 0,
             "testing_rsa_term_count": len(testing_terms),
-            "testing_max_clicks_rsa_term_count": len(testing_max_clicks_terms),
+            "testing_max_clicks_rsa_term_count": 0,
             "fix_watch_rsa_term_count": len(fix_watch_terms),
             "waste_recovery_rsa_term_count": len(waste_recovery_terms),
             "used_term_key_count": len(term_ledger_keys),
+            "retired_legacy_max_clicks_draft_count": retired_max_clicks_drafts,
         },
         "scale_landing_page_plan": scale_page_plan,
         "landing_page_governance_plan": draft_landing_page_governance,
@@ -5576,11 +5420,12 @@ def run_testing_campaign_automation(
                 "testing_pmax_asset_group_count": int(testing_pmax_theme_plan.get("asset_group_count") or 0),
                 "testing_pmax_campaign_count": int(testing_pmax_theme_plan.get("campaign_count") or 0),
                 "core_rsa_unique_keyword_count": len(core_rsa_terms),
-                "core_max_clicks_rsa_unique_keyword_count": len(core_max_clicks_terms),
+                "core_max_clicks_rsa_unique_keyword_count": 0,
                 "testing_rsa_unique_keyword_count": len(testing_terms),
-                "testing_max_clicks_rsa_unique_keyword_count": len(testing_max_clicks_terms),
+                "testing_max_clicks_rsa_unique_keyword_count": 0,
                 "fix_watch_rsa_unique_keyword_count": len(fix_watch_terms),
                 "waste_recovery_rsa_unique_keyword_count": len(waste_recovery_terms),
+                "retired_legacy_max_clicks_draft_count": retired_max_clicks_drafts,
                 "audience_signal_term_count": int(audience_signal_plan.get("custom_segment_term_count") or 0),
                 "audience_signal_similar_url_count": int(audience_signal_plan.get("similar_website_url_count") or 0),
                 "testing_scale_negative_keyword_count": int(scale_negative_plan.get("negative_keyword_count") or 0),
@@ -7056,7 +6901,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "budget": "80-85% of allowed spend inside the rolling Odoo sales cap",
             "target_roas": core_scale_roas,
             "target_roas_pct": round(core_scale_roas * 100),
-            "campaign_types": "PMax for product/category scale, Target-ROAS RSA for proven exact/phrase terms, Maximize Clicks CPC-cap RSA for controlled extra reach, and page-feed/final URL expansion for proven landing-page targets.",
+            "campaign_types": "PMax for product/category scale, Target-ROAS RSA for proven exact/phrase terms, and AI Max DSA/page-feed URL inclusion for proven landing-page targets. Legacy Max Clicks lanes are retired.",
             "rule": "Add compatible winning keywords and page targets to existing campaigns first; create a new campaign only for a proven separate cluster that needs its own budget.",
         },
         {
@@ -7064,7 +6909,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "budget": "10-15% of allowed spend inside the rolling Odoo sales cap",
             "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
             "target_roas_pct": round(TESTING_DISCOVERY_TARGET_ROAS * 100),
-            "campaign_types": "Target-ROAS RSA plus a separate Maximize Clicks CPC-cap RSA from the keyword bank, with AI Max/final URL expansion or legacy DSA-style page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence.",
+            "campaign_types": "Target-ROAS RSA from the keyword bank plus AI Max DSA page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence. Legacy Max Clicks lanes are retired.",
             "rule": f"Use RSA/page discovery only for the first {testing_bootstrap_days} day(s) when delivery is missing or conversion evidence is thin; promote to Core / Scale only after purchase evidence, healthy spend efficiency, and no duplicate keyword or landing-page conflict.",
         },
         {
@@ -7136,7 +6981,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             {
                 "name": "Testing campaign bootstrap",
                 "cadence": "After each daily insight refresh" if testing_bootstrap_enabled else "Disabled",
-                "detail": f"If an account has no last-7-day impressions, or is inside the {testing_bootstrap_days}-day bootstrap, automation publishes Testing / Discovery Search using Target ROAS RSA, Maximize Clicks CPC-cap RSA, and page-discovery URL inclusions from the best keyword bank terms. Core / Scale, Fix / Watch, and Waste / Recovery can stay in the closed loop, but PMax is drafted/held from live until automation-owned Search campaigns reach at least {pmax_min_7d_conversions:g} conversions. The testing lane uses {testing_sales_budget_pct:g}% of rolling Odoo sales, capped by the account guard.",
+                "detail": f"If an account has no last-7-day impressions, or is inside the {testing_bootstrap_days}-day bootstrap, automation publishes Testing / Discovery Search using Target ROAS RSA plus AI Max DSA page-discovery URL inclusions from the best keyword and URL banks. Core / Scale, Fix / Watch, and Waste / Recovery can stay in the closed loop, but PMax is drafted/held from live until automation-owned Search campaigns reach at least {pmax_min_7d_conversions:g} conversions. The testing lane uses {testing_sales_budget_pct:g}% of rolling Odoo sales, capped by the account guard.",
             },
             {
                 "name": "Mutation cooldown",

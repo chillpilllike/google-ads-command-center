@@ -351,8 +351,6 @@ def _plan_delivery_actions(
     actions: list[AutoPilotAction] = []
     threshold = int(_num(settings, "autopilot.low_impression_threshold", 1))
     now = datetime.now(timezone.utc)
-    max_clicks_after = _num(settings, "autopilot.maximize_clicks_after_hours", 24)
-    cpc_interval = _num(settings, "autopilot.cpc_increase_interval_hours", 6)
     disable_after = _num(settings, "autopilot.disable_after_hours", 72)
     observation_interval = _num(settings, "autopilot.observation_interval_hours", 3)
     red_budget_cut_pct = min(max(_num(settings, "spend_guard.red_budget_cut_pct", 0.2), 0.01), 0.95)
@@ -429,20 +427,6 @@ def _plan_delivery_actions(
                             field="campaign.maximize_conversion_value.target_roas",
                             old_value=campaign.get("target_roas"),
                             new_value=roas_start,
-                            evidence=evidence,
-                        )
-                    )
-                    restored_cpc = int(state.get("initial_cpc_bid_limit_micros") or _initial_cpc(settings, str(campaign["currency_code"])))
-                    actions.append(
-                        AutoPilotAction(
-                            action_type="delivery_rescue_restore_cpc_cap",
-                            summary=f"Restore initial max CPC cap to {micros_to_currency(restored_cpc):,.2f} {campaign['currency_code']} after delivery recovered.",
-                            campaign_id=campaign_id,
-                            campaign_name=campaign["campaign_name"],
-                            resource_name=campaign["campaign_resource_name"],
-                            field="campaign.maximize_clicks.cpc_bid_ceiling_micros",
-                            old_value=int(campaign.get("cpc_bid_ceiling_micros") or 0),
-                            new_value=restored_cpc,
                             evidence=evidence,
                         )
                     )
@@ -548,22 +532,7 @@ def _plan_delivery_actions(
                         evidence=evidence,
                     )
                 )
-            cpc_cap = int(campaign.get("cpc_bid_ceiling_micros") or state.get("cpc_bid_limit_micros") or 0)
-            if cpc_cap:
-                actions.append(
-                    AutoPilotAction(
-                        action_type="delivery_rescue_remove_cpc_cap",
-                        summary="Remove Maximize Clicks CPC cap for open-delivery observation after the configured no-impression window.",
-                        campaign_id=campaign_id,
-                        campaign_name=campaign["campaign_name"],
-                        resource_name=campaign["campaign_resource_name"],
-                        field="campaign.maximize_clicks.cpc_bid_ceiling_micros",
-                        old_value=cpc_cap,
-                        new_value=0,
-                        evidence=evidence,
-                    )
-                )
-            if not campaign.get("target_roas") and not cpc_cap and _age_hours(state.get("last_observation_at"), now) >= observation_interval:
+            if not campaign.get("target_roas") and _age_hours(state.get("last_observation_at"), now) >= observation_interval:
                 actions.append(
                     AutoPilotAction(
                         action_type="delivery_rescue_observe_open_delivery",
@@ -578,46 +547,6 @@ def _plan_delivery_actions(
                 state["last_observation_at"] = now.isoformat()
             _save_state(session, account, campaign_id, state)
             continue
-
-        if age_hours >= max_clicks_after:
-            if campaign["channel_type"] != "SEARCH":
-                actions.append(
-                    AutoPilotAction(
-                        action_type="delivery_rescue_max_clicks_not_supported",
-                        summary=f"Maximize Clicks rescue skipped because {campaign['channel_type']} is not a Search campaign.",
-                        campaign_id=campaign_id,
-                        campaign_name=campaign["campaign_name"],
-                        resource_name=campaign["campaign_resource_name"],
-                        evidence=evidence,
-                        applyable=False,
-                    )
-                )
-                continue
-            cpc_limit = int(state.get("cpc_bid_limit_micros") or _initial_cpc(settings, str(campaign["currency_code"])))
-            last_raise = state.get("last_cpc_increase_at")
-            if last_raise:
-                last_raise_dt = datetime.fromisoformat(last_raise)
-                if (now - last_raise_dt).total_seconds() / 3600 >= cpc_interval:
-                    cpc_limit += _cpc_step(settings, str(campaign["currency_code"]))
-                    state["last_cpc_increase_at"] = now.isoformat()
-            else:
-                state["last_cpc_increase_at"] = now.isoformat()
-            state["initial_cpc_bid_limit_micros"] = state.get("initial_cpc_bid_limit_micros") or _initial_cpc(settings, str(campaign["currency_code"]))
-            state["cpc_bid_limit_micros"] = cpc_limit
-            _save_state(session, account, campaign_id, state)
-            actions.append(
-                AutoPilotAction(
-                    action_type="delivery_rescue_maximize_clicks",
-                    summary=f"Set Search campaign to Maximize Clicks with max CPC {micros_to_currency(cpc_limit):,.2f} {campaign['currency_code']}.",
-                    campaign_id=campaign_id,
-                    campaign_name=campaign["campaign_name"],
-                    resource_name=campaign["campaign_resource_name"],
-                    field="campaign.maximize_clicks.cpc_bid_ceiling_micros",
-                    old_value=campaign["bidding_strategy_type"],
-                    new_value=cpc_limit,
-                    evidence=evidence,
-                )
-            )
     return actions
 
 
@@ -666,9 +595,6 @@ def _apply_action(client, account: GoogleAdsAccount, action: AutoPilotAction, va
         "delivery_rescue_lower_target_roas",
         "delivery_rescue_remove_target_roas",
         "delivery_rescue_restore_target_roas",
-        "delivery_rescue_maximize_clicks",
-        "delivery_rescue_remove_cpc_cap",
-        "delivery_rescue_restore_cpc_cap",
     }:
         operation = client.get_type("CampaignOperation")
         operation.update.resource_name = str(action.resource_name)
@@ -682,9 +608,6 @@ def _apply_action(client, account: GoogleAdsAccount, action: AutoPilotAction, va
             except Exception:
                 pass
             operation.update_mask.paths.append("maximize_conversion_value.target_roas")
-        elif action.action_type in {"delivery_rescue_maximize_clicks", "delivery_rescue_remove_cpc_cap", "delivery_rescue_restore_cpc_cap"}:
-            operation.update.maximize_clicks.cpc_bid_ceiling_micros = int(action.new_value)
-            operation.update_mask.paths.append("maximize_clicks.cpc_bid_ceiling_micros")
         request = client.get_type("MutateCampaignsRequest")
         request.customer_id = account.customer_id
         request.operations.append(operation)

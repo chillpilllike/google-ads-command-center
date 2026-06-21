@@ -943,6 +943,7 @@ def sync_google_ads_research(
                             account,
                             scope_key=str(result.get("scope_key") or ""),
                             source_job_id=job_id,
+                            force=force,
                         )
                         landing_page_result = sync_account_landing_page_candidates(
                             session,
@@ -1031,6 +1032,7 @@ def sync_google_ads_daily_keywords(
                             account,
                             scope_key=str(result.get("scope_key") or ""),
                             source_job_id=job_id,
+                            force=force,
                         )
                         landing_page_result = sync_account_landing_page_candidates(
                             session,
@@ -1164,6 +1166,7 @@ def sync_google_ads_keyword_pull(
                                 account,
                                 scope_key=str(result.get("scope_key") or ""),
                                 source_job_id=job_id,
+                                force=force,
                             )
                             landing_page_result = sync_account_landing_page_candidates(
                                 session,
@@ -1543,6 +1546,53 @@ def run_google_ads_automation_monitor(
             results: list[dict] = []
             leased_preference_ids: set[int] = set()
             leased_api_preference_ids: set[int] = set()
+            def reset_monitor_session() -> None:
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+            def record_monitor_exception_in_fresh_session(
+                preference_id: int,
+                account_id: int,
+                exc: Exception,
+                *,
+                context: str,
+                is_google_ads_exception: bool = False,
+            ) -> None:
+                with SessionLocal() as error_session:
+                    preference_row = error_session.get(GoogleAdsAutomationPreference, preference_id)
+                    account_row = error_session.get(GoogleAdsAccount, account_id)
+                    if preference_row is not None:
+                        preference_row.last_error = str(exc)[:2000]
+                        preference_row.last_run_at = utcnow()
+                        error_session.commit()
+                    if account_row is not None and is_google_ads_exception:
+                        record_google_ads_api_error(
+                            error_session,
+                            exc,
+                            account=account_row,
+                            job_id=job_id,
+                            context=context,
+                            severity="manual_action_required",
+                            extra={"force": bool(force), "budget_only": bool(budget_only)},
+                        )
+                    elif account_row is not None:
+                        record_google_ads_generic_error(
+                            error_session,
+                            exc,
+                            account=account_row,
+                            job_id=job_id,
+                            context=context,
+                            severity="manual_action_required",
+                            extra={"force": bool(force), "budget_only": bool(budget_only)},
+                        )
+                    error_session.commit()
+
             def release_monitor_leases(preferences_to_release: list[GoogleAdsAutomationPreference]) -> None:
                 for leased_preference in preferences_to_release:
                     leased_account = leased_preference.account
@@ -1736,7 +1786,7 @@ def run_google_ads_automation_monitor(
                     ga4_pre_refresh_enabled = parse_bool(settings_map.get("automation.ga4_pre_refresh_enabled", False))
                     if ga4_pre_refresh_enabled:
                         try:
-                            ga4_days = max(7, min(max(int(item.daily_keyword_lookback_days or 60) for item in preferences), 365))
+                            ga4_days = max(7, min(max(int(item.daily_keyword_lookback_days or 120) for item in preferences), 365))
                             ga4_max_rows = max(1000, min(max(int(item.max_daily_api_rows or 10_000) for item in preferences), 5_000))
                             ga4_account_ids = [item.account_id for item in preferences]
                             ga4_result = sync_ga4_ecommerce_snapshots(
@@ -1884,49 +1934,76 @@ def run_google_ads_automation_monitor(
                         results.append(result)
                     except GoogleAdsException as exc:
                         session.rollback()
-                        preference = session.get(GoogleAdsAutomationPreference, preference.id)
-                        quota_retry = google_ads_exception_quota_retry_state(session, account, exc)
-                        if quota_retry and preference is not None:
-                            result = google_ads_quota_blocked_result(account, quota_retry)
-                            mark_preference_google_quota_blocked(session, preference, result)
-                            results.append(result)
-                        else:
+                        preference_id = preference.id
+                        account_id = account.id
+                        try:
+                            preference = session.get(GoogleAdsAutomationPreference, preference_id)
+                            account = session.get(GoogleAdsAccount, account_id) or account
+                            quota_retry = google_ads_exception_quota_retry_state(session, account, exc)
+                            if quota_retry and preference is not None:
+                                result = google_ads_quota_blocked_result(account, quota_retry)
+                                mark_preference_google_quota_blocked(session, preference, result)
+                                results.append(result)
+                            else:
+                                errors += 1
+                                if preference is not None:
+                                    preference.last_error = str(exc)[:2000]
+                                    preference.last_run_at = utcnow()
+                                    session.commit()
+                                record_google_ads_api_error(
+                                    session,
+                                    exc,
+                                    account=account,
+                                    job_id=job_id,
+                                    context="automation_monitor",
+                                    severity="manual_action_required",
+                                    extra={"force": bool(force), "budget_only": bool(budget_only)},
+                                )
+                        except Exception:
+                            session.rollback()
                             errors += 1
-                            if preference is not None:
-                                preference.last_error = str(exc)[:2000]
-                                preference.last_run_at = utcnow()
-                                session.commit()
-                            record_google_ads_api_error(
-                                session,
+                            record_monitor_exception_in_fresh_session(
+                                preference_id,
+                                account_id,
                                 exc,
-                                account=account,
-                                job_id=job_id,
                                 context="automation_monitor",
-                                severity="manual_action_required",
-                                extra={"force": bool(force), "budget_only": bool(budget_only)},
+                                is_google_ads_exception=True,
                             )
                     except Exception as exc:  # noqa: BLE001 - keep other accounts moving.
                         session.rollback()
-                        preference = session.get(GoogleAdsAutomationPreference, preference.id)
-                        quota_retry = google_ads_generic_exception_quota_retry_state(session, account, exc)
-                        if quota_retry and preference is not None:
-                            result = google_ads_quota_blocked_result(account, quota_retry)
-                            mark_preference_google_quota_blocked(session, preference, result)
-                            results.append(result)
-                        else:
+                        preference_id = preference.id
+                        account_id = account.id
+                        try:
+                            preference = session.get(GoogleAdsAutomationPreference, preference_id)
+                            account = session.get(GoogleAdsAccount, account_id) or account
+                            quota_retry = google_ads_generic_exception_quota_retry_state(session, account, exc)
+                            if quota_retry and preference is not None:
+                                result = google_ads_quota_blocked_result(account, quota_retry)
+                                mark_preference_google_quota_blocked(session, preference, result)
+                                results.append(result)
+                            else:
+                                errors += 1
+                                if preference is not None:
+                                    preference.last_error = str(exc)[:2000]
+                                    preference.last_run_at = utcnow()
+                                    session.commit()
+                                record_google_ads_generic_error(
+                                    session,
+                                    exc,
+                                    account=account,
+                                    job_id=job_id,
+                                    context="automation_monitor",
+                                    severity="manual_action_required",
+                                    extra={"force": bool(force), "budget_only": bool(budget_only)},
+                                )
+                        except Exception:
+                            session.rollback()
                             errors += 1
-                            if preference is not None:
-                                preference.last_error = str(exc)[:2000]
-                                preference.last_run_at = utcnow()
-                                session.commit()
-                            record_google_ads_generic_error(
-                                session,
+                            record_monitor_exception_in_fresh_session(
+                                preference_id,
+                                account_id,
                                 exc,
-                                account=account,
-                                job_id=job_id,
                                 context="automation_monitor",
-                                severity="manual_action_required",
-                                extra={"force": bool(force), "budget_only": bool(budget_only)},
                             )
                     finally:
                         if lease_acquired:
@@ -1958,7 +2035,13 @@ def run_google_ads_automation_monitor(
                                     extra={"force": bool(force), "budget_only": bool(budget_only)},
                                 )
                         processed += 1
-                        update_job_progress(session, job_id, current=processed)
+                        try:
+                            update_job_progress(session, job_id, current=processed)
+                        except Exception:
+                            reset_monitor_session()
+                            with SessionLocal() as progress_session:
+                                update_job_progress(progress_session, job_id, current=processed)
+                        reset_monitor_session()
                 finish_payload = {
                     "processed": processed,
                     "errors": errors,
@@ -1995,7 +2078,12 @@ def run_google_ads_automation_monitor(
                     )
             except Exception as exc:  # noqa: BLE001
                 release_monitor_leases(preferences)
-                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
+                try:
+                    mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
+                except Exception:
+                    reset_monitor_session()
+                    with SessionLocal() as finish_session:
+                        mark_job_finished(finish_session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
                 raise
 
 

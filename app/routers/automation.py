@@ -29,6 +29,7 @@ from app.services.google_ads_automation import (
 
 router = APIRouter()
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
+STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
 DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK = 5
 
 
@@ -481,6 +482,23 @@ async def automation_scheduler_tick(
         stale_job.finished_at = now
         stale_job.error = "Stale queued automation job never started; marked failed so scheduler can resume."
     if stale_jobs:
+        await session.commit()
+    stale_running_before = now - STALE_RUNNING_AUTOMATION_JOB_AFTER
+    stale_running_jobs = (
+        await session.scalars(
+            select(BackgroundJob).where(
+                BackgroundJob.job_type == "google_ads_automation_monitor",
+                BackgroundJob.status.in_([BackgroundJobStatus.running, BackgroundJobStatus.cancel_requested]),
+                BackgroundJob.started_at.is_not(None),
+                BackgroundJob.started_at < stale_running_before,
+            )
+        )
+    ).all()
+    for stale_job in stale_running_jobs:
+        stale_job.status = BackgroundJobStatus.failed
+        stale_job.finished_at = now
+        stale_job.error = "Stale running automation job exceeded the worker lease window; marked failed so scheduler can resume."
+    if stale_running_jobs:
         await session.commit()
     active_job = await session.scalar(
         select(BackgroundJob)
