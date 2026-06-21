@@ -7271,9 +7271,12 @@ def run_account_automation_monitor(
     if budget_only:
         schedule_decision = preference.schedule_decision_json if isinstance(preference.schedule_decision_json, dict) else {}
         if not schedule_decision:
+            checkpoint("low_traffic_schedule")
             schedule_decision = refresh_low_traffic_schedule(session, preference, fetch_time_zone=False)
     else:
+        checkpoint("low_traffic_schedule")
         schedule_decision = refresh_low_traffic_schedule(session, preference, fetch_time_zone=not google_ads_api_blocked)
+    checkpoint("low_traffic_schedule", schedule_decision.get("status") or "done")
     summary["schedule_decision"] = {
         "recommended_time": schedule_decision.get("recommended_time"),
         "time_zone": schedule_decision.get("time_zone"),
@@ -7293,19 +7296,29 @@ def run_account_automation_monitor(
             "peak_hour_impressions": schedule_decision.get("peak_hour_impressions"),
         }
     )
+    checkpoint("odoo_preflight_sync")
     odoo_preflight_step = _odoo_preflight_sync_for_account(
         session,
         preference,
         now=now,
         force=force and preference.last_run_at is None,
     )
+    checkpoint(
+        "odoo_preflight_sync",
+        odoo_preflight_step.get("status") or "done",
+        store_count=odoo_preflight_step.get("store_count"),
+        synced_store_count=odoo_preflight_step.get("synced_store_count"),
+        error_count=odoo_preflight_step.get("error_count"),
+    )
     summary["steps"].append(odoo_preflight_step)
+    checkpoint("automation_budget_bootstrap")
     budget_bootstrap = automation_budget_bootstrap_state(
         session,
         preference,
         now=now,
         ensure=bool(preference.auto_create_campaigns_enabled and not preference.monitor_only),
     )
+    checkpoint("automation_budget_bootstrap", budget_bootstrap.get("status") or "done")
     summary["budget_bootstrap"] = budget_bootstrap
     summary["steps"].append(budget_bootstrap)
 
@@ -7320,7 +7333,9 @@ def run_account_automation_monitor(
                 "guard": None,
             }
             summary["steps"].append(step)
+            checkpoint("odoo_sales_guard", step.get("status") or "done")
             return step
+        checkpoint("odoo_sales_guard")
         step = run_odoo_sales_budget_guard(
             session,
             preference,
@@ -7330,10 +7345,12 @@ def run_account_automation_monitor(
         preference.last_budget_guard_run_at = utcnow()
         session.commit()
         summary["steps"].append(step)
+        checkpoint("odoo_sales_guard", step.get("status") or "done")
         return step
 
     def run_peak_budget_step(sales_step: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         nonlocal preference
+        checkpoint("peak_budget_transition")
         step = run_peak_budget_transition(
             session,
             preference,
@@ -7358,6 +7375,7 @@ def run_account_automation_monitor(
             preference.last_peak_budget_check_at = utcnow()
             session.commit()
         summary["steps"].append(step)
+        checkpoint("peak_budget_transition", step.get("status") or "done")
         return step
 
     if google_ads_api_blocked:
