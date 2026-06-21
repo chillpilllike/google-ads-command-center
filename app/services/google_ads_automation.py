@@ -27,6 +27,8 @@ from app.models import (
     GoogleAdsNegativeKeywordCandidate,
     GoogleAnalyticsDataSnapshot,
     GoogleAnalyticsSearchTermCandidate,
+    OdooSaleOrder,
+    OdooStore,
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
@@ -74,6 +76,8 @@ from app.services.google_search_console import (
     sync_search_console_search_analytics,
 )
 from app.services.openai_ad_copy import generate_ad_copy
+from app.services.odoo_product_feed import sync_store_product_page_feeds
+from app.services.odoo_sales import sync_store_confirmed_orders, sync_store_websites
 from app.services.page_feed_restrictions import (
     get_restricted_title_terms_sync,
     normalize_restricted_text,
@@ -7057,6 +7061,131 @@ def daily_insight_api_window_days(
     return incremental_days, "incremental_last_3d_minimum_since_last_daily_pull"
 
 
+def _odoo_preflight_sync_for_account(
+    session: Session,
+    preference: GoogleAdsAutomationPreference,
+    *,
+    now: Optional[datetime] = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Refresh mapped Odoo data before budget/assets planning without spending Google Ads quota."""
+    account = preference.account
+    now = now or utcnow()
+    mappings = session.scalars(
+        select(OdooStoreGoogleAdsMapping)
+        .where(
+            OdooStoreGoogleAdsMapping.account_id == account.id,
+            OdooStoreGoogleAdsMapping.is_active.is_(True),
+        )
+        .order_by(OdooStoreGoogleAdsMapping.store_id, OdooStoreGoogleAdsMapping.website_id)
+    ).all()
+    step: dict[str, Any] = {
+        "name": "odoo_preflight_sync",
+        "status": "skipped",
+        "reason": "No active Odoo store mapping is attached to this Google Ads account.",
+        "store_count": 0,
+        "synced_store_count": 0,
+        "errors": [],
+        "stores": [],
+    }
+    if not mappings:
+        return step
+
+    stale_after = now - timedelta(hours=6)
+    window_days = max(int(preference.odoo_sales_guard_window_days or 7), 7)
+    seen_store_ids: set[int] = set()
+    stores: list[OdooStore] = []
+    website_ids_by_store: dict[int, set[int]] = {}
+    for mapping in mappings:
+        if mapping.store_id not in seen_store_ids:
+            seen_store_ids.add(mapping.store_id)
+            if mapping.store is not None and mapping.store.is_active:
+                stores.append(mapping.store)
+        if mapping.website_id:
+            website_ids_by_store.setdefault(mapping.store_id, set()).add(int(mapping.website_id))
+
+    step["store_count"] = len(stores)
+    step["reason"] = ""
+    if not stores:
+        step["status"] = "skipped"
+        step["reason"] = "Odoo mappings exist, but none point to an active store."
+        return step
+
+    synced_count = 0
+    skipped_count = 0
+    for store in stores:
+        store_entry: dict[str, Any] = {
+            "store_id": store.id,
+            "store_name": store.name,
+            "last_sync_at": store.last_sync_at.isoformat() if store.last_sync_at else None,
+        }
+        try:
+            existing_order_count = int(
+                session.scalar(
+                    select(func.count(OdooSaleOrder.id)).where(OdooSaleOrder.store_id == store.id)
+                )
+                or 0
+            )
+            latest_order_at = session.scalar(
+                select(func.max(OdooSaleOrder.order_datetime)).where(OdooSaleOrder.store_id == store.id)
+            )
+            should_sync = force or existing_order_count == 0 or store.last_sync_at is None or store.last_sync_at <= stale_after
+            store_entry["existing_order_count"] = existing_order_count
+            store_entry["latest_order_at"] = latest_order_at.isoformat() if latest_order_at else None
+            store_entry["stale"] = bool(should_sync)
+            if not should_sync:
+                skipped_count += 1
+                store_entry["status"] = "fresh"
+                step["stores"].append(store_entry)
+                continue
+
+            baseline_days = 120 if existing_order_count == 0 or force else max(window_days + 2, 14)
+            hours = baseline_days * 24
+            websites_saved = sync_store_websites(session, store)
+            selected_website_ids = sorted(website_ids_by_store.get(store.id) or [])
+            orders_saved = sync_store_confirmed_orders(
+                session,
+                store,
+                hours=hours,
+                website_ids=selected_website_ids or None,
+            )
+            product_result = sync_store_product_page_feeds(session, store, days=max(baseline_days, 30))
+            synced_count += 1
+            store_entry.update(
+                {
+                    "status": "synced",
+                    "hours": hours,
+                    "website_ids": selected_website_ids,
+                    "websites_saved": websites_saved,
+                    "orders_saved": orders_saved,
+                    "product_page_signals": product_result.get("saved") if isinstance(product_result, dict) else None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - keep Ads automation moving; budget step will fall back safely.
+            session.rollback()
+            store_entry["status"] = "failed"
+            store_entry["error"] = str(exc)[:500]
+            step["errors"].append(
+                {
+                    "store_id": store.id,
+                    "store_name": store.name,
+                    "error": str(exc)[:500],
+                }
+            )
+        step["stores"].append(store_entry)
+
+    step["synced_store_count"] = synced_count
+    step["skipped_store_count"] = skipped_count
+    step["error_count"] = len(step["errors"])
+    if synced_count:
+        step["status"] = "done" if not step["errors"] else "partial"
+    elif step["errors"]:
+        step["status"] = "failed"
+    else:
+        step["status"] = "fresh"
+    return step
+
+
 def run_account_automation_monitor(
     session: Session,
     preference: GoogleAdsAutomationPreference,
@@ -7145,6 +7274,13 @@ def run_account_automation_monitor(
             "peak_hour_impressions": schedule_decision.get("peak_hour_impressions"),
         }
     )
+    odoo_preflight_step = _odoo_preflight_sync_for_account(
+        session,
+        preference,
+        now=now,
+        force=force and preference.last_run_at is None,
+    )
+    summary["steps"].append(odoo_preflight_step)
     budget_bootstrap = automation_budget_bootstrap_state(
         session,
         preference,
