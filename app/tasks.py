@@ -1552,10 +1552,6 @@ def run_google_ads_automation_monitor(
                     session.rollback()
                 except Exception:
                     pass
-                try:
-                    session.close()
-                except Exception:
-                    pass
 
             def record_monitor_exception_in_fresh_session(
                 preference_id: int,
@@ -1596,7 +1592,9 @@ def run_google_ads_automation_monitor(
 
             def release_monitor_leases(preferences_to_release: list[GoogleAdsAutomationPreference]) -> None:
                 for leased_preference in preferences_to_release:
-                    leased_account = leased_preference.account
+                    leased_account = session.get(GoogleAdsAccount, leased_preference.account_id)
+                    if leased_account is None:
+                        continue
                     if leased_preference.id in leased_preference_ids:
                         try:
                             release_automation_run_lease(session, leased_account, job_id=job_id)
