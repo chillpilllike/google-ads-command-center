@@ -4216,9 +4216,10 @@ def run_testing_campaign_automation(
     pmax_source_rows = same_account_keyword_rows or list(keyword_rows)
     pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows, policy_terms=pmax_policy_terms)
     pmax_search_themes = list(pmax_theme_plan["active_terms"])
-    core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
-    testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
-    fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=keyword_limit)
+    lane_keyword_limit = keyword_limit or (max((len(keyword_rows) + 2) // 3, 1) if keyword_rows else 0)
+    core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+    testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+    fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
     search_console_terms = search_console_keyword_terms(search_console_matrix, limit=0)
 
     def fill_with_search_console_terms(target_terms: list[str], *, limit: Optional[int] = None) -> None:
@@ -4283,6 +4284,23 @@ def run_testing_campaign_automation(
         if len(waste_recovery_terms) >= keyword_limit:
             break
     keywords = testing_terms
+    testing_rsa_terms = (
+        testing_terms
+        or [
+            term
+            for term in search_console_terms
+            if _term_key_from_text(term) not in term_ledger_keys
+        ][: lane_keyword_limit or 50]
+        or [
+            item
+            for item in (
+                f"{account.name} online",
+                "shop online",
+                "trusted online store",
+            )
+            if _term_key_from_text(item)
+        ]
+    )
     scale_page_plan = scale_landing_page_plan(
         page_rows,
         ga4_matrix=ga4_matrix,
@@ -4545,14 +4563,15 @@ def run_testing_campaign_automation(
         )
 
     if decision["mode"] in {"testing_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
-        if keywords:
+        if testing_rsa_terms:
+            testing_keyword_rows_for_payload = testing_rows or available_keyword_rows_for_terms(keyword_rows, set())
             assets, validation, prompt = generate_ad_copy(
                 session,
                 ad_type="rsa",
                 website_url=website_url,
                 business_name=account.name,
                 generic_page_feed_copy=False,
-                keyword_terms=keywords,
+                keyword_terms=testing_rsa_terms,
             )
             automation = attach_campaign_identity(
                 session,
@@ -4561,7 +4580,7 @@ def run_testing_campaign_automation(
                     "source_key": _automation_draft_source_key(account, "testing_keyword_rsa"),
                     "decision": decision,
                     "keyword_source": keyword_source,
-                    "keyword_themes": _keyword_payload(_planning_items(testing_rows, keyword_limit)),
+                    "keyword_themes": _keyword_payload(_planning_items(testing_keyword_rows_for_payload, keyword_limit)),
                     "scale_negative_keyword_plan": scale_negative_plan,
                     "scale_page_exclusion_plan": scale_page_exclusion_plan,
                     "landing_page_governance_plan": draft_landing_page_governance,
@@ -4609,11 +4628,11 @@ def run_testing_campaign_automation(
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "url_inclusion_targets": testing_discovery_url_targets,
                 "blocked_final_urls": [item["url"] for item in testing_page_exclusions],
-                "source_terms": _planning_items(keywords, keyword_limit),
+                "source_terms": _planning_items(testing_rsa_terms, keyword_limit),
                 "search_console_source_terms": _planning_items(search_console_terms, keyword_limit),
                 "google_keyword_plan": {
                     "source": keyword_source,
-                    "terms": _planning_items(keywords, keyword_limit),
+                    "terms": _planning_items(testing_rsa_terms, keyword_limit),
                     "candidate_count": len(keyword_rows),
                 },
                 "keyword_clusters": [
@@ -4621,7 +4640,7 @@ def run_testing_campaign_automation(
                         "ad_group_name": f"AUTO | Testing / Discovery | RSA Keywords | {campaign_identity['campaign_code']}",
                         "source": keyword_source,
                         "match_type": "exact",
-                        "exact_terms": _planning_items(keywords, keyword_limit),
+                        "exact_terms": _planning_items(testing_rsa_terms, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
