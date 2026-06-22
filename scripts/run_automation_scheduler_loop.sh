@@ -19,6 +19,10 @@ case "$(printf '%s' "$APP_INSTANCE_ROLE" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 run_count=0
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if [ -x ".venv/bin/python" ]; then
+  PYTHON_BIN=".venv/bin/python"
+fi
 while true; do
   run_count=$((run_count + 1))
   timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -36,9 +40,9 @@ while true; do
   {
     echo "[$timestamp] scheduler tick args=${arg_label}"
     if [ "$arg_count" -gt 0 ]; then
-      .venv/bin/python scripts/queue_automation_monitor.py "${args[@]}"
+      "$PYTHON_BIN" scripts/queue_automation_monitor.py "${args[@]}"
     else
-      .venv/bin/python scripts/queue_automation_monitor.py
+      "$PYTHON_BIN" scripts/queue_automation_monitor.py
     fi
   } >>"$LOG_FILE" 2>&1 || true
 
