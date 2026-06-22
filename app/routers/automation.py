@@ -7,12 +7,13 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_session
 from app.dependencies import require_user, settings, templates
 from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, GoogleAdsAutomationPreference, GoogleAdsKeywordCandidate, GoogleAdsNegativeKeywordCandidate, User
 from app.runtime_role import primary_instance_required_result, runtime_role_status
-from app.app_settings import get_sync_setting_map
+from app.app_settings import get_sync_setting_map, parse_bool
 from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
 from app.services.google_ads_automation import (
     automation_strategy_summary,
@@ -31,6 +32,26 @@ router = APIRouter()
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
 STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
 DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK = 5
+BUDGET_ONLY_REASONS = {"budget_guard", "peak_budget"}
+
+
+def _customer_id_set(value: object) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = str(value).replace(",", "\n").splitlines()
+    return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
+
+
+def _scheduler_tier(account: GoogleAdsAccount, primary_ids: set[str], secondary_ids: set[str]) -> int:
+    customer_id = "".join(ch for ch in str(account.customer_id or "") if ch.isdigit())
+    if customer_id in primary_ids:
+        return 0
+    if customer_id in secondary_ids:
+        return 1
+    return 2
 
 
 def _checked(value: Optional[str]) -> bool:
@@ -485,6 +506,7 @@ async def automation_scheduler_tick(
     preferences = (
         await session.scalars(
             select(GoogleAdsAutomationPreference)
+            .options(selectinload(GoogleAdsAutomationPreference.account))
             .join(GoogleAdsAccount, GoogleAdsAccount.id == GoogleAdsAutomationPreference.account_id)
             .where(
                 GoogleAdsAutomationPreference.automation_enabled.is_(True),
@@ -494,10 +516,16 @@ async def automation_scheduler_tick(
         )
     ).all()
     now = datetime.now(timezone.utc)
-    due_account_ids: list[int] = []
+    scheduler_settings = await session.run_sync(lambda sync_session: get_sync_setting_map(sync_session))
+    primary_customer_ids = _customer_id_set(scheduler_settings.get("automation.scheduler_primary_customer_ids"))
+    secondary_customer_ids = _customer_id_set(scheduler_settings.get("automation.scheduler_secondary_customer_ids"))
+    include_unlisted = parse_bool(scheduler_settings.get("automation.scheduler_include_unlisted_accounts", False))
+    due_candidates: list[tuple[int, datetime, str, int]] = []
     due_reasons: dict[int, list[str]] = {}
+    due_tiers: dict[int, int] = {}
     decisions: list[dict] = []
     for preference in preferences:
+        account = preference.account
         if recompute:
             schedule_decision = await session.run_sync(
                 lambda sync_session, preference_id=preference.id: refresh_low_traffic_schedule(
@@ -516,6 +544,8 @@ async def automation_scheduler_tick(
             decisions.append(
                 {
                     "account_id": preference.account_id,
+                    "customer_id": account.customer_id,
+                    "priority_tier": _scheduler_tier(account, primary_customer_ids, secondary_customer_ids),
                     "time": schedule_decision.get("recommended_time"),
                     "time_zone": schedule_decision.get("time_zone"),
                     "low_hour_impressions": schedule_decision.get("low_hour_impressions"),
@@ -549,11 +579,32 @@ async def automation_scheduler_tick(
         if force and not reasons:
             reasons.append("manual_force")
         if reasons:
-            due_account_ids.append(preference.account_id)
+            tier = _scheduler_tier(account, primary_customer_ids, secondary_customer_ids)
+            heavy_reasons = not set(reasons).issubset(BUDGET_ONLY_REASONS)
+            if tier > 1 and heavy_reasons and not include_unlisted and not force:
+                decisions.append(
+                    {
+                        "account_id": preference.account_id,
+                        "customer_id": account.customer_id,
+                        "priority_tier": tier,
+                        "status": "deferred_unlisted_basic_access",
+                        "reasons": reasons,
+                    }
+                )
+                continue
+            due_candidates.append(
+                (
+                    tier,
+                    preference.last_run_at or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                    account.name,
+                    preference.account_id,
+                )
+            )
             due_reasons[preference.account_id] = reasons
+            due_tiers[preference.account_id] = tier
+    due_account_ids = [account_id for _tier, _last_run, _name, account_id in sorted(due_candidates)]
     due_account_ids = list(dict.fromkeys(due_account_ids))
     original_due_account_ids = list(due_account_ids)
-    scheduler_settings = await session.run_sync(lambda sync_session: get_sync_setting_map(sync_session))
     configured_max_accounts = clamp_int(
         max_accounts
         if max_accounts is not None
@@ -570,8 +621,7 @@ async def automation_scheduler_tick(
         deferred_account_ids = due_account_ids[configured_max_accounts:]
         due_account_ids = due_account_ids[:configured_max_accounts]
         due_reasons = {account_id: due_reasons[account_id] for account_id in due_account_ids}
-    budget_only_reasons = {"budget_guard", "peak_budget"}
-    budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(budget_only_reasons) for account_id in due_account_ids)
+    budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(BUDGET_ONLY_REASONS) for account_id in due_account_ids)
     if not due_account_ids:
         return JSONResponse({"queued": False, "reason": "not_due", "schedule_decisions": decisions})
     stale_before = now - STALE_QUEUED_AUTOMATION_JOB_AFTER
@@ -635,6 +685,7 @@ async def automation_scheduler_tick(
                 "deferred_account_ids": deferred_account_ids,
                 "scheduler_max_accounts_per_tick": configured_max_accounts,
                 "due_reasons": due_reasons,
+                "due_tiers": {account_id: due_tiers.get(account_id) for account_id in due_account_ids},
                 "budget_only": budget_only,
                 "schedule_decisions": decisions,
             }
@@ -653,6 +704,12 @@ async def automation_scheduler_tick(
             "deferred_account_ids": deferred_account_ids,
             "scheduler_max_accounts_per_tick": configured_max_accounts,
             "original_due_count": len(original_due_account_ids),
+            "priority": {
+                "primary_customer_ids": sorted(primary_customer_ids),
+                "secondary_customer_ids": sorted(secondary_customer_ids),
+                "include_unlisted_accounts": include_unlisted,
+                "due_tiers": {account_id: due_tiers.get(account_id) for account_id in due_account_ids},
+            },
             "schedule_decisions": decisions,
         },
     )
@@ -673,6 +730,7 @@ async def automation_scheduler_tick(
             "deferred_account_ids": deferred_account_ids,
             "scheduler_max_accounts_per_tick": configured_max_accounts,
             "due_reasons": due_reasons,
+            "due_tiers": {account_id: due_tiers.get(account_id) for account_id in due_account_ids},
             "budget_only": budget_only,
             "schedule_decisions": decisions,
         }

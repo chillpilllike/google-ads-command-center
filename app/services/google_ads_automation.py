@@ -91,6 +91,7 @@ DEFAULT_DYNAMIC_SCHEDULE_MINUTE = 20
 PEAK_BUDGET_STATE_PREFIX = "peak_budget_state"
 CAMPAIGN_BOOTSTRAP_STATE_PREFIX = "campaign_bootstrap_state"
 AUTOMATION_QUOTA_STATE_PREFIX = "automation_api_quota"
+DEVELOPER_TOKEN_QUOTA_STATE_PREFIX = "automation_developer_token_quota"
 SCALE_SEARCH_THEME_MIGRATION_STATE_PREFIX = "scale_search_theme_migration"
 SCALE_LANDING_PAGE_MIGRATION_STATE_PREFIX = "scale_landing_page_migration"
 WASTE_RECOVERY_STATE_PREFIX = "waste_recovery"
@@ -120,6 +121,17 @@ GA4_ECOMMERCE_REFRESH_MAX_AGE_HOURS = 20
 BUDGET_GUARD_QUOTA_UNITS = 2
 PEAK_BUDGET_TRANSITION_QUOTA_UNITS = 2
 PEAK_TIMEZONE_FETCH_QUOTA_UNITS = 1
+LIVE_CAMPAIGN_CREATION_QUOTA_UNITS = 450
+LIVE_ASSET_PUBLICATION_QUOTA_UNITS = 250
+BUDGET_RESERVED_QUOTA_REASONS = {
+    "odoo_sales_budget_guard",
+    "odoo_sales_budget_guard_budget_check",
+    "peak_budget_transition",
+    "peak_budget_restore",
+    "peak_budget_boost",
+    "peak_budget_timezone_fetch",
+    "campaign_metric_refresh_7d",
+}
 PMAX_SEARCH_THEME_LIMIT = 50
 PMAX_ASSET_GROUP_LIMIT = 100
 PMAX_SEARCH_THEME_TEXT_LIMIT = 80
@@ -530,8 +542,24 @@ def automation_quota_state_key(account: GoogleAdsAccount, now: Optional[datetime
     return f"{AUTOMATION_QUOTA_STATE_PREFIX}.{account.customer_id}.{day}"
 
 
+def developer_token_quota_state_key(account: GoogleAdsAccount, now: Optional[datetime] = None) -> str:
+    day = (now or utcnow()).astimezone(timezone.utc).date().isoformat()
+    if account.connection_id:
+        scope = f"connection.{int(account.connection_id)}"
+    else:
+        scope = f"token.{_account_developer_token_hash(account) or 'unknown'}"
+    return f"{DEVELOPER_TOKEN_QUOTA_STATE_PREFIX}.{scope}.{day}"
+
+
 def load_automation_quota_state(session: Session, account: GoogleAdsAccount, now: Optional[datetime] = None) -> dict[str, Any]:
     row = session.scalar(select(AppSetting).where(AppSetting.key == automation_quota_state_key(account, now)))
+    if row is not None and isinstance(row.value, dict):
+        return dict(row.value)
+    return {}
+
+
+def load_developer_token_quota_state(session: Session, account: GoogleAdsAccount, now: Optional[datetime] = None) -> dict[str, Any]:
+    row = session.scalar(select(AppSetting).where(AppSetting.key == developer_token_quota_state_key(account, now)))
     if row is not None and isinstance(row.value, dict):
         return dict(row.value)
     return {}
@@ -559,24 +587,55 @@ def reserve_automation_quota_units(
 ) -> dict[str, Any]:
     now = now or utcnow()
     account = preference.account
-    budget = clamp_int(preference.api_call_budget_per_day, 750, 1, 100000)
+    settings_map = get_sync_setting_map(session)
+    account_budget = clamp_int(preference.api_call_budget_per_day, 750, 1, 100000)
+    developer_budget = clamp_int(settings_map.get("automation.basic_access_daily_operation_budget"), 15000, 1000, 100000)
+    reserve_floor = clamp_int(settings_map.get("automation.basic_access_budget_reserve"), 3000, 0, developer_budget - 1)
     units = clamp_int(units, 1, 1, 100000)
     key = automation_quota_state_key(account, now)
+    developer_key = developer_token_quota_state_key(account, now)
+    developer_locked = _postgres_advisory_lock(session, developer_key)
     locked = _postgres_advisory_lock(session, key)
     state = load_automation_quota_state(session, account, now)
     used = int(state.get("used_units") or 0)
-    remaining = max(budget - used, 0)
+    remaining = max(account_budget - used, 0)
     if units > remaining:
         return {
             "allowed": False,
             "status": "quota_deferred",
-            "reason": "Daily automation API budget would be exceeded; work will resume on the next schedule/day.",
+            "reason": "Daily account automation API budget would be exceeded; work will resume on the next schedule/day.",
             "key": key,
             "locked": locked,
-            "budget_units": budget,
+            "budget_units": account_budget,
             "used_units": used,
             "requested_units": units,
             "remaining_units": remaining,
+        }
+    developer_state = load_developer_token_quota_state(session, account, now)
+    developer_used = int(developer_state.get("used_units") or 0)
+    developer_remaining = max(developer_budget - developer_used, 0)
+    budget_reserved_reason = reason in BUDGET_RESERVED_QUOTA_REASONS
+    usable_developer_remaining = developer_remaining if budget_reserved_reason else max(developer_remaining - reserve_floor, 0)
+    if units > usable_developer_remaining:
+        return {
+            "allowed": False,
+            "status": "quota_deferred",
+            "reason": (
+                "Developer-token Basic Access operations reserve would be consumed; "
+                "heavy work is deferred so budget up/down and monitoring keep room."
+            ),
+            "key": key,
+            "developer_key": developer_key,
+            "locked": locked,
+            "developer_locked": developer_locked,
+            "budget_units": account_budget,
+            "used_units": used,
+            "remaining_units": remaining,
+            "developer_budget_units": developer_budget,
+            "developer_used_units": developer_used,
+            "developer_remaining_units": developer_remaining,
+            "developer_reserve_units": reserve_floor,
+            "requested_units": units,
         }
 
     reservations = state.get("reservations") if isinstance(state.get("reservations"), list) else []
@@ -592,11 +651,50 @@ def reserve_automation_quota_units(
         "date": now.astimezone(timezone.utc).date().isoformat(),
         "account_id": account.id,
         "customer_id": account.customer_id,
-        "budget_units": budget,
+        "budget_units": account_budget,
         "used_units": used + units,
-        "remaining_units": max(budget - used - units, 0),
+        "remaining_units": max(account_budget - used - units, 0),
         "reservations": reservations[-80:],
     }
+    developer_reservations = developer_state.get("reservations") if isinstance(developer_state.get("reservations"), list) else []
+    developer_reservations.append(
+        {
+            "reason": reason,
+            "units": units,
+            "account_id": account.id,
+            "customer_id": account.customer_id,
+            "reserved_at": now.astimezone(timezone.utc).isoformat(),
+        }
+    )
+    developer_state = {
+        **developer_state,
+        "date": now.astimezone(timezone.utc).date().isoformat(),
+        "connection_id": account.connection_id,
+        "developer_token_hash": _account_developer_token_hash(account),
+        "budget_units": developer_budget,
+        "reserve_units": reserve_floor,
+        "used_units": developer_used + units,
+        "remaining_units": max(developer_budget - developer_used - units, 0),
+        "reservations": developer_reservations[-160:],
+    }
+    developer_stmt = insert(AppSetting).values(
+        key=developer_key,
+        value=developer_state,
+        category="Automation state",
+        label=f"Google Ads developer-token automation quota {developer_state['date']}",
+        help_text="Developer-token-level daily operation ledger for Google Ads Basic Access protection.",
+        input_type="json",
+        sensitive=False,
+    )
+    developer_stmt = developer_stmt.on_conflict_do_update(
+        index_elements=[AppSetting.key],
+        set_={
+            "value": developer_stmt.excluded.value,
+            "label": developer_stmt.excluded.label,
+            "help_text": developer_stmt.excluded.help_text,
+        },
+    )
+    session.execute(developer_stmt)
     stmt = insert(AppSetting).values(
         key=key,
         value=state,
@@ -620,11 +718,17 @@ def reserve_automation_quota_units(
         "allowed": True,
         "status": "reserved",
         "key": key,
+        "developer_key": developer_key,
         "locked": locked,
-        "budget_units": budget,
+        "developer_locked": developer_locked,
+        "budget_units": account_budget,
         "used_units": used + units,
         "requested_units": units,
-        "remaining_units": max(budget - used - units, 0),
+        "remaining_units": max(account_budget - used - units, 0),
+        "developer_budget_units": developer_budget,
+        "developer_used_units": developer_used + units,
+        "developer_remaining_units": max(developer_budget - developer_used - units, 0),
+        "developer_reserve_units": reserve_floor,
     }
 
 
@@ -7838,36 +7942,53 @@ def run_account_automation_monitor(
                 "reason": "Turn monitor-only off before live campaign creation.",
             }
         else:
-            from app.services.google_ads_live_campaign_creator import enforce_automation_campaign_revisions, publish_automation_campaigns
+            live_creation_quota = reserve_automation_quota_units(
+                session,
+                preference,
+                units=LIVE_CAMPAIGN_CREATION_QUOTA_UNITS,
+                reason="live_campaign_creation",
+                now=now,
+            )
+            if not live_creation_quota["allowed"]:
+                live_campaign_creation_step = {
+                    "name": "live_campaign_creation",
+                    "status": "deferred_quota",
+                    "reason": live_creation_quota["reason"],
+                    "quota": live_creation_quota,
+                    "estimated_operation_units": LIVE_CAMPAIGN_CREATION_QUOTA_UNITS,
+                }
+            else:
+                from app.services.google_ads_live_campaign_creator import enforce_automation_campaign_revisions, publish_automation_campaigns
 
-            # The live publisher performs several Google API calls. End the
-            # current transaction first so remote Postgres does not close an
-            # idle-in-transaction connection while we wait on Google.
-            session.commit()
-            checkpoint("live_campaign_creation")
-            live_campaign_creation_step = publish_automation_campaigns(
-                session,
-                preference,
-                validate_only=False,
-                progress_callback=checkpoint,
-            )
-            session.commit()
-            checkpoint("live_campaign_revisions")
-            campaign_revision_step = enforce_automation_campaign_revisions(
-                session,
-                preference,
-                validate_only=False,
-            )
-            session.commit()
-            checkpoint(
-                "live_campaign_creation",
-                live_campaign_creation_step.get("status") or "done",
-                revision_status=campaign_revision_step.get("status") if isinstance(campaign_revision_step, dict) else None,
-            )
-            live_campaign_creation_step = {
-                **live_campaign_creation_step,
-                "revision": campaign_revision_step,
-            }
+                # The live publisher performs several Google API calls. End the
+                # current transaction first so remote Postgres does not close an
+                # idle-in-transaction connection while we wait on Google.
+                session.commit()
+                checkpoint("live_campaign_creation")
+                live_campaign_creation_step = publish_automation_campaigns(
+                    session,
+                    preference,
+                    validate_only=False,
+                    progress_callback=checkpoint,
+                )
+                session.commit()
+                checkpoint("live_campaign_revisions")
+                campaign_revision_step = enforce_automation_campaign_revisions(
+                    session,
+                    preference,
+                    validate_only=False,
+                )
+                session.commit()
+                checkpoint(
+                    "live_campaign_creation",
+                    live_campaign_creation_step.get("status") or "done",
+                    revision_status=campaign_revision_step.get("status") if isinstance(campaign_revision_step, dict) else None,
+                )
+                live_campaign_creation_step = {
+                    **live_campaign_creation_step,
+                    "quota": live_creation_quota,
+                    "revision": campaign_revision_step,
+                }
         summary["steps"].append(live_campaign_creation_step)
 
     asset_publication_step: Optional[dict[str, Any]] = None
@@ -7915,72 +8036,89 @@ def run_account_automation_monitor(
                         **quota_retry,
                     }
                 else:
-                    # Asset generation/publishing may call Google and Odoo.
-                    # Keep each external section out of an open DB transaction.
-                    session.commit()
-                    checkpoint("live_asset_generation")
-                    generated_asset_result = generate_account_assets(
+                    asset_publication_quota = reserve_automation_quota_units(
                         session,
-                        account_id=account.id,
-                        include_promotions=True,
+                        preference,
+                        units=LIVE_ASSET_PUBLICATION_QUOTA_UNITS,
+                        reason="live_asset_publication",
+                        now=now,
                     )
-                    session.commit()
-                    checkpoint(
-                        "live_asset_generation",
-                        "done",
-                        generated_count=generated_asset_result.get("generated_count"),
-                        signal_count=generated_asset_result.get("signal_count"),
-                    )
-                    checkpoint("live_asset_publication")
-                    client = build_client(settings_map, account.manager_customer_id, account.connection)
-                    published_asset_result = publish_generated_assets(
-                        session,
-                        client,
-                        account,
-                        validate_only=False,
-                        max_assets=100,
-                    )
-                    session.commit()
-                    checkpoint(
-                        "live_asset_publication",
-                        "done" if not published_asset_result.get("failed") else "partial",
-                        created=published_asset_result.get("created"),
-                        linked=published_asset_result.get("linked"),
-                        failed=published_asset_result.get("failed"),
-                        quota_exhausted=published_asset_result.get("quota_exhausted"),
-                    )
-                    if published_asset_result.get("quota_exhausted"):
-                        retry_after_seconds = int(published_asset_result.get("quota_retry_after_seconds") or 0)
-                        if retry_after_seconds > 0:
-                            quota_value = {
-                                "customer_id": account.customer_id,
-                                "account_id": account.id,
-                                "reason": "Google Ads API basic-access operations quota exhausted during live asset publication",
-                                "retry_after_seconds": retry_after_seconds,
-                                "retry_not_before": (utcnow() + timedelta(seconds=retry_after_seconds)).isoformat(),
-                                "recorded_at": utcnow().isoformat(),
-                            }
-                            stmt = insert(AppSetting).values(
-                                key=f"{ASSET_PUBLISH_QUOTA_PREFIX}.{account.customer_id}",
-                                value=quota_value,
-                                category="google_ads_automation",
-                                label=f"{account.name} asset publish quota retry",
-                                help_text="Recorded when Google Ads API returns too many requests during live asset publication.",
-                                input_type="json",
-                                sensitive=False,
-                                updated_at=utcnow(),
-                            ).on_conflict_do_update(
-                                index_elements=[AppSetting.key],
-                                set_={"value": quota_value, "updated_at": utcnow()},
-                            )
-                            session.execute(stmt)
-                            session.commit()
-                    asset_publication_step = {
-                        "name": "live_asset_publication",
-                        "status": "done" if not published_asset_result.get("failed") else "partial",
-                        "generated": generated_asset_result,
-                        "published": published_asset_result,
-                    }
+                    if not asset_publication_quota["allowed"]:
+                        asset_publication_step = {
+                            "name": "live_asset_publication",
+                            "status": "deferred_quota",
+                            "reason": asset_publication_quota["reason"],
+                            "quota": asset_publication_quota,
+                            "estimated_operation_units": LIVE_ASSET_PUBLICATION_QUOTA_UNITS,
+                        }
+                    else:
+                        # Asset generation/publishing may call Google and Odoo.
+                        # Keep each external section out of an open DB transaction.
+                        session.commit()
+                        checkpoint("live_asset_generation")
+                        generated_asset_result = generate_account_assets(
+                            session,
+                            account_id=account.id,
+                            include_promotions=True,
+                        )
+                        session.commit()
+                        checkpoint(
+                            "live_asset_generation",
+                            "done",
+                            generated_count=generated_asset_result.get("generated_count"),
+                            signal_count=generated_asset_result.get("signal_count"),
+                        )
+                        checkpoint("live_asset_publication")
+                        client = build_client(settings_map, account.manager_customer_id, account.connection)
+                        published_asset_result = publish_generated_assets(
+                            session,
+                            client,
+                            account,
+                            validate_only=False,
+                            max_assets=100,
+                        )
+                        session.commit()
+                        checkpoint(
+                            "live_asset_publication",
+                            "done" if not published_asset_result.get("failed") else "partial",
+                            created=published_asset_result.get("created"),
+                            linked=published_asset_result.get("linked"),
+                            failed=published_asset_result.get("failed"),
+                            quota_exhausted=published_asset_result.get("quota_exhausted"),
+                        )
+                        if published_asset_result.get("quota_exhausted"):
+                            retry_after_seconds = int(published_asset_result.get("quota_retry_after_seconds") or 0)
+                            if retry_after_seconds > 0:
+                                quota_value = {
+                                    "customer_id": account.customer_id,
+                                    "account_id": account.id,
+                                    "reason": "Google Ads API basic-access operations quota exhausted during live asset publication",
+                                    "retry_after_seconds": retry_after_seconds,
+                                    "retry_not_before": (utcnow() + timedelta(seconds=retry_after_seconds)).isoformat(),
+                                    "recorded_at": utcnow().isoformat(),
+                                }
+                                stmt = insert(AppSetting).values(
+                                    key=f"{ASSET_PUBLISH_QUOTA_PREFIX}.{account.customer_id}",
+                                    value=quota_value,
+                                    category="google_ads_automation",
+                                    label=f"{account.name} asset publish quota retry",
+                                    help_text="Recorded when Google Ads API returns too many requests during live asset publication.",
+                                    input_type="json",
+                                    sensitive=False,
+                                    updated_at=utcnow(),
+                                ).on_conflict_do_update(
+                                    index_elements=[AppSetting.key],
+                                    set_={"value": quota_value, "updated_at": utcnow()},
+                                )
+                                session.execute(stmt)
+                                session.commit()
+                        asset_publication_step = {
+                            "name": "live_asset_publication",
+                            "status": "done" if not published_asset_result.get("failed") else "partial",
+                            "quota": asset_publication_quota,
+                            "generated": generated_asset_result,
+                            "published": published_asset_result,
+                        }
         except Exception as exc:  # noqa: BLE001 - assets should not hide campaign-monitor results.
             session.rollback()
             asset_publication_step = {

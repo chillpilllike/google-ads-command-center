@@ -11,10 +11,12 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from sqlalchemy import func, select
 
+from app.app_settings import get_sync_setting_map, parse_bool
 from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount
 from app.runtime_role import primary_instance_required_result
 from app.services.google_ads_automation import (
     budget_guard_due_now,
+    clamp_int,
     enabled_automation_preferences,
     peak_budget_due_now,
     preference_due_now,
@@ -25,6 +27,27 @@ from app.tasks import SessionLocal, run_google_ads_automation_monitor
 
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
 STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
+DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK = 5
+BUDGET_ONLY_REASONS = {"budget_guard", "peak_budget"}
+
+
+def customer_id_set(value: object) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = str(value).replace(",", "\n").splitlines()
+    return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
+
+
+def scheduler_tier(account: GoogleAdsAccount, primary_ids: set[str], secondary_ids: set[str]) -> int:
+    customer_id = "".join(ch for ch in str(account.customer_id or "") if ch.isdigit())
+    if customer_id in primary_ids:
+        return 0
+    if customer_id in secondary_ids:
+        return 1
+    return 2
 
 
 def automation_first_run_missing(session, account_id: int) -> bool:
@@ -45,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignore-schedule", action="store_true", help="Queue selected enabled accounts immediately.")
     parser.add_argument("--recompute-schedule", action="store_true", help="Refresh the low-traffic runtime decision from saved time segments before checking due accounts.")
     parser.add_argument("--fetch-timezone", action="store_true", help="Use one Google Ads customer query to refresh the account timezone while recomputing.")
+    parser.add_argument("--max-accounts", type=int, default=None, help="Maximum due accounts to queue in this scheduler tick.")
     return parser.parse_args()
 
 
@@ -69,10 +93,24 @@ def main() -> None:
             selected_ids.extend(account.id for account in accounts)
         selected_ids = list(dict.fromkeys(selected_ids))
         preferences = enabled_automation_preferences(session, account_ids=selected_ids or None)
-        due_account_ids: list[int] = []
+        scheduler_settings = get_sync_setting_map(session)
+        primary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_primary_customer_ids"))
+        secondary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_secondary_customer_ids"))
+        include_unlisted = parse_bool(scheduler_settings.get("automation.scheduler_include_unlisted_accounts", False))
+        configured_max_accounts = clamp_int(
+            args.max_accounts
+            if args.max_accounts is not None
+            else scheduler_settings.get("automation.scheduler_max_accounts_per_tick", DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK),
+            DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK,
+            1,
+            100,
+        )
+        due_candidates: list[tuple[int, datetime, str, int]] = []
         due_reasons: dict[int, list[str]] = {}
+        due_tiers: dict[int, int] = {}
         decisions: list[dict] = []
         for preference in preferences:
+            account = preference.account
             if args.recompute_schedule:
                 schedule_decision = refresh_low_traffic_schedule(
                     session,
@@ -87,6 +125,8 @@ def main() -> None:
                 decisions.append(
                     {
                         "account_id": preference.account_id,
+                        "customer_id": account.customer_id,
+                        "priority_tier": scheduler_tier(account, primary_customer_ids, secondary_customer_ids),
                         "time": schedule_decision.get("recommended_time"),
                         "time_zone": schedule_decision.get("time_zone"),
                         "low_hour_impressions": schedule_decision.get("low_hour_impressions"),
@@ -110,11 +150,38 @@ def main() -> None:
             if automation_first_run_missing(session, preference.account_id):
                 reasons.append("first_run_bootstrap")
             if reasons:
-                due_account_ids.append(preference.account_id)
+                tier = scheduler_tier(account, primary_customer_ids, secondary_customer_ids)
+                heavy_reasons = not set(reasons).issubset(BUDGET_ONLY_REASONS)
+                if tier > 1 and heavy_reasons and not include_unlisted and not selected_ids:
+                    decisions.append(
+                        {
+                            "account_id": preference.account_id,
+                            "customer_id": account.customer_id,
+                            "priority_tier": tier,
+                            "status": "deferred_unlisted_basic_access",
+                            "reasons": reasons,
+                        }
+                    )
+                    continue
+                due_candidates.append(
+                    (
+                        tier,
+                        preference.last_run_at or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        account.name,
+                        preference.account_id,
+                    )
+                )
                 due_reasons[preference.account_id] = reasons
+                due_tiers[preference.account_id] = tier
+        due_account_ids = [account_id for _tier, _last_run, _name, account_id in sorted(due_candidates)]
         due_account_ids = list(dict.fromkeys(due_account_ids))
-        budget_only_reasons = {"budget_guard", "peak_budget"}
-        budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(budget_only_reasons) for account_id in due_account_ids)
+        original_due_account_ids = list(due_account_ids)
+        deferred_account_ids: list[int] = []
+        if len(due_account_ids) > configured_max_accounts:
+            deferred_account_ids = due_account_ids[configured_max_accounts:]
+            due_account_ids = due_account_ids[:configured_max_accounts]
+            due_reasons = {account_id: due_reasons[account_id] for account_id in due_account_ids}
+        budget_only = bool(due_account_ids) and all(set(due_reasons.get(account_id) or []).issubset(BUDGET_ONLY_REASONS) for account_id in due_account_ids)
         if not due_account_ids:
             print("No enabled automation accounts are due right now.")
             if decisions:
@@ -181,6 +248,15 @@ def main() -> None:
                 "budget_only": budget_only,
                 "queued_by": "scripts/queue_automation_monitor.py",
                 "due_reasons": due_reasons,
+                "deferred_account_ids": deferred_account_ids,
+                "scheduler_max_accounts_per_tick": configured_max_accounts,
+                "original_due_count": len(original_due_account_ids),
+                "priority": {
+                    "primary_customer_ids": sorted(primary_customer_ids),
+                    "secondary_customer_ids": sorted(secondary_customer_ids),
+                    "include_unlisted_accounts": include_unlisted,
+                    "due_tiers": {account_id: due_tiers.get(account_id) for account_id in due_account_ids},
+                },
                 "schedule_decisions": decisions,
             },
             status=BackgroundJobStatus.queued,
