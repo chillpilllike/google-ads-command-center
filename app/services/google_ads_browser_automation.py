@@ -18,6 +18,13 @@ BROWSER_AUTOMATION_TOKEN_KEY = "browser_automation.extension_token"
 BROWSER_TASK_FINAL_STATUSES = {"done", "skipped", "cancelled"}
 BROWSER_TASK_CLAIMABLE_STATUSES = {"queued", "retry"}
 BROWSER_TASK_STALE_CLAIM_MINUTES = 15
+BROWSER_TASK_BATCHABLE_ACTIONS = {
+    "add_keyword",
+    "add_negative_keyword",
+    "add_url_inclusion",
+    "add_url_exclusion",
+    "add_pmax_search_theme",
+}
 
 
 def _clean(value: Any, *, max_len: int = 255) -> str:
@@ -38,6 +45,32 @@ def _hash_payload(*values: Any) -> str:
         digest.update(str(value or "").encode("utf-8", "ignore"))
         digest.update(b"\0")
     return digest.hexdigest()[:64]
+
+
+def _payload_main_value(payload: dict[str, Any]) -> str:
+    for key in ("keyword", "search_theme", "url"):
+        value = _clean(payload.get(key), max_len=500)
+        if value:
+            return value
+    return ""
+
+
+def _task_batch_item(task: BrowserAutomationTask) -> dict[str, Any]:
+    payload = task.payload_json if isinstance(task.payload_json, dict) else {}
+    return {
+        "task_id": int(task.id),
+        "action_type": task.action_type,
+        "entity_type": task.entity_type,
+        "campaign": task.campaign_name,
+        "ad_group": task.ad_group_name,
+        "asset_group": task.asset_group_name,
+        "value": _payload_main_value(payload),
+        "keyword": _clean(payload.get("keyword"), max_len=120),
+        "match_type": _clean(payload.get("match_type"), max_len=80),
+        "search_theme": _clean(payload.get("search_theme"), max_len=120),
+        "url": _clean(payload.get("url"), max_len=500),
+        "payload": payload,
+    }
 
 
 def _ads_url(account: GoogleAdsAccount, path: str = "overview") -> str:
@@ -299,6 +332,7 @@ def claim_next_browser_automation_task(
     *,
     worker_id: str,
     account_id: Optional[int] = None,
+    batch_size: int = 50,
 ) -> Optional[BrowserAutomationTask]:
     stale_before = datetime.utcnow() - timedelta(minutes=BROWSER_TASK_STALE_CLAIM_MINUTES)
     stale_statement = (
@@ -331,6 +365,38 @@ def claim_next_browser_automation_task(
     task.claimed_by = _clean(worker_id, max_len=160)
     task.claimed_at = datetime.utcnow()
     task.started_at = task.started_at or datetime.utcnow()
+    batch_items = [_task_batch_item(task)]
+    if task.action_type in BROWSER_TASK_BATCHABLE_ACTIONS and batch_size > 1:
+        sibling_statement = (
+            select(BrowserAutomationTask.id)
+            .where(BrowserAutomationTask.id != task.id)
+            .where(BrowserAutomationTask.account_id == task.account_id)
+            .where(BrowserAutomationTask.status.in_(BROWSER_TASK_CLAIMABLE_STATUSES))
+            .where(BrowserAutomationTask.action_type == task.action_type)
+            .where(BrowserAutomationTask.campaign_name == task.campaign_name)
+            .where(BrowserAutomationTask.ad_group_name == task.ad_group_name)
+            .where(BrowserAutomationTask.asset_group_name == task.asset_group_name)
+            .order_by(BrowserAutomationTask.priority.asc(), BrowserAutomationTask.step_order.asc(), BrowserAutomationTask.id.asc())
+            .limit(max(0, min(int(batch_size), 250) - 1))
+            .with_for_update(skip_locked=True)
+        )
+        if account_id:
+            sibling_statement = sibling_statement.where(BrowserAutomationTask.account_id == int(account_id))
+        sibling_ids = [int(value) for value in session.scalars(sibling_statement).all()]
+        if sibling_ids:
+            siblings = list(session.scalars(select(BrowserAutomationTask).where(BrowserAutomationTask.id.in_(sibling_ids))).all())
+            for sibling in siblings:
+                sibling.status = "claimed"
+                sibling.claimed_by = _clean(worker_id, max_len=160)
+                sibling.claimed_at = task.claimed_at
+                sibling.started_at = sibling.started_at or datetime.utcnow()
+                batch_items.append(_task_batch_item(sibling))
+    task.result_json = {
+        **(task.result_json or {}),
+        "claimed_batch": batch_items,
+        "claimed_batch_size": len(batch_items),
+        "claimed_batch_at": datetime.utcnow().isoformat() + "Z",
+    }
     session.flush()
     return task
 
@@ -358,6 +424,31 @@ def mark_browser_automation_task_result(
     }
     if normalized in BROWSER_TASK_FINAL_STATUSES or normalized in {"failed", "needs_manual_attention"}:
         task.finished_at = datetime.utcnow()
+    claimed_batch = task.result_json.get("claimed_batch") if isinstance(task.result_json, dict) else []
+    result_batch_ids = result.get("batch_task_ids") if isinstance(result, dict) else None
+    batch_ids = {
+        int(item.get("task_id"))
+        for item in claimed_batch
+        if isinstance(item, dict) and str(item.get("task_id") or "").isdigit()
+    }
+    if isinstance(result_batch_ids, list):
+        for item in result_batch_ids:
+            if str(item).isdigit():
+                batch_ids.add(int(item))
+    batch_ids.discard(int(task.id))
+    if batch_ids:
+        siblings = list(session.scalars(select(BrowserAutomationTask).where(BrowserAutomationTask.id.in_(batch_ids))).all())
+        for sibling in siblings:
+            sibling.status = normalized
+            sibling.claimed_by = _clean(worker_id or sibling.claimed_by, max_len=160)
+            sibling.result_json = {
+                **(sibling.result_json or {}),
+                "batch_parent_task_id": int(task.id),
+                "last_result": result if isinstance(result, dict) else {"value": str(result)},
+                "reported_at": datetime.utcnow().isoformat() + "Z",
+            }
+            if normalized in BROWSER_TASK_FINAL_STATUSES or normalized in {"failed", "needs_manual_attention"}:
+                sibling.finished_at = datetime.utcnow()
     session.add(
         AutoPilotEvent(
             account_id=task.account_id,
@@ -375,6 +466,22 @@ def mark_browser_automation_task_result(
 
 
 def serialize_browser_task(task: BrowserAutomationTask) -> dict[str, Any]:
+    payload = dict(task.payload_json or {})
+    claimed_batch = task.result_json.get("claimed_batch") if isinstance(task.result_json, dict) else []
+    if isinstance(claimed_batch, list) and claimed_batch:
+        values = [
+            _clean(item.get("value"), max_len=500)
+            for item in claimed_batch
+            if isinstance(item, dict) and _clean(item.get("value"), max_len=500)
+        ]
+        payload["batch_items"] = claimed_batch
+        payload["batch_values"] = values
+        payload["batch_task_ids"] = [
+            int(item.get("task_id"))
+            for item in claimed_batch
+            if isinstance(item, dict) and str(item.get("task_id") or "").isdigit()
+        ]
+        payload["batch_size"] = len(values)
     return {
         "id": task.id,
         "account_id": task.account_id,
@@ -387,7 +494,7 @@ def serialize_browser_task(task: BrowserAutomationTask) -> dict[str, Any]:
         "priority": task.priority,
         "step_order": task.step_order,
         "status": task.status,
-        "payload": task.payload_json or {},
+        "payload": payload,
         "result": task.result_json or {},
         "claimed_by": task.claimed_by,
         "claimed_at": task.claimed_at.isoformat() if task.claimed_at else None,

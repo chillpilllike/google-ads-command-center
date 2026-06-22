@@ -44,13 +44,17 @@
       });
   }
 
-  function findTextInput() {
-    return deepElements().find((node) => {
+  function findTextInput({ preferMultiline = false } = {}) {
+    const candidates = deepElements().filter((node) => {
       if (!visible(node)) return false;
       const tag = node.tagName.toLowerCase();
       const type = String(node.getAttribute("type") || "").toLowerCase();
       return tag === "textarea" || (tag === "input" && !["hidden", "checkbox", "radio", "file"].includes(type)) || node.isContentEditable;
     });
+    if (preferMultiline) {
+      return candidates.find((node) => node.tagName.toLowerCase() === "textarea") || candidates.find((node) => node.isContentEditable) || candidates[0];
+    }
+    return candidates[0];
   }
 
   function setInputValue(node, value) {
@@ -82,6 +86,34 @@
     return payload.keyword || payload.search_theme || payload.url || payload.ad_type || payload.campaign || "";
   }
 
+  function taskValues(task) {
+    const payload = task.payload || {};
+    const values = Array.isArray(payload.batch_values) ? payload.batch_values : [];
+    const cleaned = values.map((value) => String(value || "").trim()).filter(Boolean);
+    if (cleaned.length) return [...new Set(cleaned)];
+    const value = mainValue(payload);
+    return value ? [value] : [];
+  }
+
+  function batchTaskIds(task) {
+    const payload = task.payload || {};
+    const ids = Array.isArray(payload.batch_task_ids) ? payload.batch_task_ids : [task.id];
+    return [...new Set(ids.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0))];
+  }
+
+  function keywordForPaste(value) {
+    const text = String(value || "").trim().replace(/^\[|\]$/g, "");
+    return text ? `[${text}]` : "";
+  }
+
+  function valuesForPaste(task) {
+    const values = taskValues(task);
+    if (task.action_type === "add_keyword" || task.action_type === "add_negative_keyword") {
+      return values.map(keywordForPaste).filter(Boolean);
+    }
+    return values;
+  }
+
   function renderPanel(task, note = "") {
     let panel = document.getElementById("gacc-worker-panel");
     if (!panel) {
@@ -101,8 +133,8 @@
         <div class="gacc-value">${escapeHtml(payload.campaign || "")}</div>
         <div class="gacc-muted">Ad group / Asset group</div>
         <div class="gacc-value">${escapeHtml(payload.ad_group || payload.asset_group || "")}</div>
-        <div class="gacc-muted">Value copied for paste</div>
-        <div class="gacc-value">${escapeHtml(mainValue(payload))}</div>
+        <div class="gacc-muted">Values copied for paste</div>
+        <div class="gacc-value">${escapeHtml(`${taskValues(task).length} item(s)\n${taskValues(task).slice(0, 12).join("\n")}${taskValues(task).length > 12 ? "\n..." : ""}`)}</div>
         ${note ? `<div class="gacc-value">${escapeHtml(note)}</div>` : ""}
       </main>
     `;
@@ -117,11 +149,37 @@
       .replaceAll('"', "&quot;");
   }
 
+  function possibleValidationText() {
+    return deepElements()
+      .filter(visible)
+      .map(textOf)
+      .find((text) => /\b(error|invalid|required|cannot|failed|disapproved|not eligible)\b/i.test(text));
+  }
+
+  async function selectExactUrlMode() {
+    const exact = findClickableByText(["use exact urls", "exact urls", "exact url"]);
+    if (exact) {
+      exact.click();
+      await sleep(400);
+      return true;
+    }
+    const radios = deepElements()
+      .filter(visible)
+      .filter((node) => String(node.getAttribute("role") || "").toLowerCase() === "radio" || String(node.getAttribute("type") || "").toLowerCase() === "radio");
+    const exactRadio = radios.find((node) => /exact url/i.test(textOf(node.closest("label") || node.parentElement || node)));
+    if (exactRadio) {
+      exactRadio.click();
+      await sleep(400);
+      return true;
+    }
+    return false;
+  }
+
   async function guardedAddFlow(task) {
     const payload = task.payload || {};
-    const value = mainValue(payload);
-    if (!value) {
-      return { status: "needs_manual_attention", reason: "No value found in task payload." };
+    const values = valuesForPaste(task);
+    if (!values.length) {
+      return { status: "needs_manual_attention", reason: "No values found in task payload." };
     }
     const addButton = findClickableByText(["add", "new", "plus", "create"]);
     if (!addButton) {
@@ -129,40 +187,48 @@
     }
     addButton.click();
     await sleep(1000);
-    const input = findTextInput();
+    if (task.action_type === "add_url_inclusion" || task.action_type === "add_url_exclusion") {
+      await selectExactUrlMode();
+    }
+    const input = findTextInput({ preferMultiline: values.length > 1 || task.action_type.includes("url") || task.action_type.includes("keyword") });
     if (!input) {
       return { status: "needs_manual_attention", reason: "Add dialog opened, but no editable input was found." };
     }
-    setInputValue(input, value);
+    const pasteValue = values.join("\n");
+    setInputValue(input, pasteValue);
     await sleep(350);
+    const intermediateAdd = values.length > 1 ? findClickableByText(["add urls", "add keywords", "add"]) : null;
+    if (intermediateAdd && intermediateAdd !== addButton) {
+      intermediateAdd.click();
+      await sleep(900);
+    }
     const save = findClickableByText(["save", "apply", "done"]);
     if (!save) {
       return { status: "needs_manual_attention", reason: "Value filled, but no Save/Apply button was found." };
     }
     save.click();
-    await sleep(1800);
-    const errorText = deepElements()
-      .filter(visible)
-      .map(textOf)
-      .find((text) => /\b(error|invalid|required|cannot|failed)\b/i.test(text));
+    await sleep(Math.min(6000, 1600 + values.length * 35));
+    const errorText = possibleValidationText();
     if (errorText) {
       return { status: "needs_manual_attention", reason: `Google Ads showed a possible validation message: ${errorText.slice(0, 220)}` };
     }
-    return { status: "done", reason: "Clicked add, filled the value, and clicked save/apply." };
+    return { status: "done", reason: `Clicked add, filled ${values.length} value(s), and clicked save/apply.` };
   }
 
   async function executeTask(task) {
     const payload = task.payload || {};
     renderPanel(task, "Preparing task...");
-    await copyToClipboard(mainValue(payload));
+    await copyToClipboard(valuesForPaste(task).join("\n") || mainValue(payload));
     const safeAddActions = new Set(["add_keyword", "add_negative_keyword", "add_url_inclusion", "add_url_exclusion", "add_pmax_search_theme"]);
     if (!safeAddActions.has(task.action_type)) {
-      renderPanel(task, "Complex campaign/ad/entity creation is prepared in the panel. Use the copied payload or Google Ads Editor import for this step.");
+      await copyToClipboard(JSON.stringify(payload.raw_editor_row || payload, null, 2));
+      renderPanel(task, "Complex campaign/ad/entity creation is queued and copied as structured JSON. Use the Google Ads Editor import bundle for this step until the wizard template is trained.");
       return {
         status: "needs_manual_attention",
-        reason: "Complex wizard step requires supervised browser flow.",
+        reason: "Complex wizard step requires Google Ads Editor import or supervised browser flow.",
         copied_value: mainValue(payload),
         current_url: location.href,
+        batch_task_ids: batchTaskIds(task),
       };
     }
     const result = await guardedAddFlow(task);
@@ -170,7 +236,9 @@
     return {
       status: result.status,
       reason: result.reason,
-      copied_value: mainValue(payload),
+      copied_value: valuesForPaste(task).join("\n") || mainValue(payload),
+      value_count: taskValues(task).length,
+      batch_task_ids: batchTaskIds(task),
       current_url: location.href,
     };
   }

@@ -177,6 +177,7 @@ async def extension_status(
 async def extension_next_task(
     worker_id: str = Query("browser-worker"),
     account_id: Optional[int] = None,
+    batch_size: int = Query(50, ge=1, le=250),
     authorization: Optional[str] = Header(None),
     x_automation_token: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
@@ -184,7 +185,12 @@ async def extension_next_task(
 ) -> dict[str, Any]:
     await _require_extension_token(session, authorization, x_automation_token, token)
     task = await session.run_sync(
-        lambda sync_session: claim_next_browser_automation_task(sync_session, worker_id=worker_id, account_id=account_id)
+        lambda sync_session: claim_next_browser_automation_task(
+            sync_session,
+            worker_id=worker_id,
+            account_id=account_id,
+            batch_size=batch_size,
+        )
     )
     await session.commit()
     if task is None:

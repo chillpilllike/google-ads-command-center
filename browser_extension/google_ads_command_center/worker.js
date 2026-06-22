@@ -35,12 +35,13 @@ function normalizeBaseUrl(value) {
 }
 
 async function config() {
-  const saved = await storageGet(["appBaseUrl", "token", "accountId", "pollMs", "running"]);
+  const saved = await storageGet(["appBaseUrl", "token", "accountId", "pollMs", "running", "batchSize"]);
   return {
     appBaseUrl: normalizeBaseUrl(saved.appBaseUrl),
     token: String(saved.token || "").trim(),
     accountId: String(saved.accountId || "").trim(),
     pollMs: Number(saved.pollMs || DEFAULT_POLL_MS),
+    batchSize: Math.max(1, Math.min(Number(saved.batchSize || 50), 250)),
     running: Boolean(saved.running),
   };
 }
@@ -133,7 +134,8 @@ async function runOneStep() {
   let task = null;
   try {
     const id = await workerId();
-    const next = await apiFetch(`/api/browser-automation/next?worker_id=${encodeURIComponent(id)}`);
+    const cfg = await config();
+    const next = await apiFetch(`/api/browser-automation/next?worker_id=${encodeURIComponent(id)}&batch_size=${encodeURIComponent(cfg.batchSize)}`);
     task = next.task;
     if (!task) {
       await updateStatus("No queued browser automation tasks.");
@@ -177,7 +179,7 @@ async function runOneStep() {
     await sleep(1500);
     const response = await withTimeout(
       chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_BROWSER_AUTOMATION_TASK", task }),
-      30000,
+      90000,
       "Timed out waiting for the Google Ads page worker response."
     );
     const status = response?.status || "needs_manual_attention";

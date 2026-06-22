@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from app.services.google_ads_browser_automation import _task_classification, _task_payload
+from app.services.google_ads_browser_automation import _task_classification, _task_payload, serialize_browser_task
 
 
 class GoogleAdsBrowserAutomationTests(unittest.TestCase):
@@ -47,6 +47,37 @@ class GoogleAdsBrowserAutomationTests(unittest.TestCase):
         self.assertEqual(payload["ad_group"], row["Ad Group"])
         self.assertEqual(payload["keyword"], "magnesium glycinate")
         self.assertIn("ads.google.com/aw/keywords", payload["target_url"])
+
+    def test_serialize_browser_task_includes_claimed_batch_values(self) -> None:
+        task = SimpleNamespace(
+            id=101,
+            account_id=7,
+            draft_id=None,
+            action_type="add_keyword",
+            entity_type="keyword",
+            campaign_name="AUTO | Core / Scale | RSA Target ROAS",
+            ad_group_name="AUTO | Core / Scale | RSA Keywords",
+            asset_group_name="",
+            priority=40,
+            step_order=9,
+            status="claimed",
+            payload_json={"keyword": "magnesium glycinate"},
+            result_json={
+                "claimed_batch": [
+                    {"task_id": 101, "value": "magnesium glycinate"},
+                    {"task_id": 102, "value": "vitamin c"},
+                ]
+            },
+            claimed_by="chrome-worker-test",
+            claimed_at=None,
+            finished_at=None,
+        )
+
+        payload = serialize_browser_task(task)["payload"]
+
+        self.assertEqual(payload["batch_values"], ["magnesium glycinate", "vitamin c"])
+        self.assertEqual(payload["batch_task_ids"], [101, 102])
+        self.assertEqual(payload["batch_size"], 2)
 
 
 if __name__ == "__main__":

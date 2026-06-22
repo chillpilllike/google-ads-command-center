@@ -1,4 +1,4 @@
-const fields = ["appBaseUrl", "token", "accountId"];
+const fields = ["appBaseUrl", "token", "accountId", "batchSize"];
 const statusBox = document.getElementById("status");
 
 function setStatus(message) {
