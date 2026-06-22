@@ -16,6 +16,7 @@ from app.runtime_role import primary_instance_required_result, runtime_role_stat
 from app.app_settings import get_sync_setting_map, parse_bool
 from app.services.background_jobs import create_background_job, mark_job_dispatch_failed, save_job_message_id
 from app.services.google_ads_automation import (
+    active_google_ads_quota_retry_state,
     automation_strategy_summary,
     budget_guard_due_now,
     clamp_int,
@@ -581,6 +582,26 @@ async def automation_scheduler_tick(
         if reasons:
             tier = _scheduler_tier(account, primary_customer_ids, secondary_customer_ids)
             heavy_reasons = not set(reasons).issubset(BUDGET_ONLY_REASONS)
+            quota_retry = await session.run_sync(
+                lambda sync_session, account_id=account.id: active_google_ads_quota_retry_state(
+                    sync_session,
+                    sync_session.get(GoogleAdsAccount, account_id),
+                    now=now,
+                )
+            )
+            if quota_retry:
+                decisions.append(
+                    {
+                        "account_id": preference.account_id,
+                        "customer_id": account.customer_id,
+                        "priority_tier": tier,
+                        "status": "deferred_google_ads_quota",
+                        "reasons": reasons,
+                        "retry_not_before": quota_retry.get("retry_not_before"),
+                        "quota_key": quota_retry.get("quota_key"),
+                    }
+                )
+                continue
             if tier > 1 and heavy_reasons and not include_unlisted and not force:
                 decisions.append(
                     {

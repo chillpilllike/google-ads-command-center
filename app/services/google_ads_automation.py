@@ -258,6 +258,15 @@ def _google_ads_api_quota_retry_state(session: Session, account: GoogleAdsAccoun
     }
 
 
+def active_google_ads_quota_retry_state(
+    session: Session,
+    account: GoogleAdsAccount,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return an active Google Ads quota cooldown without mutating run state."""
+    return _google_ads_api_quota_retry_state(session, account, now=now)
+
+
 def clamp_int(value: Any, default: int, low: int, high: int) -> int:
     try:
         parsed = int(value)
@@ -8216,8 +8225,12 @@ def run_account_automation_monitor(
     else:
         preference.last_error = None
     summary["finished_at"] = utcnow().isoformat()
-    preference.last_run_at = utcnow()
-    preference.last_analysis_at = preference.last_run_at
+    finished_at = utcnow()
+    if google_ads_api_blocked:
+        preference.last_analysis_at = finished_at
+    else:
+        preference.last_run_at = finished_at
+        preference.last_analysis_at = finished_at
     preference.strategy_summary_json = summary
     session.commit()
     return summary

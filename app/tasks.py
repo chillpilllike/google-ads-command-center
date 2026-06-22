@@ -368,7 +368,6 @@ def mark_preference_google_quota_blocked(
     result: dict[str, Any],
 ) -> None:
     now = utcnow()
-    preference.last_run_at = now
     preference.last_analysis_at = now
     preference.last_error = None
     preference.strategy_summary_json = result
