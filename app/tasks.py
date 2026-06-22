@@ -124,6 +124,21 @@ def _lock_app_setting_key(session: Session, key: str) -> None:
         session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
 
 
+def _lease_job_still_active(session: Session, job_id: object) -> bool:
+    try:
+        parsed_job_id = int(job_id)
+    except (TypeError, ValueError):
+        return True
+    job = session.get(BackgroundJob, parsed_job_id)
+    if job is None:
+        return False
+    return job.status in {
+        BackgroundJobStatus.queued,
+        BackgroundJobStatus.running,
+        BackgroundJobStatus.cancel_requested,
+    }
+
+
 def acquire_automation_run_lease(
     session: Session,
     account: GoogleAdsAccount,
@@ -137,6 +152,17 @@ def acquire_automation_run_lease(
     state = dict(row.value) if row is not None and isinstance(row.value, dict) else {}
     expires_at = _automation_lease_time(state.get("expires_at"))
     active_job_id = state.get("job_id")
+    if state.get("active") and active_job_id != job_id and expires_at and expires_at > now:
+        if not _lease_job_still_active(session, active_job_id):
+            state["active"] = False
+        else:
+            return {
+                "acquired": False,
+                "key": key,
+                "active_job_id": active_job_id,
+                "expires_at": expires_at.isoformat(),
+                "reason": "Another automation monitor is already running for this account.",
+            }
     if state.get("active") and active_job_id != job_id and expires_at and expires_at > now:
         return {
             "acquired": False,
@@ -214,6 +240,19 @@ def acquire_google_ads_api_account_lease(
     state = dict(row.value) if row is not None and isinstance(row.value, dict) else {}
     expires_at = _automation_lease_time(state.get("expires_at"))
     active_job_id = state.get("job_id")
+    if state.get("active") and active_job_id != job_id and expires_at and expires_at > now:
+        if not _lease_job_still_active(session, active_job_id):
+            state["active"] = False
+        else:
+            return {
+                "acquired": False,
+                "status": "busy",
+                "key": key,
+                "active_job_id": active_job_id,
+                "active_purpose": state.get("purpose"),
+                "expires_at": expires_at.isoformat(),
+                "reason": "Another Google Ads API job is already running for this account.",
+            }
     if state.get("active") and active_job_id != job_id and expires_at and expires_at > now:
         return {
             "acquired": False,
