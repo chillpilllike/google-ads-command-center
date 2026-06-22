@@ -37,7 +37,7 @@ def customer_id_set(value: object) -> set[str]:
     if isinstance(value, (list, tuple, set)):
         raw_items = [str(item) for item in value]
     else:
-        raw_items = str(value).replace(",", "\n").splitlines()
+        raw_items = str(value).replace("\\n", "\n").replace(",", "\n").splitlines()
     return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
 
 
