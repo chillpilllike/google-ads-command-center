@@ -1046,6 +1046,7 @@ def sync_google_ads_daily_keywords(
             errors = 0
             keyword_saved = 0
             pages_saved = 0
+            negative_saved = 0
             try:
                 for account in accounts:
                     if job_cancel_requested(session, job_id):
