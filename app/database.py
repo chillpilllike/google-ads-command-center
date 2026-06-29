@@ -16,8 +16,8 @@ settings = get_settings()
 engine = create_async_engine(
     settings.sqlalchemy_async_url,
     connect_args={"ssl": False, "timeout": 10},
-    pool_size=5,
-    max_overflow=5,
+    pool_size=settings.db_async_pool_size,
+    max_overflow=settings.db_async_max_overflow,
     pool_pre_ping=True,
     pool_recycle=1800,
 )

@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     worker_timeout_seconds: int = 60 * 60
     auto_init_db: bool = False
     public_base_url: str = ""
+    db_async_pool_size: int = 2
+    db_async_max_overflow: int = 2
+    db_sync_pool_size: int = 2
+    db_sync_max_overflow: int = 2
 
     model_config = SettingsConfigDict(
         env_file=ROOT_DIR / ".env",

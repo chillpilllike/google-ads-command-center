@@ -86,8 +86,8 @@ settings = get_settings()
 sync_engine = create_engine(
     settings.sqlalchemy_sync_url,
     connect_args={"sslmode": "disable", "connect_timeout": 20},
-    pool_size=5,
-    max_overflow=5,
+    pool_size=settings.db_sync_pool_size,
+    max_overflow=settings.db_sync_max_overflow,
     pool_pre_ping=True,
     pool_recycle=900,
     pool_timeout=30,
