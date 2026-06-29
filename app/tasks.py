@@ -47,6 +47,7 @@ from app.services.google_ads_account_red_flags import (
     account_api_red_flag,
     mark_preference_account_red_flagged,
     red_flag_blocked_result,
+    upsert_account_api_red_flag,
 )
 from app.services.google_ads_api_errors import (
     classify_google_ads_error,
@@ -865,7 +866,14 @@ def sync_google_ads_performance(
 ) -> None:
     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
         with SessionLocal() as session:
-            query = select(GoogleAdsAccount).where(GoogleAdsAccount.is_active.is_(True))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
             selected_ids = [int(item) for item in (account_ids or []) if item]
             if selected_ids:
                 query = query.where(GoogleAdsAccount.id.in_(selected_ids))
@@ -881,6 +889,9 @@ def sync_google_ads_performance(
                         return
                     api_lease = None
                     try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            continue
                         api_lease = acquire_google_ads_api_account_lease(
                             session,
                             account,
@@ -892,6 +903,15 @@ def sync_google_ads_performance(
                         sync_account_campaign_metrics(session, account, days, source_job_id=job_id)
                     except GoogleAdsException as exc:
                         errors += 1
+                        summary = summarize_google_ads_exception(exc)
+                        if "CUSTOMER_NOT_ENABLED" in str(summary).upper():
+                            upsert_account_api_red_flag(
+                                session,
+                                account,
+                                status="customer_not_enabled",
+                                reason="Google Ads API says this customer account is not enabled or has been deactivated.",
+                                source="google_ads_sync",
+                            )
                         record_google_ads_api_error(
                             session,
                             exc,
@@ -945,7 +965,14 @@ def sync_google_ads_research(
 ) -> None:
     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
         with SessionLocal() as session:
-            query = select(GoogleAdsAccount).where(GoogleAdsAccount.is_active.is_(True))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
             selected_ids = [int(item) for item in (account_ids or []) if item]
             if selected_ids:
                 query = query.where(GoogleAdsAccount.id.in_(selected_ids))
@@ -964,6 +991,9 @@ def sync_google_ads_research(
                         return
                     api_lease = None
                     try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            continue
                         api_lease = acquire_google_ads_api_account_lease(
                             session,
                             account,
@@ -1035,7 +1065,14 @@ def sync_google_ads_daily_keywords(
 ) -> None:
     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
         with SessionLocal() as session:
-            query = select(GoogleAdsAccount).where(GoogleAdsAccount.is_active.is_(True))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
             selected_ids = [int(item) for item in (account_ids or []) if item]
             if selected_ids:
                 query = query.where(GoogleAdsAccount.id.in_(selected_ids))
@@ -1054,6 +1091,9 @@ def sync_google_ads_daily_keywords(
                         return
                     api_lease = None
                     try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            continue
                         api_lease = acquire_google_ads_api_account_lease(
                             session,
                             account,
@@ -1096,6 +1136,15 @@ def sync_google_ads_daily_keywords(
                         negative_saved += int(negative_result.get("saved") or 0)
                     except GoogleAdsException as exc:
                         errors += 1
+                        summary = summarize_google_ads_exception(exc)
+                        if "CUSTOMER_NOT_ENABLED" in str(summary).upper():
+                            upsert_account_api_red_flag(
+                                session,
+                                account,
+                                status="customer_not_enabled",
+                                reason="Google Ads API says this customer account is not enabled or has been deactivated.",
+                                source="daily_keyword_sync",
+                            )
                         record_google_ads_api_error(
                             session,
                             exc,
