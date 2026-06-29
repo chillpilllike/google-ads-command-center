@@ -23,6 +23,7 @@ from app.models import (
     OdooWebsite,
 )
 from app.services.google_ads_api_errors import record_google_ads_api_error, record_google_ads_generic_error
+from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.google_ads_sync import build_client, enum_name
 from app.services.page_feed_restrictions import get_restricted_title_terms_sync, restricted_title_match
 
@@ -676,6 +677,15 @@ def publish_mapping_page_feed(
         "blocked_campaigns": [],
         "errors": [],
     }
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        publication.status = "blocked_by_account_red_flag"
+        publication.last_error = red_flag["reason"]
+        result.update({"status": "blocked_by_account_red_flag", "reason": red_flag["reason"], "red_flag": red_flag})
+        publication.last_publish_json = result
+        publication.updated_at = utcnow()
+        session.commit()
+        return result
     if not candidates:
         publication.status = "skipped"
         publication.last_error = "No winner or fallback Odoo page feed signals are available."

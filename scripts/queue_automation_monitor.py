@@ -24,12 +24,17 @@ from app.services.google_ads_automation import (
     refresh_low_traffic_schedule,
     refresh_peak_budget_decision,
 )
-from app.tasks import SessionLocal, run_google_ads_automation_monitor
+from app.tasks import SessionLocal, run_google_ads_automation_monitor, sync_google_ads_daily_keywords
 
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
 STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
 DEFAULT_SCHEDULER_MAX_ACCOUNTS_PER_TICK = 5
 BUDGET_ONLY_REASONS = {"budget_guard", "peak_budget"}
+DAILY_KEYWORD_SYNC_INTERVAL = timedelta(hours=24)
+DAILY_KEYWORD_SYNC_DAYS_SETTING = "automation.daily_keyword_sync_days"
+DAILY_KEYWORD_SYNC_MAX_ROWS_SETTING = "automation.daily_keyword_sync_max_rows"
+DAILY_KEYWORD_SYNC_DEFAULT_DAYS = 60
+DAILY_KEYWORD_SYNC_DEFAULT_MAX_ROWS = 5000
 
 
 def customer_id_set(value: object) -> set[str]:
@@ -70,7 +75,84 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recompute-schedule", action="store_true", help="Refresh the low-traffic runtime decision from saved time segments before checking due accounts.")
     parser.add_argument("--fetch-timezone", action="store_true", help="Use one Google Ads customer query to refresh the account timezone while recomputing.")
     parser.add_argument("--max-accounts", type=int, default=None, help="Maximum due accounts to queue in this scheduler tick.")
+    parser.add_argument("--skip-daily-keywords", action="store_true", help="Do not queue the recurring Google Ads keyword/negative/landing-page bank sync.")
     return parser.parse_args()
+
+
+def _active_job(session, job_type: str) -> BackgroundJob | None:
+    return session.scalar(
+        select(BackgroundJob)
+        .where(
+            BackgroundJob.job_type == job_type,
+            BackgroundJob.status.in_(
+                [
+                    BackgroundJobStatus.queued,
+                    BackgroundJobStatus.running,
+                    BackgroundJobStatus.cancel_requested,
+                ]
+            ),
+        )
+        .order_by(BackgroundJob.created_at.desc(), BackgroundJob.id.desc())
+        .limit(1)
+    )
+
+
+def _queue_daily_keyword_sync_if_due(session, now: datetime) -> None:
+    if _active_job(session, "google_ads_keyword_daily_sync") is not None:
+        return
+    latest_finished = session.scalar(
+        select(BackgroundJob.finished_at)
+        .where(
+            BackgroundJob.job_type == "google_ads_keyword_daily_sync",
+            BackgroundJob.status == BackgroundJobStatus.succeeded,
+            BackgroundJob.finished_at.is_not(None),
+        )
+        .order_by(BackgroundJob.finished_at.desc())
+        .limit(1)
+    )
+    if latest_finished is not None and latest_finished.astimezone(timezone.utc) > now - DAILY_KEYWORD_SYNC_INTERVAL:
+        return
+    scheduler_settings = get_sync_setting_map(session)
+    days = clamp_int(
+        scheduler_settings.get(DAILY_KEYWORD_SYNC_DAYS_SETTING),
+        DAILY_KEYWORD_SYNC_DEFAULT_DAYS,
+        1,
+        365,
+    )
+    max_rows = clamp_int(
+        scheduler_settings.get(DAILY_KEYWORD_SYNC_MAX_ROWS_SETTING),
+        DAILY_KEYWORD_SYNC_DEFAULT_MAX_ROWS,
+        50,
+        50_000,
+    )
+    job = BackgroundJob(
+        job_type="google_ads_keyword_daily_sync",
+        label="Daily Google Ads keyword, negative, and landing-page bank sync",
+        requested_by_id=None,
+        payload={
+            "account_ids": None,
+            "days": days,
+            "max_rows": max_rows,
+            "force": False,
+            "queued_by": "scripts/queue_automation_monitor.py",
+            "reason": "recurring_daily_keyword_negative_landing_page_sync",
+        },
+        status=BackgroundJobStatus.queued,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    try:
+        message = sync_google_ads_daily_keywords.send(days, job.id, None, max_rows, False)
+        job.message_id = str(message.message_id)
+        session.commit()
+        print(f"Queued daily Google Ads keyword sync job #{job.id}")
+    except Exception as exc:  # noqa: BLE001 - keep failed dispatch visible in Jobs.
+        job.status = BackgroundJobStatus.failed
+        job.error = str(exc)
+        job.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        raise
 
 
 def main() -> None:
@@ -82,6 +164,8 @@ def main() -> None:
         return
     now = datetime.now(timezone.utc)
     with SessionLocal() as session:
+        if not args.skip_daily_keywords:
+            _queue_daily_keyword_sync_if_due(session, now)
         selected_ids = [int(item) for item in args.account_id if item]
         customer_ids = [str(item).replace("-", "").strip() for item in args.customer_id if str(item).strip()]
         if customer_ids:

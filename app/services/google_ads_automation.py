@@ -34,6 +34,11 @@ from app.models import (
 )
 from app.services.currency_rates import convert_amount, get_latest_rate_snapshot_sync, snapshot_payload
 from app.services.google_ads_api_errors import record_google_ads_api_error, record_google_ads_generic_error
+from app.services.google_ads_account_red_flags import (
+    account_api_red_flag,
+    mark_preference_account_red_flagged,
+    red_flag_blocked_result,
+)
 from app.services.google_ads_assets import generate_account_assets
 from app.services.google_ads_asset_publisher import publish_generated_assets
 from app.services.google_ads_keyword_bank import sync_account_all_time_keyword_candidates, sync_account_keyword_candidates
@@ -102,7 +107,7 @@ FORCE_MINIMUM_BUDGET_SETTING = "automation.force_minimum_budget_when_budget_guar
 CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
-WASTE_RECOVERY_TARGET_ROAS = 2.0
+WASTE_RECOVERY_TARGET_ROAS = 5.0
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
 DEFAULT_TESTING_KEYWORD_LIMIT = 0
 DEFAULT_TESTING_LANDING_PAGE_LIMIT = 0
@@ -7339,6 +7344,13 @@ def run_account_automation_monitor(
         "planned_live_actions": [],
         "errors": [],
     }
+
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        summary = red_flag_blocked_result(account, red_flag)
+        summary["started_at"] = now.isoformat()
+        mark_preference_account_red_flagged(session, preference, red_flag)
+        return summary
 
     def checkpoint(name: str, status: str = "started", **extra: Any) -> None:
         if progress_callback is None:

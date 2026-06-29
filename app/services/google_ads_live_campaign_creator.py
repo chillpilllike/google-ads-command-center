@@ -29,6 +29,7 @@ from app.models import (
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
+from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.google_ads_api_errors import summarize_google_ads_exception
 from app.services.google_ads_browser_automation import generate_browser_automation_tasks
 from app.services.google_ads_landing_page_bank import usable_landing_page_url
@@ -79,7 +80,7 @@ REPLACEMENT_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions_s001"
 CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
-WASTE_RECOVERY_TARGET_ROAS = 2.0
+WASTE_RECOVERY_TARGET_ROAS = 5.0
 MINIMUM_DAILY_BUDGET_BY_CURRENCY = {
     "INR": 1000.0,
 }
@@ -5969,6 +5970,9 @@ def publish_automation_campaigns(
     )[:batch_limit]
     if not drafts:
         return {"name": "live_campaign_creation", "status": "skipped", "reason": "No eligible automation DSA/RSA drafts."}
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        return {"name": "live_campaign_creation", "status": "blocked_by_account_red_flag", "reason": red_flag["reason"], "red_flag": red_flag}
 
     session_info = _session_info(session)
     previous_scope_count = session_info.get("live_criteria_scope_count")

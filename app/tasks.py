@@ -43,6 +43,11 @@ from app.models import (
 from app.runtime_role import primary_instance_required_result
 from app.services.cost_dashboard_snapshot import refresh_standard_cost_dashboard_snapshots
 from app.services.google_ads_account_discovery import discover_accounts_for_connection
+from app.services.google_ads_account_red_flags import (
+    account_api_red_flag,
+    mark_preference_account_red_flagged,
+    red_flag_blocked_result,
+)
 from app.services.google_ads_api_errors import (
     classify_google_ads_error,
     record_google_ads_api_error,
@@ -1669,6 +1674,14 @@ def run_google_ads_automation_monitor(
                         mark_job_finished(session, job_id, BackgroundJobStatus.canceled, current=processed)
                         return
                     account = preference.account
+                    red_flag = account_api_red_flag(session, account)
+                    if red_flag is not None:
+                        result = red_flag_blocked_result(account, red_flag)
+                        mark_preference_account_red_flagged(session, preference, red_flag)
+                        results.append(result)
+                        processed += 1
+                        update_job_progress(session, job_id, current=processed)
+                        continue
                     quota_retry = google_ads_api_quota_retry_state(session, account)
                     if quota_retry:
                         result = google_ads_quota_blocked_result(account, quota_retry)

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.app_settings import get_sync_setting_map
 from app.models import GoogleAdsAccount, GoogleAdsCampaignMetric
 from app.services.google_ads_api_errors import summarize_google_ads_exception
+from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.google_ads_live_campaign_creator import _google_ads_search
 from app.services.google_ads_snapshot_store import upsert_snapshot
 from app.services.google_ads_sync import build_client, enum_name
@@ -341,6 +342,16 @@ def _upsert_campaign_metric_shells(
 
 
 def sync_account_auto_live_inventory(session: Session, account: GoogleAdsAccount) -> dict[str, Any]:
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        return {
+            "account_id": account.id,
+            "customer_id": account.customer_id,
+            "account_name": account.name,
+            "status": "blocked_by_account_red_flag",
+            "reason": red_flag["reason"],
+            "red_flag": red_flag,
+        }
     values = get_sync_setting_map(session)
     client = build_client(values, account.manager_customer_id, account.connection)
     result: dict[str, Any] = {

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.app_settings import get_sync_setting_map
 from app.models import GoogleAdsAccount, GoogleAdsAccountDailyMetric, GoogleAdsCampaignMetric, GoogleAdsConnection
+from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.google_ads_snapshot_store import (
     DATASET_CAMPAIGN_DAILY,
     get_fresh_snapshot,
@@ -150,6 +151,9 @@ def refresh_account_currency(
     account: GoogleAdsAccount,
     client: GoogleAdsClient | None = None,
 ) -> str:
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        raise RuntimeError(f"Google Ads API blocked for red-flagged account {account.customer_id}: {red_flag['reason']}")
     values = get_sync_setting_map(session)
     client = client or build_client(values, account.manager_customer_id, account.connection)
     ga_service = client.get_service("GoogleAdsService")
@@ -402,6 +406,9 @@ def sync_account_campaign_metrics(
         query=query,
     )
     if snapshot is None:
+        red_flag = account_api_red_flag(session, account)
+        if red_flag is not None:
+            return 0
         values = get_sync_setting_map(session)
         client = build_client(values, account.manager_customer_id, account.connection)
         rows = campaign_daily_rows_from_google(client, account, start_date=start_date, end_date=end_date)
