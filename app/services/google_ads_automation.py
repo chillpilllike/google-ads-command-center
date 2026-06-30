@@ -49,7 +49,11 @@ from app.services.google_ads_landing_page_bank import (
     usable_landing_page_url,
 )
 from app.services.google_ads_negative_keyword_bank import sync_account_negative_keyword_candidates
-from app.services.google_ads_pmax_gate import pmax_activation_gate, pmax_conversion_threshold
+from app.services.google_ads_pmax_gate import (
+    auto_search_campaign_conversion_totals,
+    pmax_activation_gate,
+    pmax_conversion_threshold,
+)
 from app.services.google_ads_research_collector import sync_account_research_snapshots
 from app.services.google_ads_snapshot_store import (
     DATASET_AI_MAX_SEARCH_TERM_COMBINATIONS,
@@ -104,6 +108,8 @@ AUDIENCE_SIGNAL_INPUTS_PREFIX = "audience_signal_inputs"
 ASSET_PUBLISH_QUOTA_PREFIX = "google_ads_asset_publish_quota"
 BUDGET_BOOTSTRAP_STATE_PREFIX = "automation_budget_bootstrap"
 FORCE_MINIMUM_BUDGET_SETTING = "automation.force_minimum_budget_when_budget_guard_blocked"
+COLD_START_MINIMUM_BUDGET_SETTING = "automation.cold_start_minimum_budget_until_conversion_threshold"
+COLD_START_CONVERSION_THRESHOLD_SETTING = "automation.cold_start_conversion_threshold"
 CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
@@ -478,6 +484,47 @@ def save_waste_recovery_state(session: Session, account: GoogleAdsAccount, state
         },
     )
     session.execute(stmt)
+
+
+def cold_start_minimum_budget_state(
+    session: Session,
+    preference: GoogleAdsAutomationPreference,
+    *,
+    settings: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    account = preference.account
+    settings = settings or get_sync_setting_map(session)
+    account_metrics = recent_account_metric_totals(session, account, days=7)
+    auto_search_metrics = auto_search_campaign_conversion_totals(session, account, days=7)
+    try:
+        configured_threshold = float(settings.get(COLD_START_CONVERSION_THRESHOLD_SETTING, 0) or 0)
+    except (TypeError, ValueError):
+        configured_threshold = 0.0
+    conversion_threshold = configured_threshold if configured_threshold > 0 else pmax_conversion_threshold(preference)
+    conversions = max(
+        float(account_metrics.get("conversions") or 0.0),
+        float(auto_search_metrics.get("conversions") or 0.0),
+    )
+    enabled = parse_bool(settings.get(COLD_START_MINIMUM_BUDGET_SETTING, True))
+    active = bool(
+        enabled
+        and preference.testing_bootstrap_enabled
+        and preference.auto_create_campaigns_enabled
+        and conversions < conversion_threshold
+    )
+    return {
+        "enabled": enabled,
+        "active": active,
+        "conversion_threshold": conversion_threshold,
+        "conversions": conversions,
+        "account_metrics_7d": account_metrics,
+        "auto_search_metrics_7d": auto_search_metrics,
+        "reason": (
+            f"Cold-start minimum budget is active until the account reaches {conversion_threshold:g} conversions."
+            if active
+            else "Cold-start minimum budget is inactive."
+        ),
+    }
 
 
 def audience_signal_inputs_key(account: GoogleAdsAccount) -> str:
@@ -2211,6 +2258,7 @@ def testing_daily_budget_from_sales(
     preference: GoogleAdsAutomationPreference,
 ) -> dict[str, Any]:
     account = preference.account
+    settings = get_sync_setting_map(session)
     ratio = min(max(float(preference.testing_sales_budget_ratio or 0.05), 0.001), 1.0)
     window_days = clamp_int(preference.odoo_sales_guard_window_days, 7, 1, 90)
     guard = odoo_sales_budget_guard_for_account(
@@ -2220,6 +2268,8 @@ def testing_daily_budget_from_sales(
         max_spend_ratio=ratio,
     )
     sales_inr = float(guard.get("sales_inr") or 0)
+    cold_start = cold_start_minimum_budget_state(session, preference, settings=settings)
+    cold_start_minimum_active = bool(cold_start.get("active"))
     planned_daily_inr = (sales_inr * ratio / max(window_days, 1)) if sales_inr > 0 else 0.0
     daily_room_inr = float(guard.get("daily_spend_room_inr") or 0.0)
     remaining_room_inr = float(guard.get("remaining_spend_room_inr") or 0.0)
@@ -2231,7 +2281,7 @@ def testing_daily_budget_from_sales(
     bootstrap_active = bool(bootstrap.get("active"))
     daily_inr = (
         planned_daily_inr
-        if bootstrap_active
+        if bootstrap_active or cold_start_minimum_active
         else (min(planned_daily_inr, daily_room_inr) if planned_daily_inr > 0 and daily_room_inr > 0 else 0.0)
     )
     rates = snapshot_payload(get_latest_rate_snapshot_sync(session)).get("rates", {})
@@ -2241,16 +2291,17 @@ def testing_daily_budget_from_sales(
     converted_amount = float(converted or 0.0)
     budget_blocked = False
     block_reason = ""
-    if sales_inr <= 0:
+    if sales_inr <= 0 and not cold_start_minimum_active:
         budget_blocked = True
         block_reason = "No synced Odoo sales are available for this account, so automated campaign spend is blocked."
-    elif not bootstrap_active and (remaining_room_inr <= 0 or daily_room_inr <= 0):
+    elif not (bootstrap_active or cold_start_minimum_active) and (remaining_room_inr <= 0 or daily_room_inr <= 0):
         budget_blocked = True
         block_reason = "Odoo sales guard has no remaining spend room for Testing / Discovery."
-    elif not bootstrap_active and converted_amount < minimum:
+    elif not (bootstrap_active or cold_start_minimum_active) and converted_amount < minimum:
         budget_blocked = True
         block_reason = "Remaining Odoo spend room is below the configured minimum daily budget."
-    daily_budget = 0.0 if budget_blocked else (max(converted_amount, minimum) if bootstrap_active else converted_amount)
+    use_minimum_budget = bool(bootstrap_active or cold_start_minimum_active)
+    daily_budget = 0.0 if budget_blocked else (max(converted_amount, minimum) if use_minimum_budget else converted_amount)
     return {
         "ratio": ratio,
         "ratio_pct": round(ratio * 100, 2),
@@ -2265,9 +2316,16 @@ def testing_daily_budget_from_sales(
         "minimum_daily_budget": minimum,
         "budget_blocked": budget_blocked,
         "budget_block_reason": block_reason,
-        "used_minimum": bool(not budget_blocked and bootstrap_active and converted_amount < minimum),
+        "used_minimum": bool(not budget_blocked and use_minimum_budget and converted_amount < minimum),
         "bootstrap": bootstrap,
-        "budget_basis": "last_7_day_sales_bootstrap" if bootstrap_active else "remaining_sales_guard_room",
+        "cold_start_minimum": {
+            **cold_start,
+        },
+        "budget_basis": (
+            "cold_start_minimum_until_conversion_threshold"
+            if cold_start_minimum_active
+            else ("last_7_day_sales_bootstrap" if bootstrap_active else "remaining_sales_guard_room")
+        ),
         "guard": guard,
     }
 
@@ -6098,6 +6156,56 @@ def _selected_peak_budget_operations(
     return list(operations_by_budget.values()), skipped
 
 
+def auto_campaign_budget_floor_operations(
+    budget_rows: list[dict[str, Any]],
+    *,
+    minimum_daily_budget_amount: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        minimum_daily_budget_amount = max(float(minimum_daily_budget_amount), 0.0)
+    except (TypeError, ValueError):
+        minimum_daily_budget_amount = 0.0
+    minimum_micros = int(round(minimum_daily_budget_amount * 1_000_000))
+    operations_by_budget: dict[str, dict[str, Any]] = {}
+    skipped: list[dict[str, Any]] = []
+    if minimum_micros <= 0:
+        return [], [{"reason": "minimum_budget_not_configured"}]
+
+    for row in budget_rows:
+        campaign_name = str(row.get("campaign_name") or "")
+        if not campaign_name.startswith("AUTO |"):
+            continue
+        budget_resource_name = str(row.get("budget_resource_name") or "")
+        if not budget_resource_name:
+            skipped.append({**row, "reason": "missing_budget_resource"})
+            continue
+        if row.get("explicitly_shared"):
+            skipped.append({**row, "reason": "shared_budget"})
+            continue
+        old_amount = int(row.get("amount_micros") or 0)
+        if old_amount >= minimum_micros:
+            skipped.append({**row, "reason": "already_at_or_above_minimum_budget"})
+            continue
+        if budget_resource_name not in operations_by_budget:
+            operations_by_budget[budget_resource_name] = {
+                "budget_resource_name": budget_resource_name,
+                "budget_name": row.get("budget_name"),
+                "currency_code": row.get("currency_code"),
+                "old_amount_micros": old_amount,
+                "new_amount_micros": minimum_micros,
+                "old_amount": micros_to_currency(old_amount),
+                "new_amount": micros_to_currency(minimum_micros),
+                "campaign_ids": [],
+                "campaign_names": [],
+                "repair_reason": "cold_start_auto_campaign_budget_floor",
+                "minimum_daily_budget_amount": minimum_daily_budget_amount,
+            }
+        operation = operations_by_budget[budget_resource_name]
+        operation["campaign_ids"].append(int(row.get("campaign_id") or 0))
+        operation["campaign_names"].append(campaign_name)
+    return list(operations_by_budget.values()), skipped
+
+
 def _amount_to_inr(amount: float, currency_code: str, rates: dict[str, Any]) -> Optional[float]:
     return convert_amount(float(amount or 0), currency_code or "UNKNOWN", "INR", rates)
 
@@ -6430,7 +6538,92 @@ def run_odoo_sales_budget_guard(
         "minimum_daily_budget_amount": preference.minimum_daily_budget_amount,
         "underperforming_budget_reduce_pct": preference.underperforming_budget_reduce_pct,
     }
+    cold_start = cold_start_minimum_budget_state(session, preference)
+    evidence["cold_start_minimum"] = cold_start
     if guard.get("status") != "red":
+        if cold_start.get("active"):
+            api_quota = reserve_automation_quota_units(
+                session,
+                preference,
+                units=BUDGET_GUARD_QUOTA_UNITS,
+                reason="cold_start_auto_budget_floor_repair",
+            )
+            if not api_quota["allowed"]:
+                result = {"guard": guard, "quota": api_quota, "cold_start_minimum": cold_start}
+                record_peak_budget_event(
+                    session,
+                    account,
+                    action_type="cold_start_budget_floor_repair",
+                    status="deferred_quota",
+                    summary=api_quota["reason"],
+                    evidence=evidence,
+                    result=result,
+                )
+                session.commit()
+                return {
+                    "name": "odoo_sales_budget_guard",
+                    "status": guard.get("status"),
+                    "action": "defer_cold_start_budget_floor_repair",
+                    "reason": api_quota["reason"],
+                    "guard": guard,
+                    "cold_start_minimum": cold_start,
+                    "quota": api_quota,
+                }
+            mutation_guard = peak_budget_mutation_guard(
+                session,
+                preference,
+                action_enabled=preference.odoo_sales_guard_enabled,
+            )
+            validate_only = bool(mutation_guard["validate_only"])
+            client = build_client(get_sync_setting_map(session), account.manager_customer_id, account.connection)
+            budget_rows = fetch_campaign_budget_rows(client, account)
+            operations, skipped = auto_campaign_budget_floor_operations(
+                budget_rows,
+                minimum_daily_budget_amount=preference.minimum_daily_budget_amount,
+            )
+            if operations:
+                result = mutate_campaign_budgets(client, account, operations, validate_only=validate_only)
+                result["guard"] = guard
+                result["mutation_guard"] = mutation_guard
+                result["quota"] = api_quota
+                result["budgets"] = operations
+                result["skipped"] = skipped
+                result["cold_start_minimum"] = cold_start
+                status = "validated" if validate_only else "applied"
+                record_peak_budget_event(
+                    session,
+                    account,
+                    action_type="cold_start_budget_floor_repair",
+                    status=status,
+                    summary=f"Raise {len(operations)} AUTO campaign budget(s) to the cold-start minimum budget.",
+                    evidence=evidence,
+                    result=result,
+                )
+                session.commit()
+                return {
+                    "name": "odoo_sales_budget_guard",
+                    "status": status,
+                    "action": "cold_start_budget_floor_repair",
+                    "guard": guard,
+                    "budget_count": len(operations),
+                    "cold_start_minimum": cold_start,
+                    "validate_only": validate_only,
+                }
+            record_peak_budget_event(
+                session,
+                account,
+                action_type="cold_start_budget_floor_repair",
+                status="skipped",
+                summary="Cold-start minimum budget is active, but no enabled non-shared AUTO budgets are below the floor.",
+                evidence=evidence,
+                result={
+                    "guard": guard,
+                    "mutation_guard": mutation_guard,
+                    "quota": api_quota,
+                    "skipped": skipped,
+                    "cold_start_minimum": cold_start,
+                },
+            )
         session.commit()
         return {
             "name": "odoo_sales_budget_guard",

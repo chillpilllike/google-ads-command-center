@@ -248,6 +248,22 @@ SETTING_DEFINITIONS = [
         "Operations kept unused for budget up/down, monitoring, retries, and urgent fixes. Heavy campaign/asset work stops before this reserve is consumed.",
     ),
     SettingDefinition(
+        "automation.cold_start_minimum_budget_until_conversion_threshold",
+        "Cold-start minimum budget",
+        "Automation",
+        "checkbox",
+        True,
+        "Allows Testing / Discovery campaign creation at the account minimum budget for cold accounts until they reach the configured conversion threshold.",
+    ),
+    SettingDefinition(
+        "automation.cold_start_conversion_threshold",
+        "Cold-start conversion threshold",
+        "Automation",
+        "number",
+        15,
+        "Number of recent conversions after which cold accounts return to the normal Odoo sales/spend budget guard.",
+    ),
+    SettingDefinition(
         "automation.scheduler_primary_customer_ids",
         "Primary automation accounts",
         "Safety controls",

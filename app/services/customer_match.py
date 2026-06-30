@@ -25,6 +25,7 @@ from app.models import (
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
+from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.odoo_sales import _authenticate_store, _many2one_id, _many2one_name, _parse_odoo_datetime
 
 
@@ -368,12 +369,44 @@ def ensure_customer_match_publication(
 def ensure_customer_match_publications(session: Session) -> list[GoogleAdsCustomerMatchPublication]:
     mappings = session.scalars(
         select(OdooStoreGoogleAdsMapping)
+        .join(OdooStoreGoogleAdsMapping.account)
         .where(OdooStoreGoogleAdsMapping.is_active.is_(True))
+        .where(GoogleAdsAccount.is_active.is_(True))
         .order_by(OdooStoreGoogleAdsMapping.store_id, OdooStoreGoogleAdsMapping.website_id)
     ).all()
     rows = [ensure_customer_match_publication(session, mapping) for mapping in mappings]
     session.commit()
     return rows
+
+
+def _publication_account_block(
+    session: Session,
+    publication: GoogleAdsCustomerMatchPublication,
+) -> Optional[dict[str, Any]]:
+    account = publication.account
+    if account is None:
+        return {"status": "blocked_missing_account", "reason": "Google Ads account is missing.", "sent": 0, "saved": 0}
+    if not bool(account.is_active):
+        return {
+            "status": "blocked_inactive_account",
+            "reason": "Google Ads account is inactive; Customer Match sync/upload is disabled for this account.",
+            "sent": 0,
+            "saved": 0,
+            "account_id": account.id,
+            "customer_id": account.customer_id,
+        }
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        return {
+            "status": "blocked_by_account_red_flag",
+            "reason": str(red_flag.get("reason") or "Google Ads account is red-flagged."),
+            "sent": 0,
+            "saved": 0,
+            "red_flag": red_flag,
+            "account_id": account.id,
+            "customer_id": account.customer_id,
+        }
+    return None
 
 
 def enqueue_customer_match_outbox(
@@ -426,6 +459,12 @@ def sync_customer_match_members_for_publication(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     max_orders: int = 20000,
 ) -> dict[str, Any]:
+    account_block = _publication_account_block(session, publication)
+    if account_block is not None:
+        publication.status = account_block["status"]
+        publication.last_sync_json = {**(publication.last_sync_json or {}), "member_sync": account_block}
+        session.commit()
+        return account_block
     if not publication.customer_match_policy_accepted:
         return {
             "status": "blocked_policy",
@@ -642,6 +681,13 @@ def push_customer_match_outbox_for_publication(
     max_batches: int = 1,
     validate_only: bool = False,
 ) -> dict[str, Any]:
+    account_block = _publication_account_block(session, publication)
+    if account_block is not None:
+        publication.data_manager_status = account_block["status"]
+        publication.data_manager_last_error = account_block["reason"]
+        publication.last_sync_json = {**(publication.last_sync_json or {}), "api_push": account_block}
+        session.commit()
+        return account_block
     if not publication.customer_match_policy_accepted:
         return {
             "status": "blocked_policy",
