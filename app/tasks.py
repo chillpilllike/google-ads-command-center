@@ -59,7 +59,10 @@ from app.services.google_ads_assets import generate_account_assets
 from app.services.google_ads_automation import enabled_automation_preferences, run_account_automation_monitor
 from app.services.google_ads_autopilot import run_account_autopilot
 from app.services.google_ads_brand_lists import sync_account_brand_list_candidates
-from app.services.google_ads_live_campaign_creator import pause_automation_campaigns_for_account
+from app.services.google_ads_live_campaign_creator import (
+    pause_automation_campaigns_for_account,
+    sync_universal_garbage_negatives_for_account,
+)
 from app.services.campaign_optimizer import run_campaign_optimization
 from app.services.google_ads_goals import sync_account_conversion_goals
 from app.services.google_ads_page_feed_publisher import publish_page_feeds_for_mappings
@@ -100,6 +103,25 @@ GOOGLE_ADS_API_ACCOUNT_LEASE_TTL = timedelta(hours=3)
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _customer_id_set(value: object) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = str(value).replace("\\n", "\n").replace(",", "\n").splitlines()
+    return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
+
+
+def _account_priority_tier(account: GoogleAdsAccount, primary_ids: set[str], secondary_ids: set[str]) -> int:
+    customer_id = "".join(ch for ch in str(account.customer_id or "") if ch.isdigit())
+    if customer_id in primary_ids:
+        return 0
+    if customer_id in secondary_ids:
+        return 1
+    return 2
 
 
 def _automation_run_lease_key(account: GoogleAdsAccount) -> str:
@@ -932,6 +954,8 @@ def sync_google_ads_performance(
                         )
                     finally:
                         if api_lease and api_lease.get("acquired"):
+                            if not session.is_active:
+                                session.rollback()
                             release_google_ads_api_account_lease(session, account, job_id=job_id)
                         processed += 1
                         update_job_progress(session, job_id, current=processed)
@@ -1040,6 +1064,8 @@ def sync_google_ads_research(
                         )
                     finally:
                         if api_lease and api_lease.get("acquired"):
+                            if not session.is_active:
+                                session.rollback()
                             release_google_ads_api_account_lease(session, account, job_id=job_id)
                         processed += 1
                         update_job_progress(session, job_id, current=processed)
@@ -1176,6 +1202,137 @@ def sync_google_ads_daily_keywords(
                     BackgroundJobStatus.succeeded if not errors else BackgroundJobStatus.failed,
                     current=processed,
                     error=f"{errors} account/dataset errors were recorded as dashboard alerts. {keyword_saved} keyword rows, {pages_saved} landing-page rows, and {negative_saved} negative-keyword rows refreshed." if errors else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
+                raise
+
+
+@dramatiq.actor(max_retries=0, time_limit=60 * 60 * 1000)
+def sync_google_ads_universal_garbage_negatives(
+    job_id: Optional[int] = None,
+    account_ids: Optional[list[int]] = None,
+    validate_only: bool = False,
+) -> None:
+    with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+        with SessionLocal() as session:
+            settings_map = get_sync_setting_map(session)
+            primary_ids = _customer_id_set(settings_map.get("automation.scheduler_primary_customer_ids"))
+            secondary_ids = _customer_id_set(settings_map.get("automation.scheduler_secondary_customer_ids"))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
+            selected_ids = [int(item) for item in (account_ids or []) if item]
+            if selected_ids:
+                query = query.where(GoogleAdsAccount.id.in_(selected_ids))
+            accounts = list(session.scalars(query).all())
+            accounts.sort(key=lambda account: (_account_priority_tier(account, primary_ids, secondary_ids), account.name or "", account.id))
+            if not mark_job_started(session, job_id, total=len(accounts)):
+                return
+            processed = 0
+            updated = 0
+            deferred = 0
+            blocked = 0
+            errors = 0
+            try:
+                for account in accounts:
+                    if job_cancel_requested(session, job_id):
+                        mark_job_finished(session, job_id, BackgroundJobStatus.canceled, current=processed)
+                        return
+                    api_lease = None
+                    try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            blocked += 1
+                            continue
+                        api_lease = acquire_google_ads_api_account_lease(
+                            session,
+                            account,
+                            job_id=job_id,
+                            purpose="google_ads_universal_garbage_negatives",
+                        )
+                        if not api_lease.get("acquired"):
+                            if str(api_lease.get("status") or "") == "blocked_by_google_quota":
+                                deferred += 1
+                            else:
+                                blocked += 1
+                            continue
+                        result = sync_universal_garbage_negatives_for_account(
+                            session,
+                            account,
+                            validate_only=bool(validate_only),
+                        )
+                        status = str(result.get("status") or "")
+                        if status in {"updated", "skipped"}:
+                            updated += 1
+                        elif "quota" in status or "quota" in str(result).lower():
+                            deferred += 1
+                        elif status.startswith("blocked"):
+                            blocked += 1
+                        else:
+                            errors += 1
+                        session.commit()
+                    except GoogleAdsException as exc:
+                        errors += 1
+                        summary = summarize_google_ads_exception(exc)
+                        if "CUSTOMER_NOT_ENABLED" in str(summary).upper():
+                            upsert_account_api_red_flag(
+                                session,
+                                account,
+                                status="customer_not_enabled",
+                                reason="Google Ads API says this customer account is not enabled or has been deactivated.",
+                                source="universal_garbage_negatives",
+                            )
+                        quota_retry = google_ads_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                            errors -= 1
+                        record_google_ads_api_error(
+                            session,
+                            exc,
+                            account=account,
+                            job_id=job_id,
+                            context="universal_garbage_negatives",
+                            severity="manual_action_required",
+                            extra={"validate_only": bool(validate_only)},
+                        )
+                    except Exception as exc:  # noqa: BLE001 - one bad account must not stop negative protection elsewhere.
+                        quota_retry = google_ads_generic_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                        else:
+                            errors += 1
+                        record_google_ads_generic_error(
+                            session,
+                            exc,
+                            account=account,
+                            job_id=job_id,
+                            context="universal_garbage_negatives",
+                            severity="manual_action_required",
+                            extra={"validate_only": bool(validate_only)},
+                        )
+                    finally:
+                        if api_lease and api_lease.get("acquired"):
+                            if not session.is_active:
+                                session.rollback()
+                            release_google_ads_api_account_lease(session, account, job_id=job_id)
+                        processed += 1
+                        update_job_progress(session, job_id, current=processed)
+                error_text = (
+                    f"{updated} account(s) checked/updated, {deferred} deferred by quota, "
+                    f"{blocked} blocked/skipped, {errors} error(s)."
+                )
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.failed if errors else BackgroundJobStatus.succeeded,
+                    current=processed,
+                    error=error_text if errors or deferred or blocked else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))

@@ -27,6 +27,7 @@ from app.models import (
     GoogleAdsAccount,
     GoogleAdsAutomationPreference,
     GoogleAdsCriteriaPublication,
+    GoogleAdsNegativeKeywordCandidate,
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
@@ -87,6 +88,8 @@ UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
     "online store",
     "buy online",
 ]
+UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT_SETTING = "automation.universal_garbage_negative_bank_limit"
+DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT = 1500
 MAX_DRAFT_ASSET_JSON_REWRITE_BYTES = 1_000_000
 LEGACY_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions"
 REPLACEMENT_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions_s001"
@@ -425,19 +428,33 @@ def _record_criteria_publications(
     current = utcnow()
     resources = list(resource_names or [])
     payload = result if isinstance(result, dict) else {}
+    planned_items: list[tuple[int, str, str]] = []
+    seen_keys: set[str] = set()
     for index, item in enumerate(items):
         value = str(item or "").strip()
         key = _criterion_key(kind, value)
-        if not value or not key:
+        if not value or not key or key in seen_keys:
             continue
-        row = session.scalar(
-            select(GoogleAdsCriteriaPublication).where(
-                GoogleAdsCriteriaPublication.account_id == account.id,
-                GoogleAdsCriteriaPublication.kind == kind,
-                GoogleAdsCriteriaPublication.scope_key == scope_key,
-                GoogleAdsCriteriaPublication.criterion_key == key,
-            )
+        seen_keys.add(key)
+        planned_items.append((index, value, key))
+    if not planned_items:
+        return
+    if hasattr(session, "scalars"):
+        existing_rows = list(
+            session.scalars(
+                select(GoogleAdsCriteriaPublication).where(
+                    GoogleAdsCriteriaPublication.account_id == account.id,
+                    GoogleAdsCriteriaPublication.kind == kind,
+                    GoogleAdsCriteriaPublication.scope_key == scope_key,
+                    GoogleAdsCriteriaPublication.criterion_key.in_([key for _index, _value, key in planned_items]),
+                )
+            ).all()
         )
+    else:
+        existing_rows = []
+    existing_by_key = {row.criterion_key: row for row in existing_rows}
+    for index, value, key in planned_items:
+        row = existing_by_key.get(key)
         resource_name = resources[index] if index < len(resources) else ""
         if row is None:
             row = GoogleAdsCriteriaPublication(
@@ -450,6 +467,7 @@ def _record_criteria_publications(
                 planned_at=current,
             )
             session.add(row)
+            existing_by_key[key] = row
         row.customer_id = str(account.customer_id or "")
         row.criterion_value = value
         row.status = status
@@ -4614,12 +4632,13 @@ def _create_shared_negative_keywords(
     shared_set_resource_name: str,
     terms: list[str],
     validate_only: bool,
+    max_items: int = 2000,
 ) -> list[str]:
     if not shared_set_resource_name or not terms:
         return []
     existing = set() if validate_only else _existing_shared_negative_keywords(client, account, shared_set_resource_name)
     operations = []
-    for term in _dedupe_texts(terms, limit=80, max_items=200):
+    for term in _dedupe_texts(terms, limit=80, max_items=max(1, int(max_items or 2000))):
         key = _keyword_key(term)
         if not key or key in existing:
             continue
@@ -4632,21 +4651,76 @@ def _create_shared_negative_keywords(
         existing.add(key)
     if not operations:
         return []
-    request = client.get_type("MutateSharedCriteriaRequest")
-    request.customer_id = account.customer_id
-    request.operations.extend(operations)
-    request.partial_failure = True
-    request.validate_only = validate_only
-    response = _google_ads_mutate(client.get_service("SharedCriterionService"), "mutate_shared_criteria", request)
-    return _successful_resource_names(response)
+    service = client.get_service("SharedCriterionService")
+    resources: list[str] = []
+    for index in range(0, len(operations), KEYWORD_MUTATION_BATCH_LIMIT):
+        request = client.get_type("MutateSharedCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations[index : index + KEYWORD_MUTATION_BATCH_LIMIT])
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(service, "mutate_shared_criteria", request)
+        resources.extend(_successful_resource_names(response))
+    return resources
 
 
-def _universal_generic_negative_terms(account: GoogleAdsAccount) -> list[str]:
+def _account_garbage_negative_candidate_terms(
+    session: Optional[Session],
+    account: GoogleAdsAccount,
+    *,
+    limit: int = DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT,
+) -> list[str]:
+    if session is None or not hasattr(session, "scalars"):
+        return []
+    rows = session.scalars(
+        select(GoogleAdsNegativeKeywordCandidate.keyword)
+        .where(
+            GoogleAdsNegativeKeywordCandidate.account_id == account.id,
+            GoogleAdsNegativeKeywordCandidate.review_status != "rejected",
+            GoogleAdsNegativeKeywordCandidate.guard_status.notin_(["released", "blocked"]),
+            GoogleAdsNegativeKeywordCandidate.conversions <= 0,
+            GoogleAdsNegativeKeywordCandidate.conversion_value <= 0,
+            GoogleAdsNegativeKeywordCandidate.all_conversions <= 0,
+            GoogleAdsNegativeKeywordCandidate.all_conversions_value <= 0,
+        )
+        .order_by(
+            GoogleAdsNegativeKeywordCandidate.confidence.desc(),
+            GoogleAdsNegativeKeywordCandidate.score.desc(),
+            GoogleAdsNegativeKeywordCandidate.cost.desc(),
+            GoogleAdsNegativeKeywordCandidate.clicks.desc(),
+            GoogleAdsNegativeKeywordCandidate.last_seen_at.desc(),
+        )
+        .limit(max(1, min(int(limit or DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT), 5000)))
+    ).all()
+    return [str(row or "").strip() for row in rows if _valid_exact_keyword(_keyword_key(str(row or "")))]
+
+
+def _universal_generic_negative_terms(
+    account: GoogleAdsAccount,
+    session: Optional[Session] = None,
+    *,
+    bank_limit: Optional[int] = None,
+) -> list[str]:
     terms = list(UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS)
     account_name = str(getattr(account, "name", "") or "").strip()
     if account_name:
         terms.append(f"{account_name} online")
-    return _dedupe_texts([term for term in terms if _valid_exact_keyword(_keyword_key(term))], limit=80, max_items=200)
+    if session is not None:
+        settings_map = get_sync_setting_map(session)
+        configured_limit = bank_limit
+        if configured_limit is None:
+            configured_limit = settings_map.get(
+                UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT_SETTING,
+                DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT,
+            )
+        terms.extend(
+            _account_garbage_negative_candidate_terms(
+                session,
+                account,
+                limit=max(1, min(int(configured_limit or DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT), 5000)),
+            )
+        )
+    return _dedupe_texts([term for term in terms if _valid_exact_keyword(_keyword_key(term))], limit=80, max_items=5000)
 
 
 def _campaigns_for_shared_negative_set(client: Any, account: GoogleAdsAccount, *, limit: int = 1000) -> list[dict[str, Any]]:
@@ -4733,7 +4807,15 @@ def sync_universal_generic_negative_terms(
     *,
     validate_only: bool = False,
 ) -> dict[str, Any]:
-    terms = _universal_generic_negative_terms(account)
+    settings_map = get_sync_setting_map(session)
+    bank_limit = max(
+        1,
+        min(
+            int(settings_map.get(UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT_SETTING) or DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT),
+            5000,
+        ),
+    )
+    terms = _universal_generic_negative_terms(account, session, bank_limit=bank_limit)
     shared_set_resource = None if validate_only else _shared_negative_set_by_name(client, account, UNIVERSAL_GENERIC_SHARED_SET_NAME)
     created_shared_set = False
     if terms and not shared_set_resource:
@@ -4750,6 +4832,7 @@ def sync_universal_generic_negative_terms(
         shared_set_resource_name=str(shared_set_resource or ""),
         terms=terms,
         validate_only=validate_only,
+        max_items=bank_limit + len(UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS) + 1,
     )
     campaigns = [] if validate_only else _campaigns_for_shared_negative_set(client, account)
     linked_resources = _attach_shared_negative_set_to_campaigns(
@@ -4789,7 +4872,50 @@ def sync_universal_generic_negative_terms(
         "campaign_count": len(campaigns),
         "linked_campaign_count": len(linked_resources),
         "linked_campaign_resources": linked_resources,
+        "bank_limit": bank_limit,
     }
+
+
+def sync_universal_garbage_negatives_for_account(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    if account is None:
+        return {"name": "universal_garbage_negatives", "status": "skipped", "reason": "Missing Google Ads account."}
+    red_flag = account_api_red_flag(session, account)
+    if red_flag is not None:
+        return {
+            "name": "universal_garbage_negatives",
+            "status": "blocked_by_account_red_flag",
+            "reason": red_flag["reason"],
+            "red_flag": red_flag,
+        }
+    allow_mutations = parse_bool(_sync_setting_value(session, "optimizer.allow_mutations", False))
+    dry_run = parse_bool(_sync_setting_value(session, "optimizer.dry_run", True))
+    if not validate_only and (not allow_mutations or dry_run):
+        return {
+            "name": "universal_garbage_negatives",
+            "status": "blocked_by_mutation_guard",
+            "reason": "Global mutation guards block live negative keyword updates until Allow mutations is on and Dry run is off.",
+            "guard": {
+                "optimizer_allow_mutations": allow_mutations,
+                "optimizer_dry_run": dry_run,
+                "validate_only": bool(validate_only),
+            },
+        }
+    quota_cooldown = None if validate_only else live_creation_quota_cooldown(session, account)
+    if quota_cooldown is not None:
+        return {"name": "universal_garbage_negatives", **quota_cooldown}
+    client = build_client({}, account.manager_customer_id, account.connection)
+    try:
+        result = sync_universal_generic_negative_terms(session, client, account, validate_only=validate_only)
+        return {"name": "universal_garbage_negatives", **result}
+    except Exception as exc:  # noqa: BLE001 - quota must defer/resume, other errors must be visible.
+        if _is_quota_exhausted_error(exc) and not validate_only:
+            return {"name": "universal_garbage_negatives", **defer_live_creation_for_quota(session, account, exc)}
+        raise
 
 
 def sync_restricted_policy_terms(
