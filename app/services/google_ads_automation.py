@@ -114,6 +114,7 @@ CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
 WASTE_RECOVERY_TARGET_ROAS = 5.0
+COLD_START_TARGET_ROAS = 3.5
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
 DEFAULT_TESTING_KEYWORD_LIMIT = 0
 DEFAULT_TESTING_LANDING_PAGE_LIMIT = 0
@@ -125,6 +126,14 @@ CAMPAIGN_PLANNING_KEYWORD_DATASETS = {
     DATASET_SEARCH_TERM_INSIGHTS,
     DATASET_AI_MAX_SEARCH_TERM_COMBINATIONS,
 }
+UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
+    "shop online",
+    "shop online today",
+    "trusted online store",
+    "best online store",
+    "online store",
+    "buy online",
+]
 CAMPAIGN_METRIC_REFRESH_QUOTA_UNITS = 1
 DAILY_INSIGHT_REFRESH_QUOTA_UNITS = 10
 ALL_TIME_REFRESH_QUOTA_UNITS = 4
@@ -2177,6 +2186,31 @@ def merge_negative_keywords(*groups: list[dict[str, Any]]) -> list[dict[str, Any
     return merged
 
 
+def universal_generic_negative_keywords(account: Optional[GoogleAdsAccount] = None) -> list[dict[str, Any]]:
+    terms = list(UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS)
+    account_name = str(getattr(account, "name", "") or "").strip()
+    if account_name:
+        terms.append(f"{account_name} online")
+    negatives: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for term in terms:
+        text = _clean_pmax_search_theme(term)
+        key = _term_key_from_text(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        negatives.append(
+            {
+                "keyword": text,
+                "match_type": "exact",
+                "source": "universal_generic_filler",
+                "theme_key": key,
+                "reason": "Generic filler term is blocked as a universal exact negative and must not be used as a positive keyword.",
+            }
+        )
+    return negatives
+
+
 def merge_page_exclusions(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -3906,16 +3940,22 @@ def core_owned_testing_negative_keywords(terms: list[str]) -> list[dict[str, Any
     return negatives
 
 
-def waste_owned_positive_keywords(items: list[dict[str, Any]], *, limit: int = 0) -> list[str]:
+def waste_owned_positive_keywords(
+    items: list[dict[str, Any]],
+    *,
+    limit: int = 0,
+    excluded_theme_keys: Optional[set[str]] = None,
+) -> list[str]:
     terms: list[str] = []
     seen: set[str] = set()
+    excluded = {str(key).strip().lower() for key in (excluded_theme_keys or set()) if str(key).strip()}
     max_terms = max(int(limit or 0), 0)
     for item in items or []:
         if not isinstance(item, dict):
             continue
         text = _clean_pmax_search_theme(item.get("keyword"))
         key = str(item.get("theme_key") or _term_key_from_text(text)).strip().lower()
-        if not text or not key or key in seen:
+        if not text or not key or key in seen or key in excluded:
             continue
         seen.add(key)
         terms.append(text)
@@ -4503,8 +4543,18 @@ def run_testing_campaign_automation(
     testing_pmax_source_rows = available_keyword_rows_for_terms(keyword_rows, term_ledger_keys)
     testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(testing_pmax_theme_plan))
+    universal_negative_keywords = universal_generic_negative_keywords(account)
+    universal_negative_keys = {
+        str(item.get("theme_key") or _theme_key(item.get("keyword"))).strip().lower()
+        for item in universal_negative_keywords
+        if str(item.get("keyword") or "").strip()
+    }
     waste_owned_keyword_items = list(waste_negative_plan.get("active_negative_keywords") or [])
-    waste_owned_terms = waste_owned_positive_keywords(waste_owned_keyword_items, limit=keyword_limit)
+    waste_owned_terms = waste_owned_positive_keywords(
+        waste_owned_keyword_items,
+        limit=keyword_limit,
+        excluded_theme_keys=universal_negative_keys,
+    )
     keywords = testing_terms
     testing_rsa_terms = (
         testing_terms
@@ -4549,6 +4599,7 @@ def run_testing_campaign_automation(
         }
     core_owned_testing_negatives = core_owned_testing_negative_keywords(list(pmax_search_themes) + list(core_rsa_terms))
     testing_negative_keywords = merge_negative_keywords(
+        universal_negative_keywords,
         core_owned_testing_negatives,
         scale_negative_plan["negative_keywords"],
         waste_negative_plan["active_negative_keywords"],
@@ -4557,7 +4608,11 @@ def run_testing_campaign_automation(
         scale_page_exclusion_plan["page_exclusions"],
         waste_page_exclusion_plan["active_page_exclusions"],
     )
-    core_scale_negative_keywords = merge_negative_keywords(waste_negative_plan["active_negative_keywords"])
+    core_scale_negative_keywords = merge_negative_keywords(
+        universal_negative_keywords,
+        waste_negative_plan["active_negative_keywords"],
+    )
+    waste_recovery_negative_keywords = merge_negative_keywords(universal_negative_keywords)
     core_scale_page_exclusions = merge_page_exclusions(waste_page_exclusion_plan["active_page_exclusions"])
     landing_page_governance = landing_page_category_governance_plan(
         page_rows,
@@ -4656,22 +4711,24 @@ def run_testing_campaign_automation(
                 "criteria_only_maintenance": True,
                 "criteria_only_reason": budget.get("budget_block_reason"),
             }
-    bidding = {
-        "strategy": "maximize_conversion_value_target_roas",
-        "strategy_label": "Maximize conversion value with Target ROAS",
-        "currency_code": budget["currency_code"],
-        "daily_budget": round(float(budget["daily_budget"] or 0), 2),
-        "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
-        "target_roas_percent": round(TESTING_DISCOVERY_TARGET_ROAS * 100, 2),
-        "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
-        "sales_budget_ratio": budget["ratio"],
-        "sales_budget_ratio_pct": budget["ratio_pct"],
-    }
     cold_start_max_clicks_active = bool(
         decision.get("mode") == "testing_no_pmax"
         or decision.get("no_recent_impressions")
         or (isinstance(budget.get("cold_start_minimum"), dict) and budget["cold_start_minimum"].get("active"))
     )
+    testing_target_roas = COLD_START_TARGET_ROAS if cold_start_max_clicks_active else TESTING_DISCOVERY_TARGET_ROAS
+    bidding = {
+        "strategy": "maximize_conversion_value_target_roas",
+        "strategy_label": "Maximize conversion value with Target ROAS",
+        "currency_code": budget["currency_code"],
+        "daily_budget": round(float(budget["daily_budget"] or 0), 2),
+        "target_roas": testing_target_roas,
+        "target_roas_percent": round(testing_target_roas * 100, 2),
+        "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
+        "sales_budget_ratio": budget["ratio"],
+        "sales_budget_ratio_pct": budget["ratio_pct"],
+        "cold_start_target_roas": COLD_START_TARGET_ROAS if cold_start_max_clicks_active else None,
+    }
     testing_rsa_bidding = bidding
     if cold_start_max_clicks_active:
         testing_rsa_bidding = {
@@ -5051,7 +5108,7 @@ def run_testing_campaign_automation(
                 "page_targeting": {
                     "mode": "website_root_recovery_context",
                     "website_url": website_url,
-                    "note": "Waste / Recovery RSA owns active Waste negative terms as positives while Core and Testing exclude them.",
+                    "note": "Waste / Recovery RSA owns evidence-based Waste terms as positives while universal generic filler stays negative everywhere.",
                 },
                 "created_by": "automation_monitor",
                 "source_job_id": source_job_id,
@@ -5077,7 +5134,7 @@ def run_testing_campaign_automation(
             "waste_management_plan": draft_waste_plan,
             "ga4_ads_signal_matrix": ga4_matrix,
             "url_inclusion_targets": _url_inclusion_targets_from_rows(page_rows),
-            "negative_keywords": [],
+            "negative_keywords": waste_recovery_negative_keywords,
             "source_terms": _planning_items(waste_owned_terms, keyword_limit),
             "google_keyword_plan": {
                 "source": "waste_owned_negative_keyword_bank",
@@ -5085,6 +5142,7 @@ def run_testing_campaign_automation(
                 "candidate_count": len(waste_owned_keyword_items),
                 "active_waste_positive_keyword_count": len(waste_owned_terms),
                 "active_negative_keyword_count": int(waste_negative_plan.get("active_negative_keyword_count") or 0),
+                "universal_generic_negative_keyword_count": len(universal_negative_keywords),
                 "pending_recovery_keyword_count": int(waste_negative_plan.get("pending_recovery_keyword_count") or 0),
                 "scale_recovery_keyword_count": int(waste_negative_plan.get("scale_recovery_keyword_count") or 0),
                 "testing_recovery_keyword_count": int(waste_negative_plan.get("testing_recovery_keyword_count") or 0),
@@ -5101,8 +5159,8 @@ def run_testing_campaign_automation(
                 "mode": "waste_recovery_keyword_rsa",
                 "reason": (
                     "Waste / Recovery is the quarantine and recovery lane. Active Waste negatives are published as "
-                    "positive exact keywords here, while those same terms are excluded from Core / Scale and "
-                    "Testing / Discovery. Guarded recovery can later promote them out of Waste."
+                    "positive exact keywords here unless they are universal generic filler. Generic filler is negative "
+                    "everywhere; guarded recovery can later promote evidence-backed Waste terms out of Waste."
                 ),
             },
         }
@@ -5122,7 +5180,11 @@ def run_testing_campaign_automation(
         )
 
     if decision["mode"] in {"testing_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
-        pmax_roas = max(CORE_SCALE_TARGET_ROAS, 1 / max(float(preference.odoo_sales_max_spend_ratio or 0.15), 0.01))
+        pmax_roas = (
+            COLD_START_TARGET_ROAS
+            if cold_start_max_clicks_active
+            else max(CORE_SCALE_TARGET_ROAS, 1 / max(float(preference.odoo_sales_max_spend_ratio or 0.15), 0.01))
+        )
         assets, validation, prompt = generate_ad_copy(
             session,
             ad_type="dsa",
@@ -5560,8 +5622,8 @@ def run_testing_campaign_automation(
                     "strategy_label": "Maximize conversion value with Testing target ROAS",
                     "currency_code": budget["currency_code"],
                     "daily_budget": round(float(budget["daily_budget"] or 0), 2),
-                    "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
-                    "target_roas_percent": round(TESTING_DISCOVERY_TARGET_ROAS * 100, 2),
+                    "target_roas": testing_target_roas,
+                    "target_roas_percent": round(testing_target_roas * 100, 2),
                 },
                 "final_url": testing_pmax_final_url,
                 "page_targeting": automation["page_targeting"],

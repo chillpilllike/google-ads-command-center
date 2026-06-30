@@ -328,7 +328,7 @@ def _reserve_daily_criteria_items(
     session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"), {"lock_name": lock_name})
     setting = session.scalar(select(AppSetting).where(AppSetting.key == state_key).with_for_update())
     state = setting.value if setting is not None and isinstance(setting.value, dict) else {}
-    limit = _criteria_daily_item_limit(session)
+    limit = _criteria_daily_item_limit_for_account(session, account)
     allowed, next_state = _criteria_daily_reservation_plan(
         state,
         limit=limit,

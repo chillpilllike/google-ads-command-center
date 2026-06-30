@@ -12,6 +12,7 @@ from app.services.google_ads_live_campaign_creator import (
     _campaign_by_code_or_lane,
     _contains_shipping_offer_text,
     _criteria_daily_reservation_plan,
+    _criteria_daily_item_limit_for_account,
     _create_search_campaign,
     _create_search_theme_signals,
     _draft_live_creation_control,
@@ -628,6 +629,39 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         self.assertEqual(allowed_one_again, 0)
         self.assertEqual(state["used_items"], 500)
         self.assertEqual(state["remaining_items"], 500)
+
+    def test_daily_criteria_limit_uses_account_priority_tier(self) -> None:
+        settings = {
+            "live_campaign_creator.criteria_daily_item_limit": 5000,
+            "live_campaign_creator.primary_criteria_daily_item_limit": 15000,
+            "live_campaign_creator.secondary_criteria_daily_item_limit": 10000,
+            "live_campaign_creator.other_criteria_daily_item_limit": 2500,
+            "automation.scheduler_primary_customer_ids": "3495463031",
+            "automation.scheduler_secondary_customer_ids": "6013079244",
+        }
+
+        with patch("app.services.google_ads_live_campaign_creator.get_sync_setting_map", return_value=settings):
+            self.assertEqual(
+                _criteria_daily_item_limit_for_account(
+                    SimpleNamespace(),
+                    SimpleNamespace(customer_id="349-546-3031"),
+                ),
+                15000,
+            )
+            self.assertEqual(
+                _criteria_daily_item_limit_for_account(
+                    SimpleNamespace(),
+                    SimpleNamespace(customer_id="601-307-9244"),
+                ),
+                10000,
+            )
+            self.assertEqual(
+                _criteria_daily_item_limit_for_account(
+                    SimpleNamespace(),
+                    SimpleNamespace(customer_id="111-222-3333"),
+                ),
+                2500,
+            )
 
     def test_pmax_group_copy_is_theme_specific_and_filters_shipping_offer(self) -> None:
         account = SimpleNamespace(name="Nutricity CA")

@@ -45,6 +45,7 @@ from app.services.google_ads_automation import (
     testing_scale_negative_keyword_plan,
     testing_daily_budget_from_sales,
     underperforming_budget_reduction_operations,
+    universal_generic_negative_keywords,
     waste_category_plan,
     waste_owned_positive_keywords,
 )
@@ -757,6 +758,23 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         )
 
         self.assertEqual(terms, ["Shop Online", "Bad Supplement Query"])
+
+    def test_universal_generic_negatives_are_excluded_from_waste_positives(self) -> None:
+        account = GoogleAdsAccount(id=637, name="Nutricity CA", customer_id="3495463031")
+        universal_negatives = universal_generic_negative_keywords(account)
+        universal_keys = {item["theme_key"] for item in universal_negatives}
+        terms = waste_owned_positive_keywords(
+            [
+                {"keyword": "shop online", "theme_key": "shop online"},
+                {"keyword": "Nutricity CA online", "theme_key": "nutricity ca online"},
+                {"keyword": "no sale evidence term", "theme_key": "no sale evidence term"},
+            ],
+            excluded_theme_keys=universal_keys,
+        )
+
+        self.assertIn("shop online", universal_keys)
+        self.assertIn("nutricity ca online", universal_keys)
+        self.assertEqual(terms, ["no sale evidence term"])
 
     def test_core_and_waste_terms_become_testing_negatives(self) -> None:
         core_negatives = core_owned_testing_negative_keywords(["vitamin c canada", "vitamin c canada"])
