@@ -1189,6 +1189,47 @@ class GoogleAdsPageFeedCampaignLink(Base):
     publication: Mapped[GoogleAdsPageFeedPublication] = relationship(lazy="joined")
 
 
+class GoogleAdsCriteriaPublication(Base):
+    __tablename__ = "google_ads_criteria_publications"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "kind",
+            "scope_key",
+            "criterion_key",
+            name="uq_google_ads_criteria_publication",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("google_ads_accounts.id"), index=True)
+    customer_id: Mapped[str] = mapped_column(String(40), default="", index=True)
+    kind: Mapped[str] = mapped_column(String(80), default="", index=True)
+    scope_key: Mapped[str] = mapped_column(String(500), default="", index=True)
+    criterion_key: Mapped[str] = mapped_column(String(1000), default="", index=True)
+    criterion_value: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
+    lane: Mapped[str] = mapped_column(String(120), default="", index=True)
+    campaign_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    ad_group_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    resource_name: Mapped[str] = mapped_column(String(500), default="")
+    source_key: Mapped[str] = mapped_column(String(255), default="", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    last_result_json: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict)
+    planned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    last_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )
+
+    account: Mapped[GoogleAdsAccount] = relationship(lazy="joined")
+
+
 class SpendGuardSnapshot(Base):
     __tablename__ = "spend_guard_snapshots"
 

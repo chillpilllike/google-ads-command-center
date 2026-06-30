@@ -21,6 +21,7 @@ from app.models import (
     GoogleAdsAccountDailyMetric,
     GoogleAdsAutomationPreference,
     GoogleAdsCampaignMetric,
+    GoogleAdsCriteriaPublication,
     GoogleAdsDataSnapshot,
     GoogleAdsKeywordCandidate,
     GoogleAdsLandingPageCandidate,
@@ -285,6 +286,35 @@ def active_google_ads_quota_retry_state(
 ) -> dict[str, Any] | None:
     """Return an active Google Ads quota cooldown without mutating run state."""
     return _google_ads_api_quota_retry_state(session, account, now=now)
+
+
+def criteria_publication_summary(session: Session, account: GoogleAdsAccount) -> dict[str, Any]:
+    rows = session.execute(
+        select(
+            GoogleAdsCriteriaPublication.kind,
+            GoogleAdsCriteriaPublication.status,
+            func.count(GoogleAdsCriteriaPublication.id),
+        )
+        .where(GoogleAdsCriteriaPublication.account_id == account.id)
+        .group_by(GoogleAdsCriteriaPublication.kind, GoogleAdsCriteriaPublication.status)
+    ).all()
+    by_kind: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
+    for kind, status, count in rows:
+        kind_key = str(kind or "unknown")
+        status_key = str(status or "unknown")
+        value = int(count or 0)
+        by_kind.setdefault(kind_key, {})[status_key] = value
+        totals[status_key] = totals.get(status_key, 0) + value
+    pending_statuses = {"pending", "deferred_quota", "failed"}
+    return {
+        "account_id": account.id,
+        "customer_id": account.customer_id,
+        "total_by_status": totals,
+        "by_kind": by_kind,
+        "pending_or_deferred_count": sum(totals.get(status, 0) for status in pending_statuses),
+        "basis": "Durable ledger of keyword, negative keyword, URL inclusion, URL exclusion, and shared-negative publication state.",
+    }
 
 
 def clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -8551,6 +8581,10 @@ def run_account_automation_monitor(
         live_switch_status(switch_name)
         for switch_name in enabled_live_switches
     ]
+    try:
+        summary["criteria_publication"] = criteria_publication_summary(session, account)
+    except Exception as exc:  # noqa: BLE001 - visibility should not block automation completion.
+        summary["criteria_publication"] = {"status": "failed", "error": str(exc)[:500]}
     suspended_account_block = step_has_suspended_account_error(live_campaign_creation_step) or step_has_suspended_account_error(asset_publication_step)
     if suspended_account_block:
         summary["status"] = "blocked_by_suspended_account"

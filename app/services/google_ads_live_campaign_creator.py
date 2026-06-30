@@ -26,6 +26,7 @@ from app.models import (
     AutoPilotEvent,
     GoogleAdsAccount,
     GoogleAdsAutomationPreference,
+    GoogleAdsCriteriaPublication,
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
@@ -76,7 +77,16 @@ PMAX_MEDIA_FIELD_TYPES = {
 PMAX_ASSET_GROUP_FINAL_URL_LIMIT = 0
 PMAX_SEARCH_THEME_SIGNAL_LIMIT = 50
 RESTRICTED_SHARED_SET_NAME = "restricted"
+UNIVERSAL_GENERIC_SHARED_SET_NAME = "universal generic negatives"
 RESTRICTED_TERMS_SETTING_KEY = "page_feed.restricted_title_terms"
+UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
+    "shop online",
+    "shop online today",
+    "trusted online store",
+    "best online store",
+    "online store",
+    "buy online",
+]
 MAX_DRAFT_ASSET_JSON_REWRITE_BYTES = 1_000_000
 LEGACY_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions"
 REPLACEMENT_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions_s001"
@@ -384,6 +394,79 @@ def _limit_daily_criteria_items(
     )
     allowed = int(reservation.get("allowed_items") or 0)
     return items[:allowed], reservation
+
+
+def _criterion_key(kind: str, value: Any) -> str:
+    text_value = str(value or "").strip()
+    lowered_kind = str(kind or "").lower()
+    if "url" in lowered_kind or "page" in lowered_kind or text_value.lower().startswith(("http://", "https://")):
+        return _webpage_url_key(text_value)
+    return _keyword_key(text_value)
+
+
+def _record_criteria_publications(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    scope_key: str,
+    items: list[Any],
+    status: str,
+    resource_names: Optional[list[str]] = None,
+    lane: str = "",
+    campaign_name: str = "",
+    ad_group_name: str = "",
+    source_key: str = "",
+    result: Optional[dict[str, Any]] = None,
+    error: str = "",
+) -> None:
+    if not items or not hasattr(session, "scalar"):
+        return
+    current = utcnow()
+    resources = list(resource_names or [])
+    payload = result if isinstance(result, dict) else {}
+    for index, item in enumerate(items):
+        value = str(item or "").strip()
+        key = _criterion_key(kind, value)
+        if not value or not key:
+            continue
+        row = session.scalar(
+            select(GoogleAdsCriteriaPublication).where(
+                GoogleAdsCriteriaPublication.account_id == account.id,
+                GoogleAdsCriteriaPublication.kind == kind,
+                GoogleAdsCriteriaPublication.scope_key == scope_key,
+                GoogleAdsCriteriaPublication.criterion_key == key,
+            )
+        )
+        resource_name = resources[index] if index < len(resources) else ""
+        if row is None:
+            row = GoogleAdsCriteriaPublication(
+                account_id=account.id,
+                customer_id=str(account.customer_id or ""),
+                kind=kind,
+                scope_key=scope_key,
+                criterion_key=key,
+                criterion_value=value,
+                planned_at=current,
+            )
+            session.add(row)
+        row.customer_id = str(account.customer_id or "")
+        row.criterion_value = value
+        row.status = status
+        row.lane = lane[:120]
+        row.campaign_name = campaign_name[:255]
+        row.ad_group_name = ad_group_name[:255]
+        row.source_key = source_key[:255]
+        if resource_name:
+            row.resource_name = resource_name[:500]
+        row.last_error = str(error or "")[:2000]
+        row.last_result_json = payload
+        row.last_attempted_at = current
+        row.updated_at = current
+        if status in {"published", "existing", "removed"}:
+            row.published_at = current
+        if status not in {"pending", "deferred_quota", "existing"}:
+            row.attempts = int(row.attempts or 0) + 1
 
 
 def _google_ads_search(service: Any, account: GoogleAdsAccount, query: str, *, timeout: int = 8) -> Any:
@@ -1144,6 +1227,24 @@ def _draft_identity(draft: AdDraft) -> dict[str, Any]:
     assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
     identity = assets.get("campaign_identity") if isinstance(assets.get("campaign_identity"), dict) else {}
     return identity
+
+
+def _criteria_publication_context(
+    draft: AdDraft,
+    *,
+    campaign_name: str = "",
+    ad_group_name: str = "",
+) -> dict[str, str]:
+    assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    identity = _draft_identity(draft)
+    automation = assets.get("automation") if isinstance(assets.get("automation"), dict) else {}
+    campaign_identity = automation.get("campaign_identity") if isinstance(automation.get("campaign_identity"), dict) else {}
+    return {
+        "lane": str(identity.get("category") or campaign_identity.get("category") or ""),
+        "campaign_name": str(campaign_name or identity.get("campaign_name") or campaign_identity.get("campaign_name") or ""),
+        "ad_group_name": str(ad_group_name or ""),
+        "source_key": str(automation.get("source_key") or ""),
+    }
 
 
 def _draft_automation(draft: AdDraft) -> dict[str, Any]:
@@ -2872,14 +2973,14 @@ def _apply_ad_group_webpage_inclusions(
             "url_inclusion_resources": [],
         }
     existing = _existing_ad_group_webpage_inclusions(client, account, ad_group_id) if ad_group_id else set()
-    to_create = [url for url in urls if _webpage_url_key(url) not in existing]
-    planned_to_create = len(to_create)
+    planned_items = [url for url in urls if _webpage_url_key(url) not in existing]
+    planned_to_create = len(planned_items)
     to_create, reservation = _limit_daily_criteria_items(
         session,
         account,
         kind="ad_group_url_inclusions",
         scope_key=f"ad_group_url_inclusions:{ad_group_resource_name}",
-        items=to_create,
+        items=planned_items,
         validate_only=validate_only,
     )
     resources = _create_ad_group_webpage_inclusions(
@@ -2888,6 +2989,29 @@ def _apply_ad_group_webpage_inclusions(
         ad_group_resource_name=ad_group_resource_name,
         urls=to_create,
         validate_only=validate_only,
+    )
+    scope_key = f"ad_group_url_inclusions:{ad_group_resource_name}"
+    context = _criteria_publication_context(draft)
+    _record_criteria_publications(
+        session,
+        account,
+        kind="ad_group_url_inclusions",
+        scope_key=scope_key,
+        items=to_create,
+        status="published" if not validate_only else "validated",
+        resource_names=resources,
+        result={"reservation": reservation},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="ad_group_url_inclusions",
+        scope_key=scope_key,
+        items=planned_items[len(to_create):],
+        status="deferred_quota",
+        result={"reservation": reservation},
+        **context,
     )
     return {
         "url_inclusion_count": len(urls),
@@ -3238,20 +3362,21 @@ def _apply_campaign_negative_keywords(
             "negative_keyword_resources": [],
         }
     existing = _existing_campaign_negative_exact_keywords(client, account, campaign_id) if campaign_id else set()
-    to_create = [keyword for keyword in keywords if keyword not in existing]
+    planned_items = [keyword for keyword in keywords if keyword not in existing]
     positive_keyword_resources = _existing_positive_exact_keyword_resources_by_campaign(client, account, campaign_id) if campaign_id else {}
     positive_resources_to_remove = [
         resource_name
         for keyword in keywords
         for resource_name in positive_keyword_resources.get(keyword, [])
     ]
-    planned_to_create = len(to_create)
+    planned_to_create = len(planned_items)
+    scope_key = f"campaign_negative_keywords:{campaign_resource_name}"
     to_create, reservation = _limit_daily_criteria_items(
         session,
         account,
         kind="campaign_negative_keywords",
-        scope_key=f"campaign_negative_keywords:{campaign_resource_name}",
-        items=to_create,
+        scope_key=scope_key,
+        items=planned_items,
         validate_only=validate_only,
     )
     resources = _create_campaign_negative_exact_keywords(
@@ -3266,6 +3391,28 @@ def _apply_campaign_negative_keywords(
         account,
         criterion_resource_names=positive_resources_to_remove,
         validate_only=validate_only,
+    )
+    context = _criteria_publication_context(draft)
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_negative_keywords",
+        scope_key=scope_key,
+        items=to_create,
+        status="published" if not validate_only else "validated",
+        resource_names=resources,
+        result={"reservation": reservation},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_negative_keywords",
+        scope_key=scope_key,
+        items=planned_items[len(to_create):],
+        status="deferred_quota",
+        result={"reservation": reservation},
+        **context,
     )
     return {
         "negative_keyword_count": len(keywords),
@@ -3299,20 +3446,21 @@ def _apply_campaign_negative_webpages(
             "negative_page_resources": [],
         }
     existing = _existing_campaign_negative_webpages(client, account, campaign_id) if campaign_id else set()
-    to_create = [url for url in urls if url.rstrip("/") not in existing]
+    planned_items = [url for url in urls if url.rstrip("/") not in existing]
     positive_page_resources = _existing_positive_webpage_resources_by_campaign(client, account, campaign_id) if campaign_id else {}
     positive_resources_to_remove = [
         resource_name
         for url in urls
         for resource_name in positive_page_resources.get(_webpage_url_key(url), [])
     ]
-    planned_to_create = len(to_create)
+    planned_to_create = len(planned_items)
+    scope_key = f"campaign_url_exclusions:{campaign_resource_name}"
     to_create, reservation = _limit_daily_criteria_items(
         session,
         account,
         kind="campaign_url_exclusions",
-        scope_key=f"campaign_url_exclusions:{campaign_resource_name}",
-        items=to_create,
+        scope_key=scope_key,
+        items=planned_items,
         validate_only=validate_only,
     )
     resources = _create_campaign_negative_webpages(
@@ -3327,6 +3475,28 @@ def _apply_campaign_negative_webpages(
         account,
         criterion_resource_names=positive_resources_to_remove,
         validate_only=validate_only,
+    )
+    context = _criteria_publication_context(draft)
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_url_exclusions",
+        scope_key=scope_key,
+        items=to_create,
+        status="published" if not validate_only else "validated",
+        resource_names=resources,
+        result={"reservation": reservation},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_url_exclusions",
+        scope_key=scope_key,
+        items=planned_items[len(to_create):],
+        status="deferred_quota",
+        result={"reservation": reservation},
+        **context,
     )
     return {
         "negative_page_count": len(urls),
@@ -4471,6 +4641,157 @@ def _create_shared_negative_keywords(
     return _successful_resource_names(response)
 
 
+def _universal_generic_negative_terms(account: GoogleAdsAccount) -> list[str]:
+    terms = list(UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS)
+    account_name = str(getattr(account, "name", "") or "").strip()
+    if account_name:
+        terms.append(f"{account_name} online")
+    return _dedupe_texts([term for term in terms if _valid_exact_keyword(_keyword_key(term))], limit=80, max_items=200)
+
+
+def _campaigns_for_shared_negative_set(client: Any, account: GoogleAdsAccount, *, limit: int = 1000) -> list[dict[str, Any]]:
+    query = f"""
+        SELECT
+          campaign.id,
+          campaign.name,
+          campaign.resource_name,
+          campaign.status
+        FROM campaign
+        WHERE campaign.status != REMOVED
+        LIMIT {max(1, min(int(limit or 1000), 10000))}
+    """
+    service = client.get_service("GoogleAdsService")
+    campaigns: list[dict[str, Any]] = []
+    for row in _google_ads_search(service, account, query):
+        campaigns.append(
+            {
+                "campaign_id": int(row.campaign.id),
+                "campaign_name": str(row.campaign.name or ""),
+                "campaign_resource_name": str(row.campaign.resource_name or ""),
+                "campaign_status": enum_name(row.campaign.status),
+            }
+        )
+    return campaigns
+
+
+def _existing_campaign_shared_set_links(client: Any, account: GoogleAdsAccount, shared_set_resource_name: str) -> set[str]:
+    if not shared_set_resource_name:
+        return set()
+    query = f"""
+        SELECT
+          campaign_shared_set.campaign
+        FROM campaign_shared_set
+        WHERE campaign_shared_set.shared_set = {gaql_string(shared_set_resource_name)}
+          AND campaign_shared_set.status != REMOVED
+    """
+    service = client.get_service("GoogleAdsService")
+    campaigns: set[str] = set()
+    for row in _google_ads_search(service, account, query):
+        campaign = str(row.campaign_shared_set.campaign or "")
+        if campaign:
+            campaigns.add(campaign)
+    return campaigns
+
+
+def _attach_shared_negative_set_to_campaigns(
+    client: Any,
+    account: GoogleAdsAccount,
+    *,
+    shared_set_resource_name: str,
+    campaigns: list[dict[str, Any]],
+    validate_only: bool,
+) -> list[str]:
+    if not shared_set_resource_name or not campaigns:
+        return []
+    existing = set() if validate_only else _existing_campaign_shared_set_links(client, account, shared_set_resource_name)
+    operations = []
+    for campaign in campaigns:
+        campaign_resource = str(campaign.get("campaign_resource_name") or "")
+        if not campaign_resource or campaign_resource in existing:
+            continue
+        operation = client.get_type("CampaignSharedSetOperation")
+        link = operation.create
+        link.campaign = campaign_resource
+        link.shared_set = shared_set_resource_name
+        operations.append(operation)
+        existing.add(campaign_resource)
+    if not operations:
+        return []
+    request = client.get_type("MutateCampaignSharedSetsRequest")
+    request.customer_id = account.customer_id
+    request.operations.extend(operations)
+    request.partial_failure = True
+    request.validate_only = validate_only
+    response = _google_ads_mutate(client.get_service("CampaignSharedSetService"), "mutate_campaign_shared_sets", request)
+    return _successful_resource_names(response)
+
+
+def sync_universal_generic_negative_terms(
+    session: Session,
+    client: Any,
+    account: GoogleAdsAccount,
+    *,
+    validate_only: bool = False,
+) -> dict[str, Any]:
+    terms = _universal_generic_negative_terms(account)
+    shared_set_resource = None if validate_only else _shared_negative_set_by_name(client, account, UNIVERSAL_GENERIC_SHARED_SET_NAME)
+    created_shared_set = False
+    if terms and not shared_set_resource:
+        shared_set_resource = _create_shared_negative_set(
+            client,
+            account,
+            name=UNIVERSAL_GENERIC_SHARED_SET_NAME,
+            validate_only=validate_only,
+        )
+        created_shared_set = True
+    shared_keyword_resources = _create_shared_negative_keywords(
+        client,
+        account,
+        shared_set_resource_name=str(shared_set_resource or ""),
+        terms=terms,
+        validate_only=validate_only,
+    )
+    campaigns = [] if validate_only else _campaigns_for_shared_negative_set(client, account)
+    linked_resources = _attach_shared_negative_set_to_campaigns(
+        client,
+        account,
+        shared_set_resource_name=str(shared_set_resource or ""),
+        campaigns=campaigns,
+        validate_only=validate_only,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="shared_universal_negative_keywords",
+        scope_key=str(shared_set_resource or UNIVERSAL_GENERIC_SHARED_SET_NAME),
+        items=terms,
+        status="published" if not validate_only else "validated",
+        resource_names=shared_keyword_resources,
+        lane="Universal Negatives",
+        campaign_name="*",
+        source_key="universal_generic_negative_shared_set",
+        result={
+            "shared_set_resource_name": shared_set_resource,
+            "created_shared_set": created_shared_set,
+            "linked_campaign_count": len(linked_resources),
+        },
+    )
+    return {
+        "name": "universal_generic_negative_terms",
+        "status": "updated" if shared_keyword_resources or linked_resources or created_shared_set else "skipped",
+        "term_count": len(terms),
+        "terms": terms,
+        "shared_set_name": UNIVERSAL_GENERIC_SHARED_SET_NAME,
+        "shared_set_resource_name": shared_set_resource,
+        "created_shared_set": created_shared_set,
+        "new_shared_keyword_count": len(shared_keyword_resources),
+        "new_shared_keyword_resources": shared_keyword_resources,
+        "campaign_count": len(campaigns),
+        "linked_campaign_count": len(linked_resources),
+        "linked_campaign_resources": linked_resources,
+    }
+
+
 def sync_restricted_policy_terms(
     session: Session,
     client: Any,
@@ -5313,10 +5634,16 @@ def publish_rsa_draft(
         existing_keywords = set(existing_keyword_map)
         desired_keywords = set(keywords)
         keywords_to_create = [keyword for keyword in keywords if keyword not in existing_keywords]
+        planned_keyword_items = list(keywords_to_create)
         keywords_to_enable = [
             info["resource_name"]
             for keyword, info in existing_keyword_map.items()
             if keyword in keywords and str(info.get("status") or "").upper() != "ENABLED"
+        ]
+        stale_keywords_to_remove = [
+            keyword
+            for keyword, info in existing_keyword_map.items()
+            if keyword not in desired_keywords
         ]
         keywords_to_remove = [
             info["resource_name"]
@@ -5324,11 +5651,12 @@ def publish_rsa_draft(
             if keyword not in desired_keywords
         ]
         planned_keywords_to_create = len(keywords_to_create)
+        keyword_scope_key = f"exact_keywords:{ad_group['ad_group_resource_name']}"
         keywords_to_create, keyword_daily_budget = _limit_daily_criteria_items(
             session,
             account,
             kind="exact_keywords",
-            scope_key=f"exact_keywords:{ad_group['ad_group_resource_name']}",
+            scope_key=keyword_scope_key,
             items=keywords_to_create,
             validate_only=validate_only,
         )
@@ -5350,6 +5678,42 @@ def publish_rsa_draft(
             ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
             keywords=keywords_to_create,
             validate_only=validate_only,
+        )
+        keyword_context = _criteria_publication_context(
+            draft,
+            ad_group_name=str(ad_group.get("ad_group_name") or ""),
+        )
+        _record_criteria_publications(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key=keyword_scope_key,
+            items=keywords_to_create,
+            status="published" if not validate_only else "validated",
+            resource_names=keyword_resources,
+            result={"reservation": keyword_daily_budget},
+            **keyword_context,
+        )
+        _record_criteria_publications(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key=keyword_scope_key,
+            items=planned_keyword_items[len(keywords_to_create):],
+            status="deferred_quota",
+            result={"reservation": keyword_daily_budget},
+            **keyword_context,
+        )
+        _record_criteria_publications(
+            session,
+            account,
+            kind="remove_exact_keywords",
+            scope_key=keyword_scope_key,
+            items=stale_keywords_to_remove,
+            status="removed" if removed_keyword_resources else "pending",
+            resource_names=removed_keyword_resources,
+            result={"removed_resources": removed_keyword_resources},
+            **keyword_context,
         )
         keyword_result = {
             "keyword_count": len(keywords),
@@ -6309,8 +6673,6 @@ def publish_automation_campaigns(
         ],
         key=_live_publish_sort_key,
     )[:batch_limit]
-    if not drafts:
-        return {"name": "live_campaign_creation", "status": "skipped", "reason": "No eligible automation DSA/RSA drafts."}
     red_flag = account_api_red_flag(session, account)
     if red_flag is not None:
         return {"name": "live_campaign_creation", "status": "blocked_by_account_red_flag", "reason": red_flag["reason"], "red_flag": red_flag}
@@ -6324,6 +6686,7 @@ def publish_automation_campaigns(
     client = build_client({}, account.manager_customer_id, account.connection)
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    universal_negative_result: Optional[dict[str, Any]] = None
 
     def checkpoint(name: str, status: str = "started", **extra: Any) -> None:
         if progress_callback is None:
@@ -6334,6 +6697,62 @@ def publish_automation_campaigns(
             pass
 
     checkpoint("live_campaign_batch", "started", draft_count=len(drafts), validate_only=validate_only)
+    try:
+        checkpoint("universal_generic_negative_terms", "started")
+        universal_negative_result = sync_universal_generic_negative_terms(
+            session,
+            client,
+            account,
+            validate_only=validate_only,
+        )
+        checkpoint(
+            "universal_generic_negative_terms",
+            universal_negative_result.get("status") if isinstance(universal_negative_result, dict) else "done",
+            linked_campaign_count=(
+                universal_negative_result.get("linked_campaign_count")
+                if isinstance(universal_negative_result, dict)
+                else None
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - generic negatives should be visible but not hide campaign results.
+        if _is_quota_exhausted_error(exc) and not validate_only:
+            universal_negative_result = {"name": "universal_generic_negative_terms", **defer_live_creation_for_quota(session, account, exc)}
+        else:
+            universal_negative_result = {
+                "name": "universal_generic_negative_terms",
+                "status": "failed",
+                "error": str(exc)[:500],
+            }
+    if isinstance(universal_negative_result, dict) and "quota" in str(universal_negative_result).lower():
+        if previous_scope_count is None:
+            session_info.pop("live_criteria_scope_count", None)
+        else:
+            session_info["live_criteria_scope_count"] = previous_scope_count
+        if previous_item_limit is None:
+            session_info.pop("live_criteria_daily_item_limit", None)
+        else:
+            session_info["live_criteria_daily_item_limit"] = previous_item_limit
+        return {
+            "name": "live_campaign_creation",
+            "status": "blocked_by_google_quota",
+            "reason": "Universal generic negative sync hit Google Ads quota; campaign criteria work will resume after the retry window.",
+            "universal_generic_negative_terms": universal_negative_result,
+        }
+    if not drafts:
+        if previous_scope_count is None:
+            session_info.pop("live_criteria_scope_count", None)
+        else:
+            session_info["live_criteria_scope_count"] = previous_scope_count
+        if previous_item_limit is None:
+            session_info.pop("live_criteria_daily_item_limit", None)
+        else:
+            session_info["live_criteria_daily_item_limit"] = previous_item_limit
+        return {
+            "name": "live_campaign_creation",
+            "status": "skipped",
+            "reason": "No eligible automation DSA/RSA drafts.",
+            "universal_generic_negative_terms": universal_negative_result,
+        }
     for draft in drafts:
         draft_id = draft.id
         draft_type = draft.ad_type
@@ -6494,6 +6913,7 @@ def publish_automation_campaigns(
                 "validate_only": validate_only,
                 "results": [_compact_live_result(item) for item in results],
                 "errors": [_compact_live_result(item) for item in errors],
+                "universal_generic_negative_terms": universal_negative_result,
                 "restricted_policy_terms": restricted_policy_result,
             },
             result_json={"result_count": len(results), "error_count": len(errors)},
@@ -6517,5 +6937,6 @@ def publish_automation_campaigns(
         "daily_criteria_scope_count": criteria_scope_count,
         "results": [_compact_live_result(item) for item in results],
         "errors": [_compact_live_result(item) for item in errors],
+        "universal_generic_negative_terms": universal_negative_result,
         "restricted_policy_terms": restricted_policy_result,
     }

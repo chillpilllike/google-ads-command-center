@@ -22,9 +22,11 @@ from app.services.google_ads_live_campaign_creator import (
     _live_creation_batch_status,
     _pmax_asset_group_copy_assets,
     _pmax_final_urls_from_assets,
+    _record_criteria_publications,
     _restricted_terms_from_policy_strings,
     _successful_resource_names,
     _url_inclusion_urls_from_draft,
+    _universal_generic_negative_terms,
     publish_automation_campaigns,
     publish_pmax_draft,
     publish_rsa_draft,
@@ -662,6 +664,47 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
                 ),
                 2500,
             )
+
+    def test_record_criteria_publications_persists_deferred_rows(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.added = []
+
+            def scalar(self, *_args, **_kwargs):
+                return None
+
+            def add(self, item) -> None:
+                self.added.append(item)
+
+        session = FakeSession()
+        account = SimpleNamespace(id=637, customer_id="3495463031")
+
+        _record_criteria_publications(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key="exact_keywords:customers/3495463031/adGroups/2",
+            items=["Vitamin C Canada"],
+            status="deferred_quota",
+            lane="Testing / Discovery",
+            campaign_name="AUTO | Testing / Discovery | RSA Keywords | AUTO-123",
+            ad_group_name="AUTO | Testing / Discovery | RSA Keywords | AUTO-123",
+            source_key="automation:test",
+            result={"reservation": {"remaining_items": 0}},
+        )
+
+        self.assertEqual(len(session.added), 1)
+        row = session.added[0]
+        self.assertEqual(row.status, "deferred_quota")
+        self.assertEqual(row.criterion_key, "vitamin c canada")
+        self.assertEqual(row.lane, "Testing / Discovery")
+        self.assertEqual(row.last_result_json["reservation"]["remaining_items"], 0)
+
+    def test_universal_generic_negative_terms_include_account_name(self) -> None:
+        terms = _universal_generic_negative_terms(SimpleNamespace(name="Nutricity CA"))
+
+        self.assertIn("shop online", terms)
+        self.assertIn("Nutricity CA online", terms)
 
     def test_pmax_group_copy_is_theme_specific_and_filters_shipping_offer(self) -> None:
         account = SimpleNamespace(name="Nutricity CA")

@@ -1149,6 +1149,74 @@ async def init_app_db() -> None:
         )
         await conn.execute(
             text(
+                "CREATE TABLE IF NOT EXISTS google_ads_criteria_publications ("
+                "id SERIAL PRIMARY KEY, "
+                "account_id INTEGER NOT NULL REFERENCES google_ads_accounts(id), "
+                "customer_id VARCHAR(40) NOT NULL DEFAULT '', "
+                "kind VARCHAR(80) NOT NULL DEFAULT '', "
+                "scope_key VARCHAR(500) NOT NULL DEFAULT '', "
+                "criterion_key VARCHAR(1000) NOT NULL DEFAULT '', "
+                "criterion_value TEXT NOT NULL DEFAULT '', "
+                "status VARCHAR(40) NOT NULL DEFAULT 'pending', "
+                "lane VARCHAR(120) NOT NULL DEFAULT '', "
+                "campaign_name VARCHAR(255) NOT NULL DEFAULT '', "
+                "ad_group_name VARCHAR(255) NOT NULL DEFAULT '', "
+                "resource_name VARCHAR(500) NOT NULL DEFAULT '', "
+                "source_key VARCHAR(255) NOT NULL DEFAULT '', "
+                "attempts INTEGER NOT NULL DEFAULT 0, "
+                "last_error TEXT NOT NULL DEFAULT '', "
+                "last_result_json JSONB NOT NULL DEFAULT '{}'::jsonb, "
+                "planned_at TIMESTAMP WITH TIME ZONE DEFAULT now(), "
+                "last_attempted_at TIMESTAMP WITH TIME ZONE, "
+                "published_at TIMESTAMP WITH TIME ZONE, "
+                "updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(), "
+                "CONSTRAINT uq_google_ads_criteria_publication UNIQUE "
+                "(account_id, kind, scope_key, criterion_key)"
+                ")"
+            )
+        )
+        for column_sql in [
+            "customer_id VARCHAR(40) NOT NULL DEFAULT ''",
+            "kind VARCHAR(80) NOT NULL DEFAULT ''",
+            "scope_key VARCHAR(500) NOT NULL DEFAULT ''",
+            "criterion_key VARCHAR(1000) NOT NULL DEFAULT ''",
+            "criterion_value TEXT NOT NULL DEFAULT ''",
+            "status VARCHAR(40) NOT NULL DEFAULT 'pending'",
+            "lane VARCHAR(120) NOT NULL DEFAULT ''",
+            "campaign_name VARCHAR(255) NOT NULL DEFAULT ''",
+            "ad_group_name VARCHAR(255) NOT NULL DEFAULT ''",
+            "resource_name VARCHAR(500) NOT NULL DEFAULT ''",
+            "source_key VARCHAR(255) NOT NULL DEFAULT ''",
+            "attempts INTEGER NOT NULL DEFAULT 0",
+            "last_error TEXT NOT NULL DEFAULT ''",
+            "last_result_json JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "planned_at TIMESTAMP WITH TIME ZONE DEFAULT now()",
+            "last_attempted_at TIMESTAMP WITH TIME ZONE",
+            "published_at TIMESTAMP WITH TIME ZONE",
+            "updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()",
+        ]:
+            await conn.execute(text(f"ALTER TABLE google_ads_criteria_publications ADD COLUMN IF NOT EXISTS {column_sql}"))
+        await conn.execute(
+            text(
+                "DO $$ BEGIN "
+                "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_google_ads_criteria_publication') THEN "
+                "ALTER TABLE google_ads_criteria_publications "
+                "ADD CONSTRAINT uq_google_ads_criteria_publication "
+                "UNIQUE (account_id, kind, scope_key, criterion_key); "
+                "END IF; END $$;"
+            )
+        )
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_account_id ON google_ads_criteria_publications (account_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_customer_id ON google_ads_criteria_publications (customer_id)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_kind ON google_ads_criteria_publications (kind)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_scope_key ON google_ads_criteria_publications (scope_key)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_criterion_key ON google_ads_criteria_publications (criterion_key)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_status ON google_ads_criteria_publications (status)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_lane ON google_ads_criteria_publications (lane)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_campaign_name ON google_ads_criteria_publications (campaign_name)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_google_ads_criteria_publications_source_key ON google_ads_criteria_publications (source_key)"))
+        await conn.execute(
+            text(
                 "CREATE TABLE IF NOT EXISTS google_ads_page_feed_assets ("
                 "id SERIAL PRIMARY KEY, "
                 "publication_id INTEGER NOT NULL REFERENCES google_ads_page_feed_publications(id), "
