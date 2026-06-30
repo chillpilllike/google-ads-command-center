@@ -4637,11 +4637,27 @@ def run_testing_campaign_automation(
         "sales_budget_ratio": budget["ratio"],
         "sales_budget_ratio_pct": budget["ratio_pct"],
     }
+    cold_start_max_clicks_active = bool(
+        decision.get("mode") == "testing_no_pmax"
+        or decision.get("no_recent_impressions")
+        or (isinstance(budget.get("cold_start_minimum"), dict) and budget["cold_start_minimum"].get("active"))
+    )
+    testing_rsa_bidding = bidding
+    if cold_start_max_clicks_active:
+        testing_rsa_bidding = {
+            **bidding,
+            "strategy": "maximize_clicks",
+            "strategy_label": "Maximize clicks with CPC ceiling",
+            "target_roas": 0,
+            "target_roas_percent": 0,
+            "cold_start_max_clicks": True,
+            "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
+        }
     drafts: list[dict[str, Any]] = []
     retired_max_clicks_drafts = retire_legacy_max_clicks_automation_drafts(session, preference)
     warnings = [
         "Automation draft only; live creation still requires monitor-only off, dry-run off, and mutation settings enabled.",
-        "Testing Search campaigns use Target ROAS RSA/DSA lanes only. Legacy Max Clicks CPC-cap RSA lanes are retired and paused by campaign revisions.",
+        "Cold Testing RSA campaigns use Maximize Clicks with a CPC ceiling until conversion evidence is strong enough for Target ROAS; mature Testing RSA/DSA lanes keep Target ROAS.",
         "Campaign names include category and a stable AUTO code so reconnects can resume existing campaigns.",
     ]
 
@@ -4753,7 +4769,10 @@ def run_testing_campaign_automation(
                 session,
                 account,
                 automation={
-                    "source_key": _automation_draft_source_key(account, "testing_keyword_rsa"),
+                    "source_key": _automation_draft_source_key(
+                        account,
+                        "testing_keyword_rsa_max_clicks_bootstrap" if cold_start_max_clicks_active else "testing_keyword_rsa",
+                    ),
                     "decision": decision,
                     "keyword_source": keyword_source,
                     "keyword_themes": _keyword_payload(_planning_items(testing_keyword_rows_for_payload, keyword_limit)),
@@ -4775,8 +4794,16 @@ def run_testing_campaign_automation(
                     "source_job_id": source_job_id,
                 },
                 category="Testing / Discovery",
-                campaign_intent="maximize_clicks_rsa_best_keywords",
-                channel_label="RSA Target ROAS Keywords",
+                campaign_intent=(
+                    "maximize_clicks_rsa_cold_start_keywords"
+                    if cold_start_max_clicks_active
+                    else "target_roas_rsa_testing_keywords"
+                ),
+                channel_label=(
+                    "RSA Max Clicks Cold Start Keywords"
+                    if cold_start_max_clicks_active
+                    else "RSA Target ROAS Keywords"
+                ),
                 website_url=website_url,
             )
             campaign_identity = automation["campaign_identity"]
@@ -4789,7 +4816,7 @@ def run_testing_campaign_automation(
                 "existing_google_campaign": automation["existing_google_campaign"],
                 "planned_operation": automation["planned_operation"],
                 "live_creation": automation_live_creation_control(decision, category="Testing / Discovery", ad_type="rsa"),
-                "bidding": bidding,
+                "bidding": testing_rsa_bidding,
                 "final_url": testing_final_url,
                 "page_targeting": automation["page_targeting"],
                 "scale_negative_keyword_plan": scale_negative_plan,
@@ -4813,15 +4840,27 @@ def run_testing_campaign_automation(
                 },
                 "keyword_clusters": [
                     {
-                        "ad_group_name": f"AUTO | Testing / Discovery | RSA Keywords | {campaign_identity['campaign_code']}",
+                        "ad_group_name": (
+                            f"AUTO | Testing / Discovery | RSA Max Clicks Keywords | {campaign_identity['campaign_code']}"
+                            if cold_start_max_clicks_active
+                            else f"AUTO | Testing / Discovery | RSA Keywords | {campaign_identity['campaign_code']}"
+                        ),
                         "source": keyword_source,
                         "match_type": "exact",
                         "exact_terms": _planning_items(testing_rsa_terms, keyword_limit),
                     }
                 ],
                 "copy_strategy": {
-                    "mode": "automation_keyword_bank_rsa",
-                    "reason": "No recent account delivery, so RSA starts from best saved keyword-bank terms.",
+                    "mode": (
+                        "cold_start_max_clicks_keyword_bank_rsa"
+                        if cold_start_max_clicks_active
+                        else "automation_keyword_bank_rsa"
+                    ),
+                    "reason": (
+                        "Cold account delivery needs impressions first, so RSA starts from saved keyword-bank terms on Maximize Clicks with a CPC ceiling."
+                        if cold_start_max_clicks_active
+                        else "Testing RSA starts from best saved keyword-bank terms with Target ROAS once delivery evidence exists."
+                    ),
                 },
             }
             drafts.append(
@@ -7243,7 +7282,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "budget": "10-15% of allowed spend inside the rolling Odoo sales cap",
             "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
             "target_roas_pct": round(TESTING_DISCOVERY_TARGET_ROAS * 100),
-            "campaign_types": "Target-ROAS RSA from the keyword bank plus AI Max DSA page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence. Legacy Max Clicks lanes are retired.",
+            "campaign_types": "Cold accounts use Maximize Clicks RSA with CPC ceilings from the keyword bank; mature Testing accounts use Target-ROAS RSA plus AI Max DSA page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence.",
             "rule": f"Use RSA/page discovery only for the first {testing_bootstrap_days} day(s) when delivery is missing or conversion evidence is thin; promote to Core / Scale only after purchase evidence, healthy spend efficiency, and no duplicate keyword or landing-page conflict.",
         },
         {

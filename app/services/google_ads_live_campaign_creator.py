@@ -1194,6 +1194,13 @@ def _automation_campaign_revision_plan(name: str) -> Optional[dict[str, Any]]:
         return None
     if "| rsa " not in lowered and " rsa " not in lowered:
         return None
+    if is_testing and "max clicks cold start" in lowered:
+        return {
+            **ai_max_plan,
+            "strategy": "maximize_clicks",
+            "lane": "testing_rsa_max_clicks_bootstrap",
+            "allow_max_clicks": True,
+        }
     if "cpc cap" in lowered:
         return {**ai_max_plan, "strategy": "retired_max_clicks", "lane": "legacy_max_clicks_paused"}
     if is_core_scale:
@@ -1215,6 +1222,8 @@ def _is_legacy_max_clicks_auto_campaign(campaign: dict[str, Any], plan: dict[str
     name = str(campaign.get("campaign_name") or "").lower()
     strategy = str(campaign.get("bidding_strategy_type") or "").upper()
     lane = str((plan or {}).get("lane") or "").lower()
+    if bool((plan or {}).get("allow_max_clicks")) or lane == "testing_rsa_max_clicks_bootstrap":
+        return False
     return (
         "auto |" in name
         and (
@@ -2306,6 +2315,8 @@ def _create_search_campaign(
             pass
     if strategy == "maximize_conversion_value_target_roas" and target_roas > 0:
         campaign.maximize_conversion_value.target_roas = float(target_roas)
+    elif strategy == "maximize_clicks":
+        campaign.maximize_clicks.cpc_bid_ceiling_micros = int(max(max_cpc_micros or 0, 0))
     else:
         maximize_conversion_value = client.get_type("MaximizeConversionValue")
         campaign._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)

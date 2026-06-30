@@ -44,6 +44,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             self.status = None
             self.campaign_budget = ""
             self.target_spend = SimpleNamespace(cpc_bid_ceiling_micros=0)
+            self.maximize_clicks = SimpleNamespace(cpc_bid_ceiling_micros=0)
             self.maximize_conversion_value = SimpleNamespace(target_roas=0)
             self.dynamic_search_ads_setting = SimpleNamespace(domain_name="", language_code="")
             self.ai_max_setting = SimpleNamespace(enable_ai_max=False)
@@ -426,6 +427,25 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         campaign = client.campaign_service.last_request.operations[0].create
         self.assertEqual(resource_name, "customers/3495463031/campaigns/123")
         self.assertEqual(campaign.target_spend.cpc_bid_ceiling_micros, 0)
+        self.assertEqual(campaign.maximize_clicks.cpc_bid_ceiling_micros, 0)
+
+    def test_create_search_campaign_supports_cold_start_maximize_clicks(self) -> None:
+        client = self.FakeGoogleAdsClient()
+        account = SimpleNamespace(customer_id="3495463031")
+
+        _create_search_campaign(
+            client,
+            account,
+            name="AUTO | Testing / Discovery | RSA Max Clicks Cold Start Keywords | AUTO-TST",
+            budget_resource_name="customers/3495463031/campaignBudgets/1",
+            max_cpc_micros=2_500_000,
+            bidding={"strategy": "maximize_clicks"},
+            validate_only=False,
+        )
+
+        campaign = client.campaign_service.last_request.operations[0].create
+        self.assertEqual(campaign.maximize_clicks.cpc_bid_ceiling_micros, 2_500_000)
+        self.assertEqual(campaign.maximize_conversion_value.target_roas, 0)
 
     def test_create_search_campaign_can_enable_ai_max_for_dsa_lane(self) -> None:
         client = self.FakeGoogleAdsClient()
