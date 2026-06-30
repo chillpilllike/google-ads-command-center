@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
 import time
 
 from fastapi import Depends, FastAPI, Request
@@ -29,13 +30,14 @@ async def lifespan(app: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
         async with AsyncSession(engine, expire_on_commit=False) as session:
             await seed_database(session, settings)
-    try:
-        async with AsyncSession(engine, expire_on_commit=False) as session:
-            await get_dashboard_static_data(session)
-            await get_recent_runs(session)
-            await get_google_ads_connection_status(session, include_accounts=False)
-    except Exception as exc:  # noqa: BLE001 - keep web alive during temporary database saturation.
-        app.state.startup_warmup_error = str(exc)
+    if os.getenv("STARTUP_WARMUP_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                await get_dashboard_static_data(session)
+                await get_recent_runs(session)
+                await get_google_ads_connection_status(session, include_accounts=False)
+        except Exception as exc:  # noqa: BLE001 - keep web alive during temporary database saturation.
+            app.state.startup_warmup_error = str(exc)
     yield
 
 
