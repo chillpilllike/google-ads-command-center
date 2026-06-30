@@ -64,7 +64,7 @@ RUN chmod +x scripts/docker_start.sh scripts/run_automation_scheduler_loop.sh
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=10 \
     CMD python -c "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\", \"8000\")}/healthz', timeout=5).read()"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
