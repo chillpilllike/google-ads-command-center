@@ -2316,7 +2316,7 @@ def _create_search_campaign(
     if strategy == "maximize_conversion_value_target_roas" and target_roas > 0:
         campaign.maximize_conversion_value.target_roas = float(target_roas)
     elif strategy == "maximize_clicks":
-        campaign.maximize_clicks.cpc_bid_ceiling_micros = int(max(max_cpc_micros or 0, 0))
+        campaign.target_spend.cpc_bid_ceiling_micros = int(max(max_cpc_micros or 0, 0))
     else:
         maximize_conversion_value = client.get_type("MaximizeConversionValue")
         campaign._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)
