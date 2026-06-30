@@ -23,12 +23,12 @@ from app.models import (
     OdooWebsite,
 )
 from app.services.google_ads_api_errors import record_google_ads_api_error, record_google_ads_generic_error
-from app.services.google_ads_account_red_flags import account_api_red_flag
+from app.services.google_ads_account_red_flags import account_api_red_flag, upsert_account_api_red_flag
 from app.services.google_ads_sync import build_client, enum_name
 from app.services.page_feed_restrictions import get_restricted_title_terms_sync, restricted_title_match
 
 
-MAX_PAGE_FEED_URLS = 100
+MAX_PAGE_FEED_URLS = 1000
 PAGE_FEED_LABEL = "odoo_winner"
 FALLBACK_PAGE_FEED_LABEL = "odoo_fallback"
 DSA_CRITERION_NAME = "Odoo winner page feed"
@@ -91,6 +91,11 @@ def _google_ads_mutate(service: Any, method_name: str, request: Any, *, timeout:
         if "timeout" not in str(exc):
             raise
         return method(request=request)
+
+
+def _is_suspended_account_error(exc: Any) -> bool:
+    text = str(exc or "").upper()
+    return "ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT" in text or "ACCOUNT IS SUSPENDED" in text
 
 
 def chunked(items: list[Any], size: int = 100) -> Iterable[list[Any]]:
@@ -828,6 +833,14 @@ def publish_mapping_page_feed(
         session.commit()
         return result
     except GoogleAdsException as exc:
+        if _is_suspended_account_error(exc):
+            upsert_account_api_red_flag(
+                session,
+                account,
+                status="blocked_by_suspended_account",
+                reason="Google Ads rejected page-feed publishing with ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT.",
+                source="page_feed_publish",
+            )
         record_google_ads_api_error(
             session,
             exc,
@@ -851,6 +864,14 @@ def publish_mapping_page_feed(
             session.commit()
         raise
     except Exception as exc:
+        if _is_suspended_account_error(exc):
+            upsert_account_api_red_flag(
+                session,
+                account,
+                status="blocked_by_suspended_account",
+                reason="Google Ads rejected page-feed publishing with ACTION_NOT_PERMITTED_FOR_SUSPENDED_ACCOUNT.",
+                source="page_feed_publish",
+            )
         record_google_ads_generic_error(
             session,
             exc,

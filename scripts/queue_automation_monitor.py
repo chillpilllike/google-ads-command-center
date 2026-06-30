@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT_DIR))
 from sqlalchemy import func, select
 
 from app.app_settings import get_sync_setting_map, parse_bool
-from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount
+from app.models import AdDraft, BackgroundJob, BackgroundJobStatus, GoogleAdsAccount, OdooStoreGoogleAdsMapping
 from app.runtime_role import primary_instance_required_result
 from app.services.google_ads_automation import (
     active_google_ads_quota_retry_state,
@@ -24,7 +24,8 @@ from app.services.google_ads_automation import (
     refresh_low_traffic_schedule,
     refresh_peak_budget_decision,
 )
-from app.tasks import SessionLocal, run_google_ads_automation_monitor, sync_google_ads_daily_keywords
+from app.services.google_ads_account_red_flags import account_api_red_flag
+from app.tasks import SessionLocal, publish_google_ads_page_feeds, run_google_ads_automation_monitor, sync_google_ads_daily_keywords
 
 STALE_QUEUED_AUTOMATION_JOB_AFTER = timedelta(hours=2)
 STALE_RUNNING_AUTOMATION_JOB_AFTER = timedelta(hours=3)
@@ -35,6 +36,11 @@ DAILY_KEYWORD_SYNC_DAYS_SETTING = "automation.daily_keyword_sync_days"
 DAILY_KEYWORD_SYNC_MAX_ROWS_SETTING = "automation.daily_keyword_sync_max_rows"
 DAILY_KEYWORD_SYNC_DEFAULT_DAYS = 60
 DAILY_KEYWORD_SYNC_DEFAULT_MAX_ROWS = 5000
+DAILY_PAGE_FEED_PUBLISH_INTERVAL = timedelta(hours=24)
+DAILY_PAGE_FEED_PUBLISH_MAX_URLS_SETTING = "automation.page_feed_publish_max_urls_per_account"
+DAILY_PAGE_FEED_PUBLISH_MAX_ACCOUNTS_SETTING = "automation.page_feed_publish_max_accounts_per_run"
+DAILY_PAGE_FEED_PUBLISH_DEFAULT_MAX_URLS = 1000
+DAILY_PAGE_FEED_PUBLISH_DEFAULT_MAX_ACCOUNTS = 30
 
 
 def customer_id_set(value: object) -> set[str]:
@@ -155,6 +161,93 @@ def _queue_daily_keyword_sync_if_due(session, now: datetime) -> None:
         raise
 
 
+def _queue_daily_page_feed_publish_if_due(session, now: datetime, scheduler_settings: dict) -> None:
+    if _active_job(session, "google_ads_page_feed_publish") is not None:
+        return
+    latest_finished = session.scalar(
+        select(BackgroundJob.finished_at)
+        .where(
+            BackgroundJob.job_type == "google_ads_page_feed_publish",
+            BackgroundJob.status == BackgroundJobStatus.succeeded,
+            BackgroundJob.finished_at.is_not(None),
+        )
+        .order_by(BackgroundJob.finished_at.desc())
+        .limit(1)
+    )
+    if latest_finished is not None and latest_finished.astimezone(timezone.utc) > now - DAILY_PAGE_FEED_PUBLISH_INTERVAL:
+        return
+
+    primary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_primary_customer_ids"))
+    secondary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_secondary_customer_ids"))
+    max_accounts = clamp_int(
+        scheduler_settings.get(DAILY_PAGE_FEED_PUBLISH_MAX_ACCOUNTS_SETTING),
+        DAILY_PAGE_FEED_PUBLISH_DEFAULT_MAX_ACCOUNTS,
+        1,
+        100,
+    )
+    max_urls = clamp_int(
+        scheduler_settings.get(DAILY_PAGE_FEED_PUBLISH_MAX_URLS_SETTING),
+        DAILY_PAGE_FEED_PUBLISH_DEFAULT_MAX_URLS,
+        1,
+        5000,
+    )
+    mapped_account_ids = set(
+        session.scalars(
+            select(OdooStoreGoogleAdsMapping.account_id).where(
+                OdooStoreGoogleAdsMapping.is_active.is_(True),
+                OdooStoreGoogleAdsMapping.account_id.is_not(None),
+            )
+        ).all()
+    )
+    candidates = []
+    for preference in enabled_automation_preferences(session):
+        account = preference.account
+        if account.id not in mapped_account_ids:
+            continue
+        if account_api_red_flag(session, account) is not None:
+            continue
+        if active_google_ads_quota_retry_state(session, account, now=now):
+            continue
+        tier = scheduler_tier(account, primary_customer_ids, secondary_customer_ids)
+        candidates.append((tier, preference.last_run_at or datetime(1970, 1, 1, tzinfo=timezone.utc), account.name, account.id))
+    account_ids = [account_id for _tier, _last_run, _name, account_id in sorted(candidates)[:max_accounts]]
+    if not account_ids:
+        return
+
+    job = BackgroundJob(
+        job_type="google_ads_page_feed_publish",
+        label=f"Daily Google Ads page-feed URL publish: {len(account_ids)} account(s)",
+        requested_by_id=None,
+        payload={
+            "account_ids": account_ids,
+            "max_urls": max_urls,
+            "validate_only": None,
+            "create_dsa_criteria": False,
+            "queued_by": "scripts/queue_automation_monitor.py",
+            "reason": "recurring_daily_page_feed_url_publish",
+            "priority": {
+                "primary_customer_ids": sorted(primary_customer_ids),
+                "secondary_customer_ids": sorted(secondary_customer_ids),
+            },
+        },
+        status=BackgroundJobStatus.queued,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    try:
+        message = publish_google_ads_page_feeds.send(job.id, None, account_ids, None, None, max_urls, False)
+        job.message_id = str(message.message_id)
+        session.commit()
+        print(f"Queued daily Google Ads page-feed publish job #{job.id} for account ids {account_ids}")
+    except Exception as exc:  # noqa: BLE001 - keep failed dispatch visible in Jobs.
+        job.status = BackgroundJobStatus.failed
+        job.error = str(exc)
+        job.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        raise
+
+
 def main() -> None:
     args = parse_args()
     runtime_block = primary_instance_required_result()
@@ -164,8 +257,10 @@ def main() -> None:
         return
     now = datetime.now(timezone.utc)
     with SessionLocal() as session:
+        scheduler_settings = get_sync_setting_map(session)
         if not args.skip_daily_keywords:
             _queue_daily_keyword_sync_if_due(session, now)
+            _queue_daily_page_feed_publish_if_due(session, now, scheduler_settings)
         selected_ids = [int(item) for item in args.account_id if item]
         customer_ids = [str(item).replace("-", "").strip() for item in args.customer_id if str(item).strip()]
         if customer_ids:
@@ -178,7 +273,6 @@ def main() -> None:
             selected_ids.extend(account.id for account in accounts)
         selected_ids = list(dict.fromkeys(selected_ids))
         preferences = enabled_automation_preferences(session, account_ids=selected_ids or None)
-        scheduler_settings = get_sync_setting_map(session)
         primary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_primary_customer_ids"))
         secondary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_secondary_customer_ids"))
         include_unlisted = parse_bool(scheduler_settings.get("automation.scheduler_include_unlisted_accounts", False))

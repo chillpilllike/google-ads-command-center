@@ -2666,6 +2666,17 @@ def publish_google_ads_page_feeds(
             errors: list[Any] = []
             leased_account_ids: list[int] = []
             for account_id, account in account_by_id.items():
+                red_flag = account_api_red_flag(session, account)
+                if red_flag is not None:
+                    errors.append(
+                        {
+                            "account_id": account_id,
+                            "customer_id": account.customer_id,
+                            "error": red_flag.get("reason") or "Google Ads account is red-flagged.",
+                            "status": "blocked_by_account_red_flag",
+                        }
+                    )
+                    continue
                 lease = acquire_google_ads_api_account_lease(
                     session,
                     account,
@@ -2690,7 +2701,7 @@ def publish_google_ads_page_feeds(
                 account_ids=leased_account_ids or [-1],
                 website_ids=selected_website_ids or None,
                 validate_only=validate_only,
-                max_urls=max(1, min(int(max_urls or 100), 500)),
+                max_urls=max(1, min(int(max_urls or 100), 5000)),
                 create_dsa_criteria=bool(create_dsa_criteria),
                 job_id=job_id,
             )

@@ -52,6 +52,9 @@ GOOGLE_ADS_API_QUOTA_PREFIX = "google_ads_asset_publish_quota"
 DSA_DISABLED_SETTING_PREFIX = "live_campaign_creator.dsa_disabled"
 LIVE_CREATION_QUOTA_COOLDOWN_PREFIX = "live_campaign_creator.quota_cooldown"
 CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.criteria_daily_item_limit"
+PRIMARY_CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.primary_criteria_daily_item_limit"
+SECONDARY_CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.secondary_criteria_daily_item_limit"
+OTHER_CRITERIA_DAILY_ITEM_LIMIT_SETTING = "live_campaign_creator.other_criteria_daily_item_limit"
 CRITERIA_DAILY_ITEM_STATE_PREFIX = "live_campaign_creator.criteria_daily_items"
 DEFAULT_CRITERIA_DAILY_ITEM_LIMIT = 1000
 LIVE_CAMPAIGN_PUBLISH_BATCH_LIMIT = 50
@@ -180,6 +183,16 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return max(parsed, 1)
 
 
+def _customer_id_set(value: object) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = str(value).replace("\\n", "\n").replace(",", "\n").splitlines()
+    return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
+
+
 def _session_info(session: Any) -> dict[str, Any]:
     info = getattr(session, "info", None)
     if isinstance(info, dict):
@@ -198,6 +211,20 @@ def _criteria_daily_item_limit(session: Session) -> int:
     limit = _parse_positive_int(setting.value if setting is not None else None, DEFAULT_CRITERIA_DAILY_ITEM_LIMIT)
     info["live_criteria_daily_item_limit"] = limit
     return limit
+
+
+def _criteria_daily_item_limit_for_account(session: Session, account: GoogleAdsAccount) -> int:
+    settings = get_sync_setting_map(session)
+    customer_id = "".join(ch for ch in str(getattr(account, "customer_id", "") or "") if ch.isdigit())
+    primary_ids = _customer_id_set(settings.get("automation.scheduler_primary_customer_ids"))
+    secondary_ids = _customer_id_set(settings.get("automation.scheduler_secondary_customer_ids"))
+    if customer_id in primary_ids:
+        value = settings.get(PRIMARY_CRITERIA_DAILY_ITEM_LIMIT_SETTING)
+    elif customer_id in secondary_ids:
+        value = settings.get(SECONDARY_CRITERIA_DAILY_ITEM_LIMIT_SETTING)
+    else:
+        value = settings.get(OTHER_CRITERIA_DAILY_ITEM_LIMIT_SETTING)
+    return _parse_positive_int(value or settings.get(CRITERIA_DAILY_ITEM_LIMIT_SETTING), DEFAULT_CRITERIA_DAILY_ITEM_LIMIT)
 
 
 def _criteria_daily_scope_count(session: Session) -> int:
@@ -5987,8 +6014,10 @@ def publish_automation_campaigns(
 
     session_info = _session_info(session)
     previous_scope_count = session_info.get("live_criteria_scope_count")
+    previous_item_limit = session_info.get("live_criteria_daily_item_limit")
     criteria_scope_count = _planned_criteria_scope_count(drafts)
     session_info["live_criteria_scope_count"] = criteria_scope_count
+    session_info["live_criteria_daily_item_limit"] = _criteria_daily_item_limit_for_account(session, account)
     client = build_client({}, account.manager_customer_id, account.connection)
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -6172,6 +6201,10 @@ def publish_automation_campaigns(
         session_info.pop("live_criteria_scope_count", None)
     else:
         session_info["live_criteria_scope_count"] = previous_scope_count
+    if previous_item_limit is None:
+        session_info.pop("live_criteria_daily_item_limit", None)
+    else:
+        session_info["live_criteria_daily_item_limit"] = previous_item_limit
     return {
         "name": "live_campaign_creation",
         "status": status,
