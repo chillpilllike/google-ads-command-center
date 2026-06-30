@@ -21,14 +21,6 @@ fi
 
 mkdir -p state reports
 
-if [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "false" ] && [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "0" ]; then
-  python scripts/init_dramatiq_pg.py
-fi
-
-if [ "${INIT_APP_DB:-true}" != "false" ] && [ "${INIT_APP_DB:-true}" != "0" ]; then
-  python scripts/init_app_db.py
-fi
-
 pids=()
 
 shutdown() {
@@ -40,6 +32,21 @@ shutdown() {
 
 trap shutdown TERM INT
 
+uvicorn app.main:app \
+  --host 0.0.0.0 \
+  --port "${PORT:-8000}" \
+  --workers "${WEB_CONCURRENCY:-1}" \
+  --proxy-headers &
+pids+=("$!")
+
+if [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "false" ] && [ "${INIT_DRAMATIQ_SCHEMA:-true}" != "0" ]; then
+  python scripts/init_dramatiq_pg.py
+fi
+
+if [ "${INIT_APP_DB:-true}" != "false" ] && [ "${INIT_APP_DB:-true}" != "0" ]; then
+  python scripts/init_app_db.py
+fi
+
 if [ "${DRAMATIQ_ENABLED:-true}" != "false" ] && [ "${DRAMATIQ_ENABLED:-true}" != "0" ]; then
   dramatiq app.tasks --processes "${DRAMATIQ_PROCESSES:-1}" --threads "${DRAMATIQ_THREADS:-2}" &
   pids+=("$!")
@@ -49,13 +56,6 @@ if [ "${SCHEDULER_ENABLED:-true}" != "false" ] && [ "${SCHEDULER_ENABLED:-true}"
   scripts/run_automation_scheduler_loop.sh &
   pids+=("$!")
 fi
-
-uvicorn app.main:app \
-  --host 0.0.0.0 \
-  --port "${PORT:-8000}" \
-  --workers "${WEB_CONCURRENCY:-1}" \
-  --proxy-headers &
-pids+=("$!")
 
 set +e
 wait -n "${pids[@]}"
