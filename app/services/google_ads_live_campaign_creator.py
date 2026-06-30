@@ -88,6 +88,12 @@ MINIMUM_DAILY_BUDGET_BY_CURRENCY = {
     "INR": 1000.0,
 }
 COUNTRY_TARGET_SETTING_PREFIX = "google_ads_account_country_target"
+ALL_COUNTRIES_TARGET = {
+    "country_code": "ALL",
+    "country_name": "All countries and territories",
+    "geo_target_constant": "",
+    "targeting_mode": "all_countries_and_territories",
+}
 COUNTRY_TARGETS = {
     "AR": {"name": "Argentina", "geo_target_constant": "geoTargetConstants/2032"},
     "AT": {"name": "Austria", "geo_target_constant": "geoTargetConstants/2040"},
@@ -651,6 +657,12 @@ def _country_from_text(value: str) -> str:
 
 def _country_target_payload(country_code: str, *, source: str = "", domain: str = "") -> dict[str, str]:
     code = str(country_code or "").upper()
+    if code in {"ALL", "WORLD", "GLOBAL"}:
+        return {
+            **ALL_COUNTRIES_TARGET,
+            "source": source,
+            "domain": domain,
+        }
     target = COUNTRY_TARGETS.get(code)
     if not target:
         return {}
@@ -698,12 +710,42 @@ def _record_account_country_target(
         setting.updated_at = utcnow()
 
 
+def _manual_account_country_target(session: Session, account: GoogleAdsAccount) -> dict[str, str]:
+    keys = [
+        f"{COUNTRY_TARGET_SETTING_PREFIX}.{account.customer_id}",
+        f"{COUNTRY_TARGET_SETTING_PREFIX}.{account.id}",
+    ]
+    try:
+        setting = session.scalar(
+            select(AppSetting).where(AppSetting.key.in_(keys)).order_by(AppSetting.updated_at.desc()).limit(1)
+        )
+    except Exception:
+        return {}
+    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    if not value:
+        return {}
+    country_code = str(value.get("country_code") or "").upper()
+    targeting_mode = str(value.get("targeting_mode") or "").lower()
+    source = str(value.get("source") or "manual_postgres_override")
+    domain = str(value.get("domain") or "")
+    if country_code in {"ALL", "WORLD", "GLOBAL"} or targeting_mode == "all_countries_and_territories":
+        return {
+            **ALL_COUNTRIES_TARGET,
+            "source": source,
+            "domain": domain,
+        }
+    return _country_target_payload(country_code, source=source, domain=domain)
+
+
 def resolve_account_country_target(
     session: Session,
     account: GoogleAdsAccount,
     *,
     final_url: str = "",
 ) -> dict[str, str]:
+    manual_target = _manual_account_country_target(session, account)
+    if manual_target:
+        return manual_target
     candidates: list[tuple[float, str, str, str]] = []
     if final_url:
         candidates.append((1000.0, _country_from_domain(final_url), "draft_final_url", root_domain(final_url)))
@@ -3081,8 +3123,11 @@ def _ensure_campaign_country_target(
     country_target: dict[str, str],
     validate_only: bool,
 ) -> dict[str, Any]:
+    all_countries = str(country_target.get("targeting_mode") or "").lower() == "all_countries_and_territories" or str(
+        country_target.get("country_code") or ""
+    ).upper() in {"ALL", "WORLD", "GLOBAL"}
     target_resource = str(country_target.get("geo_target_constant") or "")
-    if not campaign_id or not campaign_resource_name or not target_resource:
+    if not campaign_id or not campaign_resource_name or (not target_resource and not all_countries):
         return {"status": "skipped", "reason": "No resolved country target."}
     if not hasattr(client, "get_service") or not hasattr(client, "get_type"):
         return {"status": "skipped", "reason": "Google Ads client does not expose mutation services."}
@@ -3091,6 +3136,41 @@ def _ensure_campaign_country_target(
         return {"status": "skipped", "reason": "Google Ads client does not expose campaign criterion mutation."}
     existing = _existing_campaign_location_targets(client, account, campaign_id)
     positive_existing = [item for item in existing if not item.get("negative")]
+    if all_countries:
+        operations = []
+        for item in positive_existing:
+            resource_name = item.get("resource_name")
+            if not resource_name:
+                continue
+            operation = client.get_type("CampaignCriterionOperation")
+            if not hasattr(operation, "remove"):
+                return {"status": "skipped", "reason": "Google Ads client does not expose campaign criterion operations."}
+            operation.remove = resource_name
+            operations.append(operation)
+        if not operations:
+            return {
+                "status": "unchanged",
+                "country_code": "ALL",
+                "country_name": ALL_COUNTRIES_TARGET["country_name"],
+                "targeting_mode": ALL_COUNTRIES_TARGET["targeting_mode"],
+                "existing_location_count": len(existing),
+            }
+        request = client.get_type("MutateCampaignCriteriaRequest")
+        request.customer_id = account.customer_id
+        request.operations.extend(operations)
+        request.partial_failure = True
+        request.validate_only = validate_only
+        response = _google_ads_mutate(client.get_service("CampaignCriterionService"), "mutate_campaign_criteria", request)
+        resources = _successful_resource_names(response)
+        return {
+            "status": "validated" if validate_only else "updated",
+            "country_code": "ALL",
+            "country_name": ALL_COUNTRIES_TARGET["country_name"],
+            "targeting_mode": ALL_COUNTRIES_TARGET["targeting_mode"],
+            "removed_other_positive_locations": len(operations),
+            "created_country_target": False,
+            "resources": resources,
+        }
     has_target = any(item.get("geo_target_constant") == target_resource for item in positive_existing)
     to_remove = [
         item["resource_name"]
