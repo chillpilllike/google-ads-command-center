@@ -3885,6 +3885,49 @@ def testing_scale_negative_keyword_plan(
     }
 
 
+def core_owned_testing_negative_keywords(terms: list[str]) -> list[dict[str, Any]]:
+    negatives: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for term in terms or []:
+        text = _clean_pmax_search_theme(term)
+        key = _term_key_from_text(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        negatives.append(
+            {
+                "keyword": text,
+                "match_type": "exact",
+                "source": "core_scale_owned_keyword",
+                "theme_key": key,
+                "reason": "Term is already assigned to Core / Scale, so Testing / Discovery must not compete for it.",
+            }
+        )
+    return negatives
+
+
+def core_owned_testing_page_exclusions(url_targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    exclusions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in url_targets or []:
+        if not isinstance(item, dict):
+            continue
+        url = canonical_landing_page_url(str(item.get("url") or item.get("final_url") or ""))
+        key = str(item.get("page_key") or _page_key(url))
+        if not url or not key or key in seen:
+            continue
+        seen.add(key)
+        exclusions.append(
+            {
+                "url": url,
+                "page_key": key,
+                "source": "core_scale_owned_landing_page",
+                "reason": "URL is already assigned to Core / Scale, so Testing / Discovery must not include it.",
+            }
+        )
+    return exclusions
+
+
 def _compact_list(value: Any, *, limit: int) -> list[Any]:
     if not isinstance(value, list):
         return []
@@ -4510,7 +4553,9 @@ def run_testing_campaign_automation(
                 + " PMax live publishing is still gated, but Core / Scale Search-owned URLs remain tracked for Testing URL exclusions."
             ).strip(),
         }
+    core_owned_testing_negatives = core_owned_testing_negative_keywords(list(pmax_search_themes) + list(core_rsa_terms))
     testing_negative_keywords = merge_negative_keywords(
+        core_owned_testing_negatives,
         scale_negative_plan["negative_keywords"],
         waste_negative_plan["active_negative_keywords"],
     )
@@ -4544,6 +4589,22 @@ def run_testing_campaign_automation(
     testing_discovery_url_targets = _url_inclusion_targets_from_page_items(
         (governance_categories.get("Testing / Discovery") or {}).get("candidate_pages") or [],
         source="testing_discovery_governance",
+    )
+    core_scale_url_keys = {
+        str(item.get("page_key") or _page_key(item.get("url"))).strip().lower()
+        for item in core_scale_url_targets
+        if isinstance(item, dict) and str(item.get("url") or "").strip()
+    }
+    if core_scale_url_keys:
+        testing_discovery_url_targets = [
+            item
+            for item in testing_discovery_url_targets
+            if str(item.get("page_key") or _page_key(item.get("url"))).strip().lower() not in core_scale_url_keys
+        ]
+    core_owned_testing_exclusions = core_owned_testing_page_exclusions(core_scale_url_targets)
+    testing_page_exclusions = merge_page_exclusions(
+        core_owned_testing_exclusions,
+        testing_page_exclusions,
     )
     core_scale_pmax_url_targets, core_scale_pmax_policy_filter = _pmax_safe_url_targets(
         core_scale_url_targets,
@@ -4594,38 +4655,13 @@ def run_testing_campaign_automation(
                 "used_minimum": True,
             }
         else:
-            blocked_drafts = block_automation_campaign_drafts_for_budget(session, preference, budget)
-            reason = str(budget.get("budget_block_reason") or "Odoo sales guard blocks automated campaign spend.")
-            result = {
-                "name": "testing_campaign_automation",
-                "status": "deferred_budget_guard",
-                "reason": reason,
-                "decision": decision,
-                "budget": budget,
-                "blocked_drafts": blocked_drafts,
-                "keyword_count": len(keyword_rows),
-                "landing_page_count": len(page_rows),
-                "audience_signal_plan": audience_signal_plan,
-                "live_creation_enabled": False,
+            budget = {
+                **budget,
+                "daily_budget": 0.0,
+                "daily_budget_inr": 0.0,
+                "criteria_only_maintenance": True,
+                "criteria_only_reason": budget.get("budget_block_reason"),
             }
-            session.add(
-                AutoPilotEvent(
-                    account_id=account.id,
-                    campaign_id=None,
-                    campaign_name=None,
-                    action_type="automation_campaign_plan",
-                    status="blocked",
-                    summary=reason,
-                    evidence={
-                        "decision": decision,
-                        "budget": budget,
-                        "blocked_drafts": blocked_drafts,
-                        "source_job_id": source_job_id,
-                    },
-                )
-            )
-            session.commit()
-            return result
     bidding = {
         "strategy": "maximize_conversion_value_target_roas",
         "strategy_label": "Maximize conversion value with Target ROAS",
@@ -4688,7 +4724,9 @@ def run_testing_campaign_automation(
                 "keyword_themes": _keyword_payload(_planning_items(keyword_rows, keyword_limit)),
                 "keyword_source": keyword_source,
                 "scale_negative_keyword_plan": scale_negative_plan,
+                "core_owned_testing_negative_count": len(core_owned_testing_negatives),
                 "scale_page_exclusion_plan": scale_page_exclusion_plan,
+                "core_owned_testing_page_exclusion_count": len(core_owned_testing_exclusions),
                 "landing_page_governance_plan": draft_landing_page_governance,
                 "audience_signal_plan": audience_signal_plan,
                 "waste_management_plan": draft_waste_plan,
@@ -5668,8 +5706,10 @@ def run_testing_campaign_automation(
                 "audience_signal_similar_url_count": int(audience_signal_plan.get("similar_website_url_count") or 0),
                 "testing_scale_negative_keyword_count": int(scale_negative_plan.get("negative_keyword_count") or 0),
                 "testing_scale_pending_keyword_count": int(scale_negative_plan.get("pending_keyword_count") or 0),
+                "testing_core_owned_negative_keyword_count": len(core_owned_testing_negatives),
                 "testing_scale_page_exclusion_count": int(scale_page_exclusion_plan.get("page_exclusion_count") or 0),
                 "testing_scale_pending_page_count": int(scale_page_exclusion_plan.get("pending_page_count") or 0),
+                "testing_core_owned_page_exclusion_count": len(core_owned_testing_exclusions),
                 "waste_active_negative_keyword_count": int(waste_negative_plan.get("active_negative_keyword_count") or 0),
                 "waste_active_page_exclusion_count": int(waste_page_exclusion_plan.get("active_page_exclusion_count") or 0),
                 "waste_scale_recovery_keyword_count": int(waste_negative_plan.get("scale_recovery_keyword_count") or 0),

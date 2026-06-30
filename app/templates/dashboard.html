@@ -46,6 +46,50 @@
   </div>
 </div>
 
+<div class="card mb-3">
+  <div class="card-header">
+    <h3 class="card-title">Google Ads API quota</h3>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead>
+        <tr>
+          <th>Gmail connection</th>
+          <th class="text-end">Used</th>
+          <th class="text-end">Remaining</th>
+          <th class="text-end">Reserved</th>
+          <th class="text-end">Mutation room</th>
+          <th>429 / reset</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for quota in api_quota_rows %}
+        <tr>
+          <td>
+            <div class="fw-semibold">{{ quota.name }}</div>
+            <div class="text-secondary small">{{ quota.email }}</div>
+          </td>
+          <td class="text-end font-monospace">{{ quota.used_units }} / {{ quota.budget_units }}</td>
+          <td class="text-end font-monospace">{{ quota.remaining_units }}</td>
+          <td class="text-end font-monospace">{{ quota.reserve_units }}</td>
+          <td class="text-end font-monospace">{{ quota.mutation_available_units }}</td>
+          <td>
+            {% if quota.retry %}
+            <span class="badge bg-red-lt">blocked</span>
+            <div class="text-secondary small">{{ quota.retry.retry_not_before or quota.retry.reason }}</div>
+            {% else %}
+            <span class="badge bg-green-lt">available</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-secondary">No Google Ads Gmail connections are saved yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <form class="row row-cards" method="post" action="/runs">
   <div class="col-lg-4">
     <div class="card">

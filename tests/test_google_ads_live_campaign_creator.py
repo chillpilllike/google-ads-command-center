@@ -17,6 +17,7 @@ from app.services.google_ads_live_campaign_creator import (
     _draft_live_creation_control,
     _existing_asset_group_audience_signals,
     _is_replaced_legacy_pmax_draft,
+    _keyword_texts_from_draft,
     _live_creation_batch_status,
     _pmax_asset_group_copy_assets,
     _pmax_final_urls_from_assets,
@@ -698,7 +699,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         self.assertTrue(_is_replaced_legacy_pmax_draft(legacy, [legacy, replacement]))
         self.assertFalse(_is_replaced_legacy_pmax_draft(replacement, [legacy, replacement]))
 
-    def test_rsa_publish_enables_existing_paused_exact_keywords(self) -> None:
+    def test_rsa_publish_enables_existing_paused_exact_keywords_and_removes_stale(self) -> None:
         account = SimpleNamespace(id=637, name="Nutricity CA", customer_id="3495463031", currency_code="AUD")
         preference = SimpleNamespace(account=account, account_id=637, minimum_daily_budget_amount=1)
         draft = SimpleNamespace(
@@ -780,9 +781,9 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             "app.services.google_ads_live_campaign_creator._enable_ad_group_criteria_if_needed",
             return_value=["customers/3495463031/adGroupCriteria/2~10"],
         ) as enable_keywords, patch(
-            "app.services.google_ads_live_campaign_creator._pause_ad_group_criteria_if_needed",
+            "app.services.google_ads_live_campaign_creator._remove_ad_group_criteria_if_needed",
             return_value=["customers/3495463031/adGroupCriteria/2~13"],
-        ) as pause_keywords, patch(
+        ) as remove_keywords, patch(
             "app.services.google_ads_live_campaign_creator._create_exact_keywords",
             return_value=["customers/3495463031/adGroupCriteria/2~12"],
         ) as create_keywords:
@@ -791,7 +792,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         self.assertEqual(result["status"], "published_enabled")
         self.assertEqual(result["existing_keyword_count"], 3)
         self.assertEqual(result["enabled_existing_keyword_count"], 1)
-        self.assertEqual(result["paused_stale_keyword_count"], 1)
+        self.assertEqual(result["removed_stale_keyword_count"], 1)
         self.assertEqual(result["new_keyword_count"], 1)
         enable_keywords.assert_called_once_with(
             SimpleNamespace(),
@@ -799,7 +800,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             criterion_resource_names=["customers/3495463031/adGroupCriteria/2~10"],
             validate_only=False,
         )
-        pause_keywords.assert_called_once_with(
+        remove_keywords.assert_called_once_with(
             SimpleNamespace(),
             account,
             criterion_resource_names=["customers/3495463031/adGroupCriteria/2~13"],
@@ -812,6 +813,25 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             keywords=["new exact keyword"],
             validate_only=False,
         )
+
+    def test_negative_terms_and_page_exclusions_win_over_positive_draft_sources(self) -> None:
+        draft = SimpleNamespace(
+            generated_assets={
+                "keyword_clusters": [
+                    {"exact_terms": ["good product keyword", "bad generic keyword"]},
+                ],
+                "source_terms": ["another good keyword", "bad generic keyword"],
+                "negative_keywords": [{"keyword": "bad generic keyword", "match_type": "exact"}],
+                "url_inclusion_targets": [
+                    {"url": "https://nutricity.ca/products/good"},
+                    {"url": "https://nutricity.ca/products/bad"},
+                ],
+                "negative_page_targets": ["https://nutricity.ca/products/bad"],
+            },
+        )
+
+        self.assertEqual(_keyword_texts_from_draft(draft), ["good product keyword", "another good keyword"])
+        self.assertEqual(_url_inclusion_urls_from_draft(draft), ["https://nutricity.ca/products/good"])
 
     def test_pmax_publish_creates_asset_group_assets_and_search_themes(self) -> None:
         account = SimpleNamespace(id=637, name="Nutricity CA", customer_id="3495463031", currency_code="AUD")

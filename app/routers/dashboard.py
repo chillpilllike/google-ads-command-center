@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -18,7 +20,9 @@ from app.models import (
     BackgroundJobStatus,
     CostDashboardSnapshot,
     GoogleAdsAccount,
+    GoogleAdsConnection,
     GoogleAdsConversionGoalSnapshot,
+    AppSetting,
     RunStatus,
     Strategy,
     StrategyRun,
@@ -42,6 +46,57 @@ _dashboard_home_cache: dict[str, object] = {"expires_at": 0.0, "data": {}}
 COST_DASHBOARD_CACHE_SECONDS = 30.0
 CACHE_SECONDS = 120.0
 DASHBOARD_HOME_CACHE_SECONDS = 20.0
+
+
+def _developer_token_hash(value: str) -> str:
+    token = str(value or "").strip()
+    return hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+
+
+async def google_ads_api_quota_rows(session: AsyncSession) -> list[dict]:
+    today = datetime.now(timezone.utc).date().isoformat()
+    connections = (
+        await session.scalars(
+            select(GoogleAdsConnection).where(GoogleAdsConnection.is_active.is_(True)).order_by(GoogleAdsConnection.id)
+        )
+    ).all()
+    retry_settings = (
+        await session.scalars(
+            select(AppSetting).where(AppSetting.key.like("google_ads_asset_publish_quota.%"))
+        )
+    ).all()
+    rows: list[dict] = []
+    for connection in connections:
+        quota_key = f"automation_developer_token_quota.connection.{connection.id}.{today}"
+        quota = await session.scalar(select(AppSetting).where(AppSetting.key == quota_key))
+        quota_value = quota.value if quota is not None and isinstance(quota.value, dict) else {}
+        token_hash = _developer_token_hash(connection.developer_token)
+        retry_matches = []
+        for setting in retry_settings:
+            value = setting.value if isinstance(setting.value, dict) else {}
+            if value.get("connection_id") == connection.id or (token_hash and value.get("developer_token_hash") == token_hash):
+                retry_matches.append(value)
+        retry_matches.sort(key=lambda item: str(item.get("retry_not_before") or item.get("recorded_at") or ""), reverse=True)
+        used = int(quota_value.get("used_units") or 0)
+        budget = int(quota_value.get("budget_units") or 30000)
+        reserve = int(quota_value.get("reserve_units") or 1000)
+        remaining = int(quota_value.get("remaining_units") if quota_value.get("remaining_units") is not None else max(budget - used, 0))
+        rows.append(
+            {
+                "connection_id": connection.id,
+                "name": connection.name,
+                "email": connection.email or "Unknown Gmail",
+                "used_units": used,
+                "budget_units": budget,
+                "remaining_units": remaining,
+                "reserve_units": reserve,
+                "mutation_available_units": max(remaining - reserve, 0),
+                "quota_key": quota_key,
+                "has_quota_row": bool(quota_value),
+                "retry": retry_matches[0] if retry_matches else {},
+            }
+        )
+    return rows
 
 
 def refresh_cost_dashboard_snapshot(days: int) -> dict:
@@ -116,12 +171,14 @@ async def dashboard(
         "running": running,
     }
     google_ads_status = await get_google_ads_connection_status(session, include_accounts=False)
+    api_quota_rows = await google_ads_api_quota_rows(session)
     data = {
         "accounts": accounts,
         "strategies": strategies,
         "runs": runs,
         "counts": counts,
         "google_ads_status": google_ads_status,
+        "api_quota_rows": api_quota_rows,
     }
     _dashboard_home_cache.update({"expires_at": time.monotonic() + DASHBOARD_HOME_CACHE_SECONDS, "data": data})
     return templates.TemplateResponse(

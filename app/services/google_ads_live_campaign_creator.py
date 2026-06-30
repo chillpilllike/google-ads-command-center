@@ -779,6 +779,10 @@ def _budget_block_result(
         return None
     if not budget_blocked and daily_budget > 0:
         return None
+    assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    existing_campaign = assets.get("existing_google_campaign")
+    if isinstance(existing_campaign, dict) and int(existing_campaign.get("campaign_id") or 0) > 0:
+        return None
     return {
         "draft_id": draft.id,
         "ad_type": ad_type,
@@ -790,6 +794,32 @@ def _budget_block_result(
         "budget_blocked": budget_blocked,
         "requested_daily_budget": daily_budget,
         "minimum_daily_budget_amount": _currency_minimum_daily_budget(getattr(preference, "account", None), preference.minimum_daily_budget_amount),
+    }
+
+
+def _budget_guard_blocks_missing_campaign(
+    draft: AdDraft,
+    *,
+    ad_type: str,
+    bidding: dict[str, Any],
+    preference: GoogleAdsAutomationPreference,
+) -> Optional[dict[str, Any]]:
+    daily_budget = _float_value(bidding.get("daily_budget"), 0.0)
+    budget_blocked = bool(bidding.get("budget_blocked"))
+    if not budget_blocked and daily_budget > 0:
+        return None
+    return {
+        "draft_id": draft.id,
+        "ad_type": ad_type,
+        "status": "blocked_by_budget_guard",
+        "reason": str(
+            bidding.get("budget_block_reason")
+            or "Automation budget is blocked by the Odoo sales guard, and the existing campaign could not be found for criteria-only maintenance."
+        ),
+        "budget_blocked": budget_blocked,
+        "requested_daily_budget": daily_budget,
+        "minimum_daily_budget_amount": _currency_minimum_daily_budget(getattr(preference, "account", None), preference.minimum_daily_budget_amount),
+        "criteria_only_maintenance": False,
     }
 
 
@@ -1720,6 +1750,7 @@ def _webpage_criterion_by_ad_group(client: Any, account: GoogleAdsAccount, ad_gr
 
 def _keyword_texts_from_draft(draft: AdDraft, *, limit: Optional[int] = None) -> list[str]:
     assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    negative_terms = set(_negative_keyword_texts_from_draft(draft, limit=1000))
     rejected = {
         " ".join(str(term or "").split()).lower()
         for term in (assets.get("rejected_exact_keywords") or [])
@@ -1732,6 +1763,8 @@ def _keyword_texts_from_draft(draft: AdDraft, *, limit: Optional[int] = None) ->
             continue
         for term in cluster.get("exact_terms") or []:
             text = " ".join(str(term or "").split()).lower()
+            if text in negative_terms:
+                continue
             if text in rejected:
                 continue
             if not _valid_exact_keyword(text):
@@ -1742,6 +1775,8 @@ def _keyword_texts_from_draft(draft: AdDraft, *, limit: Optional[int] = None) ->
                 return terms
     for term in assets.get("source_terms") or []:
         text = " ".join(str(term or "").split()).lower()
+        if text in negative_terms:
+            continue
         if text in rejected:
             continue
         if not _valid_exact_keyword(text):
@@ -2034,6 +2069,36 @@ def _existing_exact_keyword_map(client: Any, account: GoogleAdsAccount, ad_group
 
 def _existing_exact_keywords(client: Any, account: GoogleAdsAccount, ad_group_id: int) -> set[str]:
     return set(_existing_exact_keyword_map(client, account, ad_group_id))
+
+
+def _existing_positive_exact_keyword_resources_by_campaign(
+    client: Any,
+    account: GoogleAdsAccount,
+    campaign_id: int,
+) -> dict[str, list[str]]:
+    if not campaign_id:
+        return {}
+    query = f"""
+        SELECT
+          ad_group_criterion.resource_name,
+          ad_group_criterion.keyword.text,
+          ad_group_criterion.keyword.match_type,
+          ad_group_criterion.status
+        FROM ad_group_criterion
+        WHERE campaign.id = {int(campaign_id)}
+          AND ad_group_criterion.type = KEYWORD
+          AND ad_group_criterion.status != REMOVED
+    """
+    service = client.get_service("GoogleAdsService")
+    existing: dict[str, list[str]] = {}
+    for row in _google_ads_search(service, account, query):
+        if enum_name(row.ad_group_criterion.keyword.match_type) != "EXACT":
+            continue
+        text = _keyword_key(row.ad_group_criterion.keyword.text)
+        resource_name = str(row.ad_group_criterion.resource_name or "")
+        if text and resource_name:
+            existing.setdefault(text, []).append(resource_name)
+    return existing
 
 
 def _existing_campaign_negative_exact_keywords(client: Any, account: GoogleAdsAccount, campaign_id: int) -> set[str]:
@@ -2542,6 +2607,8 @@ def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = Non
     identity = _draft_identity(draft)
     category = str(identity.get("category") or assets.get("category") or assets.get("campaign_name") or "").lower()
     core_scale_only = "core / scale" in category or "core scale" in category
+    excluded_urls = {_webpage_url_key(url) for url in _negative_page_urls_from_draft(draft, limit=1000)}
+    excluded_urls.discard("")
     sources = [
         assets.get("url_inclusion_targets"),
         assets.get("page_feed_targets"),
@@ -2560,6 +2627,8 @@ def _url_inclusion_urls_from_draft(draft: AdDraft, *, limit: Optional[int] = Non
                 url = str(item or "").strip()
             key = _webpage_url_key(url)
             if not key or key in seen:
+                continue
+            if key in excluded_urls:
                 continue
             if core_scale_only and _is_broad_or_category_landing_page(key):
                 continue
@@ -2670,6 +2739,39 @@ def _existing_ad_group_webpage_inclusions(client: Any, account: GoogleAdsAccount
             argument = _webpage_url_key(condition.argument)
             if argument:
                 existing.add(argument)
+    return existing
+
+
+def _existing_positive_webpage_resources_by_campaign(
+    client: Any,
+    account: GoogleAdsAccount,
+    campaign_id: int,
+) -> dict[str, list[str]]:
+    if not campaign_id:
+        return {}
+    query = f"""
+        SELECT
+          ad_group_criterion.resource_name,
+          ad_group_criterion.webpage.conditions,
+          ad_group_criterion.negative,
+          ad_group_criterion.status
+        FROM ad_group_criterion
+        WHERE campaign.id = {int(campaign_id)}
+          AND ad_group_criterion.type = WEBPAGE
+          AND ad_group_criterion.status != REMOVED
+    """
+    service = client.get_service("GoogleAdsService")
+    existing: dict[str, list[str]] = {}
+    for row in _google_ads_search(service, account, query):
+        if bool(getattr(row.ad_group_criterion, "negative", False)):
+            continue
+        resource_name = str(row.ad_group_criterion.resource_name or "")
+        if not resource_name:
+            continue
+        for condition in row.ad_group_criterion.webpage.conditions:
+            argument = _webpage_url_key(condition.argument)
+            if argument:
+                existing.setdefault(argument, []).append(resource_name)
     return existing
 
 
@@ -2832,6 +2934,33 @@ def _pause_ad_group_criteria_if_needed(
         criterion.resource_name = resource_name
         criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
         operation.update_mask.paths.append("status")
+        operations.append(operation)
+    if not operations:
+        return []
+    request = client.get_type("MutateAdGroupCriteriaRequest")
+    request.customer_id = account.customer_id
+    request.operations.extend(operations)
+    request.partial_failure = True
+    request.validate_only = validate_only
+    response = _google_ads_mutate(client.get_service("AdGroupCriterionService"), "mutate_ad_group_criteria", request)
+    return _successful_resource_names(response)
+
+
+def _remove_ad_group_criteria_if_needed(
+    client: Any,
+    account: GoogleAdsAccount,
+    *,
+    criterion_resource_names: list[str],
+    validate_only: bool,
+) -> list[str]:
+    operations = []
+    seen: set[str] = set()
+    for resource_name in criterion_resource_names:
+        if not resource_name or resource_name in seen:
+            continue
+        seen.add(resource_name)
+        operation = client.get_type("AdGroupCriterionOperation")
+        operation.remove = resource_name
         operations.append(operation)
     if not operations:
         return []
@@ -3030,6 +3159,12 @@ def _apply_campaign_negative_keywords(
         }
     existing = _existing_campaign_negative_exact_keywords(client, account, campaign_id) if campaign_id else set()
     to_create = [keyword for keyword in keywords if keyword not in existing]
+    positive_keyword_resources = _existing_positive_exact_keyword_resources_by_campaign(client, account, campaign_id) if campaign_id else {}
+    positive_resources_to_remove = [
+        resource_name
+        for keyword in keywords
+        for resource_name in positive_keyword_resources.get(keyword, [])
+    ]
     planned_to_create = len(to_create)
     to_create, reservation = _limit_daily_criteria_items(
         session,
@@ -3046,6 +3181,12 @@ def _apply_campaign_negative_keywords(
         keywords=to_create,
         validate_only=validate_only,
     )
+    removed_positive_resources = _remove_ad_group_criteria_if_needed(
+        client,
+        account,
+        criterion_resource_names=positive_resources_to_remove,
+        validate_only=validate_only,
+    )
     return {
         "negative_keyword_count": len(keywords),
         "existing_negative_keyword_count": len(existing),
@@ -3054,6 +3195,8 @@ def _apply_campaign_negative_keywords(
         "daily_deferred_negative_keyword_count": max(planned_to_create - len(to_create), 0),
         "negative_keyword_daily_budget": reservation,
         "negative_keyword_resources": resources,
+        "removed_positive_keyword_count": len(removed_positive_resources),
+        "removed_positive_keyword_resources": removed_positive_resources,
     }
 
 
@@ -3077,6 +3220,12 @@ def _apply_campaign_negative_webpages(
         }
     existing = _existing_campaign_negative_webpages(client, account, campaign_id) if campaign_id else set()
     to_create = [url for url in urls if url.rstrip("/") not in existing]
+    positive_page_resources = _existing_positive_webpage_resources_by_campaign(client, account, campaign_id) if campaign_id else {}
+    positive_resources_to_remove = [
+        resource_name
+        for url in urls
+        for resource_name in positive_page_resources.get(_webpage_url_key(url), [])
+    ]
     planned_to_create = len(to_create)
     to_create, reservation = _limit_daily_criteria_items(
         session,
@@ -3093,6 +3242,12 @@ def _apply_campaign_negative_webpages(
         urls=to_create,
         validate_only=validate_only,
     )
+    removed_positive_resources = _remove_ad_group_criteria_if_needed(
+        client,
+        account,
+        criterion_resource_names=positive_resources_to_remove,
+        validate_only=validate_only,
+    )
     return {
         "negative_page_count": len(urls),
         "existing_negative_page_count": len(existing),
@@ -3101,6 +3256,8 @@ def _apply_campaign_negative_webpages(
         "daily_deferred_negative_page_count": max(planned_to_create - len(to_create), 0),
         "negative_page_daily_budget": reservation,
         "negative_page_resources": resources,
+        "removed_positive_page_count": len(removed_positive_resources),
+        "removed_positive_page_resources": removed_positive_resources,
     }
 
 
@@ -4445,6 +4602,14 @@ def publish_dsa_draft(
     campaign = existing_campaign
     created_campaign = False
     if campaign is None:
+        missing_campaign_budget_block = _budget_guard_blocks_missing_campaign(
+            draft,
+            ad_type="dsa",
+            bidding=bidding,
+            preference=preference,
+        )
+        if missing_campaign_budget_block is not None:
+            return missing_campaign_budget_block
         budget_resource = _create_campaign_budget(
             client,
             account,
@@ -4555,11 +4720,25 @@ def publish_dsa_draft(
                 "resource_name": f"{len(negative_result['negative_keyword_resources'])} negatives",
             }
         )
+    if negative_result.get("removed_positive_keyword_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_keywords_promoted_to_negative",
+                "resource_name": f"{len(negative_result['removed_positive_keyword_resources'])} keywords",
+            }
+        )
     if page_result["negative_page_resources"]:
         operations.append(
             {
                 "operation": "create_campaign_negative_webpages",
                 "resource_name": f"{len(page_result['negative_page_resources'])} page exclusions",
+            }
+        )
+    if page_result.get("removed_positive_page_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_pages_promoted_to_exclusion",
+                "resource_name": f"{len(page_result['removed_positive_page_resources'])} pages",
             }
         )
     ad_group = _ad_group_by_name(client, account, campaign_id, ad_group_name) if campaign_id else None
@@ -4843,6 +5022,14 @@ def publish_rsa_draft(
     campaign = existing_campaign
     created_campaign = False
     if campaign is None:
+        missing_campaign_budget_block = _budget_guard_blocks_missing_campaign(
+            draft,
+            ad_type="rsa",
+            bidding=bidding,
+            preference=preference,
+        )
+        if missing_campaign_budget_block is not None:
+            return missing_campaign_budget_block
         budget_resource = _create_campaign_budget(
             client,
             account,
@@ -4946,11 +5133,25 @@ def publish_rsa_draft(
                 "resource_name": f"{len(negative_result['negative_keyword_resources'])} negatives",
             }
         )
+    if negative_result.get("removed_positive_keyword_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_keywords_promoted_to_negative",
+                "resource_name": f"{len(negative_result['removed_positive_keyword_resources'])} keywords",
+            }
+        )
     if page_result["negative_page_resources"]:
         operations.append(
             {
                 "operation": "create_campaign_negative_webpages",
                 "resource_name": f"{len(page_result['negative_page_resources'])} page exclusions",
+            }
+        )
+    if page_result.get("removed_positive_page_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_pages_promoted_to_exclusion",
+                "resource_name": f"{len(page_result['removed_positive_page_resources'])} pages",
             }
         )
     ad_group = _ad_group_by_name(client, account, campaign_id, ad_group_name) if campaign_id else None
@@ -5017,9 +5218,9 @@ def publish_rsa_draft(
         keyword_result = {
             **_manual_csv_deferred_keyword_result(draft),
             "enabled_existing_keyword_count": 0,
-            "paused_stale_keyword_count": 0,
+            "removed_stale_keyword_count": 0,
             "enabled_keyword_resources": [],
-            "paused_keyword_resources": [],
+            "removed_keyword_resources": [],
         }
         _append_manual_csv_deferred_operation(
             operations,
@@ -5037,10 +5238,10 @@ def publish_rsa_draft(
             for keyword, info in existing_keyword_map.items()
             if keyword in keywords and str(info.get("status") or "").upper() != "ENABLED"
         ]
-        keywords_to_pause = [
+        keywords_to_remove = [
             info["resource_name"]
             for keyword, info in existing_keyword_map.items()
-            if keyword not in desired_keywords and str(info.get("status") or "").upper() == "ENABLED"
+            if keyword not in desired_keywords
         ]
         planned_keywords_to_create = len(keywords_to_create)
         keywords_to_create, keyword_daily_budget = _limit_daily_criteria_items(
@@ -5057,10 +5258,10 @@ def publish_rsa_draft(
             criterion_resource_names=keywords_to_enable,
             validate_only=validate_only,
         )
-        paused_keyword_resources = _pause_ad_group_criteria_if_needed(
+        removed_keyword_resources = _remove_ad_group_criteria_if_needed(
             client,
             account,
-            criterion_resource_names=keywords_to_pause,
+            criterion_resource_names=keywords_to_remove,
             validate_only=validate_only,
         )
         keyword_resources = _create_exact_keywords(
@@ -5074,14 +5275,14 @@ def publish_rsa_draft(
             "keyword_count": len(keywords),
             "existing_keyword_count": len(existing_keywords),
             "enabled_existing_keyword_count": len(enabled_keyword_resources),
-            "paused_stale_keyword_count": len(paused_keyword_resources),
+            "removed_stale_keyword_count": len(removed_keyword_resources),
             "new_keyword_count": len(keywords_to_create),
             "planned_new_keyword_count": planned_keywords_to_create,
             "daily_deferred_keyword_count": max(planned_keywords_to_create - len(keywords_to_create), 0),
             "keyword_daily_budget": keyword_daily_budget,
             "keyword_resources": keyword_resources,
             "enabled_keyword_resources": enabled_keyword_resources,
-            "paused_keyword_resources": paused_keyword_resources,
+            "removed_keyword_resources": removed_keyword_resources,
         }
         if enabled_keyword_resources:
             operations.append(
@@ -5090,11 +5291,11 @@ def publish_rsa_draft(
                     "resource_name": f"{len(enabled_keyword_resources)} keywords",
                 }
             )
-        if paused_keyword_resources:
+        if removed_keyword_resources:
             operations.append(
                 {
-                    "operation": "pause_stale_exact_keywords",
-                    "resource_name": f"{len(paused_keyword_resources)} keywords",
+                    "operation": "remove_stale_exact_keywords",
+                    "resource_name": f"{len(removed_keyword_resources)} keywords",
                 }
             )
         if keyword_resources:
@@ -5251,6 +5452,14 @@ def publish_pmax_draft(
     checkpoint("pmax_campaign_lookup", "found" if existing_campaign else "missing")
     campaign = existing_campaign
     if campaign is None:
+        missing_campaign_budget_block = _budget_guard_blocks_missing_campaign(
+            draft,
+            ad_type="pmax",
+            bidding=bidding,
+            preference=preference,
+        )
+        if missing_campaign_budget_block is not None:
+            return missing_campaign_budget_block
         checkpoint("pmax_campaign_create")
         budget_resource = _create_campaign_budget(
             client,
@@ -5351,11 +5560,25 @@ def publish_pmax_draft(
                 "resource_name": f"{len(negative_result['negative_keyword_resources'])} negatives",
             }
         )
+    if negative_result.get("removed_positive_keyword_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_keywords_promoted_to_negative",
+                "resource_name": f"{len(negative_result['removed_positive_keyword_resources'])} keywords",
+            }
+        )
     if page_result["negative_page_resources"]:
         operations.append(
             {
                 "operation": "create_campaign_negative_webpages",
                 "resource_name": f"{len(page_result['negative_page_resources'])} page exclusions",
+            }
+        )
+    if page_result.get("removed_positive_page_resources"):
+        operations.append(
+            {
+                "operation": "remove_positive_pages_promoted_to_exclusion",
+                "resource_name": f"{len(page_result['removed_positive_page_resources'])} pages",
             }
         )
 
