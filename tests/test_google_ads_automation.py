@@ -31,6 +31,7 @@ from app.services.google_ads_automation import (
     peak_budget_due_now,
     peak_budget_restore_due_now,
     claim_keyword_terms,
+    core_owned_testing_negative_keywords,
     core_owned_keyword_rows_for_scale_migration,
     pmax_search_theme_plan,
     preference_due_now,
@@ -45,6 +46,7 @@ from app.services.google_ads_automation import (
     testing_daily_budget_from_sales,
     underperforming_budget_reduction_operations,
     waste_category_plan,
+    waste_owned_positive_keywords,
 )
 from app.services.google_ads_snapshot_store import (
     DATASET_CAMPAIGN_INSIGHTS,
@@ -742,6 +744,51 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         self.assertEqual(negatives["negative_keywords"][0]["keyword"], "vitamin c canada")
         self.assertEqual(negatives["pending_keyword_count"], 1)
         self.assertIn("testing_dsa", negatives["applies_to"])
+
+    def test_waste_owned_positive_keywords_use_active_negative_terms(self) -> None:
+        terms = waste_owned_positive_keywords(
+            [
+                {"keyword": "Shop Online", "theme_key": "shop online"},
+                {"keyword": "shop online", "theme_key": "shop online"},
+                {"keyword": "Bad Supplement Query", "theme_key": "bad supplement query"},
+                {"keyword": ""},
+            ],
+            limit=10,
+        )
+
+        self.assertEqual(terms, ["Shop Online", "Bad Supplement Query"])
+
+    def test_core_and_waste_terms_become_testing_negatives(self) -> None:
+        core_negatives = core_owned_testing_negative_keywords(["vitamin c canada", "vitamin c canada"])
+        waste_plan = waste_category_plan(
+            [
+                GoogleAdsNegativeKeywordCandidate(
+                    id=1,
+                    account_id=637,
+                    keyword="shop online",
+                    normalized_keyword="shop online",
+                    reason_label="generic_filler",
+                    confidence=0.95,
+                    clicks=20,
+                    cost=40,
+                )
+            ],
+            [],
+            [],
+            now=datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc),
+        )
+
+        negative_terms = {
+            item["keyword"]
+            for item in core_negatives + waste_plan["negative_keyword_plan"]["active_negative_keywords"]
+        }
+
+        self.assertEqual({item["keyword"] for item in core_negatives}, {"vitamin c canada"})
+        self.assertEqual(
+            waste_owned_positive_keywords(waste_plan["negative_keyword_plan"]["active_negative_keywords"]),
+            ["shop online"],
+        )
+        self.assertEqual(negative_terms, {"vitamin c canada", "shop online"})
 
     def test_testing_page_exclusion_plan_holds_new_scale_pages_pending(self) -> None:
         plan = {

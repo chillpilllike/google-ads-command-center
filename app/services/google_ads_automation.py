@@ -3906,6 +3906,24 @@ def core_owned_testing_negative_keywords(terms: list[str]) -> list[dict[str, Any
     return negatives
 
 
+def waste_owned_positive_keywords(items: list[dict[str, Any]], *, limit: int = 0) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    max_terms = max(int(limit or 0), 0)
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_pmax_search_theme(item.get("keyword"))
+        key = str(item.get("theme_key") or _term_key_from_text(text)).strip().lower()
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        terms.append(text)
+        if max_terms > 0 and len(terms) >= max_terms:
+            break
+    return terms
+
+
 def core_owned_testing_page_exclusions(url_targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     exclusions: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4485,23 +4503,8 @@ def run_testing_campaign_automation(
     testing_pmax_source_rows = available_keyword_rows_for_terms(keyword_rows, term_ledger_keys)
     testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(testing_pmax_theme_plan))
-    waste_recovery_keyword_items = (
-        list(waste_negative_plan.get("scale_recovery_keywords") or [])
-        + list(waste_negative_plan.get("testing_recovery_keywords") or [])
-        + list(waste_negative_plan.get("pending_recovery_keywords") or [])
-    )
-    waste_recovery_terms: list[str] = []
-    for item in waste_recovery_keyword_items:
-        if not isinstance(item, dict):
-            continue
-        term = _clean_pmax_search_theme(item.get("keyword"))
-        key = str(item.get("theme_key") or _term_key_from_text(term)).strip().lower()
-        if not term or not key or key in term_ledger_keys:
-            continue
-        term_ledger_keys.add(key)
-        waste_recovery_terms.append(term)
-        if len(waste_recovery_terms) >= keyword_limit:
-            break
+    waste_owned_keyword_items = list(waste_negative_plan.get("active_negative_keywords") or [])
+    waste_owned_terms = waste_owned_positive_keywords(waste_owned_keyword_items, limit=keyword_limit)
     keywords = testing_terms
     testing_rsa_terms = (
         testing_terms
@@ -4510,15 +4513,6 @@ def run_testing_campaign_automation(
             for term in search_console_terms
             if _term_key_from_text(term) not in term_ledger_keys
         ][: lane_keyword_limit or 50]
-        or [
-            item
-            for item in (
-                f"{account.name} online",
-                "shop online",
-                "trusted online store",
-            )
-            if _term_key_from_text(item)
-        ]
     )
     scale_page_plan = scale_landing_page_plan(
         page_rows,
@@ -5035,7 +5029,7 @@ def run_testing_campaign_automation(
             website_url=website_url,
             business_name=account.name,
             generic_page_feed_copy=True,
-            keyword_terms=waste_recovery_terms or ["supplements"],
+            keyword_terms=waste_owned_terms or [account.name],
         )
         automation = attach_campaign_identity(
             session,
@@ -5048,16 +5042,16 @@ def run_testing_campaign_automation(
                     {
                         "keyword": term,
                         "normalized_keyword": _term_key_from_text(term),
-                        "source": "waste_recovery",
+                        "source": "waste_owned_negative_keyword",
                     }
-                    for term in waste_recovery_terms
+                    for term in waste_owned_terms
                 ],
                 "waste_management_plan": draft_waste_plan,
                 "ga4_ads_signal_matrix": ga4_matrix,
                 "page_targeting": {
                     "mode": "website_root_recovery_context",
                     "website_url": website_url,
-                    "note": "Waste / Recovery RSA uses only recovery or pending-recovery terms, never active high-confidence waste terms.",
+                    "note": "Waste / Recovery RSA owns active Waste negative terms as positives while Core and Testing exclude them.",
                 },
                 "created_by": "automation_monitor",
                 "source_job_id": source_job_id,
@@ -5084,11 +5078,13 @@ def run_testing_campaign_automation(
             "ga4_ads_signal_matrix": ga4_matrix,
             "url_inclusion_targets": _url_inclusion_targets_from_rows(page_rows),
             "negative_keywords": [],
-            "source_terms": _planning_items(waste_recovery_terms, keyword_limit),
+            "source_terms": _planning_items(waste_owned_terms, keyword_limit),
             "google_keyword_plan": {
-                "source": "waste_recovery_state",
-                "terms": _planning_items(waste_recovery_terms, keyword_limit),
-                "candidate_count": len(waste_recovery_keyword_items),
+                "source": "waste_owned_negative_keyword_bank",
+                "terms": _planning_items(waste_owned_terms, keyword_limit),
+                "candidate_count": len(waste_owned_keyword_items),
+                "active_waste_positive_keyword_count": len(waste_owned_terms),
+                "active_negative_keyword_count": int(waste_negative_plan.get("active_negative_keyword_count") or 0),
                 "pending_recovery_keyword_count": int(waste_negative_plan.get("pending_recovery_keyword_count") or 0),
                 "scale_recovery_keyword_count": int(waste_negative_plan.get("scale_recovery_keyword_count") or 0),
                 "testing_recovery_keyword_count": int(waste_negative_plan.get("testing_recovery_keyword_count") or 0),
@@ -5096,17 +5092,17 @@ def run_testing_campaign_automation(
             "keyword_clusters": [
                 {
                     "ad_group_name": f"AUTO | Waste / Recovery | RSA Keywords | {campaign_identity['campaign_code']}",
-                    "source": "waste_recovery_state",
+                    "source": "waste_owned_negative_keyword_bank",
                     "match_type": "exact",
-                    "exact_terms": _planning_items(waste_recovery_terms, keyword_limit),
+                    "exact_terms": _planning_items(waste_owned_terms, keyword_limit),
                 }
             ],
             "copy_strategy": {
                 "mode": "waste_recovery_keyword_rsa",
                 "reason": (
-                    "Waste / Recovery is visible as a fixed-budget recovery lane. It only creates exact keywords when "
-                    "recovery evidence or pending recovery state exists, so an empty recovery pool cannot spend on "
-                    "invented terms. Active high-confidence waste remains excluded."
+                    "Waste / Recovery is the quarantine and recovery lane. Active Waste negatives are published as "
+                    "positive exact keywords here, while those same terms are excluded from Core / Scale and "
+                    "Testing / Discovery. Guarded recovery can later promote them out of Waste."
                 ),
             },
         }
@@ -5635,7 +5631,7 @@ def run_testing_campaign_automation(
             "testing_rsa_term_count": len(testing_terms),
             "testing_max_clicks_rsa_term_count": 0,
             "fix_watch_rsa_term_count": len(fix_watch_terms),
-            "waste_recovery_rsa_term_count": len(waste_recovery_terms),
+            "waste_recovery_rsa_term_count": len(waste_owned_terms),
             "used_term_key_count": len(term_ledger_keys),
             "retired_legacy_max_clicks_draft_count": retired_max_clicks_drafts,
         },
@@ -5700,7 +5696,7 @@ def run_testing_campaign_automation(
                 "testing_rsa_unique_keyword_count": len(testing_terms),
                 "testing_max_clicks_rsa_unique_keyword_count": 0,
                 "fix_watch_rsa_unique_keyword_count": len(fix_watch_terms),
-                "waste_recovery_rsa_unique_keyword_count": len(waste_recovery_terms),
+                "waste_recovery_rsa_unique_keyword_count": len(waste_owned_terms),
                 "retired_legacy_max_clicks_draft_count": retired_max_clicks_drafts,
                 "audience_signal_term_count": int(audience_signal_plan.get("custom_segment_term_count") or 0),
                 "audience_signal_similar_url_count": int(audience_signal_plan.get("similar_website_url_count") or 0),
