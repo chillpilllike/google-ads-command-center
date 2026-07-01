@@ -71,6 +71,7 @@ from app.services.google_ads_landing_page_bank import sync_account_landing_page_
 from app.services.google_ads_negative_keyword_bank import sync_account_negative_keyword_candidates
 from app.services.google_ads_policy_disapprovals import sync_account_policy_disapproval_terms
 from app.services.google_ads_research_collector import sync_account_research_snapshots
+from app.services.google_ads_roas_impression_maintenance import maintain_account_roas_impression_rescue
 from app.services.google_ads_snapshot_store import DATASET_CAMPAIGN_DAILY
 from app.services.google_ads_sync import sync_account_campaign_metrics
 from app.services.google_analytics import discover_analytics_connection, sync_ga4_ecommerce_snapshots, sync_ga4_search_term_snapshots
@@ -1734,6 +1735,131 @@ def sync_google_ads_policy_disapproval_terms(
                     )
                     if errors or deferred or blocked
                     else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
+                raise
+
+
+@dramatiq.actor(max_retries=0, time_limit=2 * 60 * 60 * 1000)
+def maintain_google_ads_roas_impression_rescue(
+    job_id: Optional[int] = None,
+    account_ids: Optional[list[int]] = None,
+    validate_only: bool = False,
+) -> None:
+    with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+        with SessionLocal() as session:
+            settings_map = get_sync_setting_map(session)
+            primary_ids = _customer_id_set(settings_map.get("automation.scheduler_primary_customer_ids"))
+            secondary_ids = _customer_id_set(settings_map.get("automation.scheduler_secondary_customer_ids"))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
+            selected_ids = [int(item) for item in (account_ids or []) if item]
+            if selected_ids:
+                query = query.where(GoogleAdsAccount.id.in_(selected_ids))
+            accounts = list(session.scalars(query).all())
+            accounts.sort(key=lambda account: (_account_priority_tier(account, primary_ids, secondary_ids), account.name or "", account.id))
+            if not mark_job_started(session, job_id, total=len(accounts)):
+                return
+            processed = 0
+            actions = 0
+            campaign_mutations = 0
+            budget_mutations = 0
+            deferred = 0
+            blocked = 0
+            errors = 0
+            try:
+                for account in accounts:
+                    if job_cancel_requested(session, job_id):
+                        mark_job_finished(session, job_id, BackgroundJobStatus.canceled, current=processed)
+                        return
+                    api_lease = None
+                    try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            blocked += 1
+                            continue
+                        api_lease = acquire_google_ads_api_account_lease(
+                            session,
+                            account,
+                            job_id=job_id,
+                            purpose="google_ads_roas_impression_maintenance",
+                        )
+                        if not api_lease.get("acquired"):
+                            if str(api_lease.get("status") or "") == "blocked_by_google_quota":
+                                deferred += 1
+                            else:
+                                blocked += 1
+                            continue
+                        result = maintain_account_roas_impression_rescue(
+                            session,
+                            account,
+                            validate_only=bool(validate_only),
+                        )
+                        status = str(result.get("status") or "")
+                        if status in {"done", "blocked_by_mutation_guard", "blocked_red_flag"}:
+                            actions += int(result.get("actions") or 0)
+                            campaign_mutations += int(result.get("campaign_mutations") or 0)
+                            budget_mutations += int(result.get("budget_mutations") or 0)
+                            if status.startswith("blocked"):
+                                blocked += 1
+                        elif "quota" in status or "quota" in str(result).lower():
+                            deferred += 1
+                        else:
+                            errors += 1
+                        session.commit()
+                    except GoogleAdsException as exc:
+                        errors += 1
+                        quota_retry = google_ads_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                            errors -= 1
+                        record_google_ads_api_error(
+                            session,
+                            exc,
+                            account=account,
+                            job_id=job_id,
+                            context="roas_impression_maintenance",
+                            severity="manual_action_required",
+                            extra={"validate_only": bool(validate_only)},
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        quota_retry = google_ads_generic_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                        else:
+                            errors += 1
+                        record_google_ads_generic_error(
+                            session,
+                            exc,
+                            account=account,
+                            job_id=job_id,
+                            context="roas_impression_maintenance",
+                            severity="manual_action_required",
+                            extra={"validate_only": bool(validate_only)},
+                        )
+                    finally:
+                        if api_lease and api_lease.get("acquired"):
+                            release_google_ads_api_account_lease(session, account, job_id=job_id)
+                        processed += 1
+                        update_job_progress(session, job_id, current=processed)
+                summary = (
+                    f"ROAS impression maintenance processed {processed} account(s): "
+                    f"{actions} campaign action(s), {campaign_mutations} ROAS mutation(s), "
+                    f"{budget_mutations} budget mutation(s), {deferred} deferred, {blocked} blocked."
+                )
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.succeeded if not errors else BackgroundJobStatus.failed,
+                    current=processed,
+                    error=f"{summary} {errors} account errors were recorded as dashboard alerts." if errors else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))

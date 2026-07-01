@@ -27,6 +27,7 @@ from app.services.google_ads_automation import (
 from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.tasks import (
     SessionLocal,
+    maintain_google_ads_roas_impression_rescue,
     publish_google_ads_page_feeds,
     run_google_ads_automation_monitor,
     sync_google_ads_daily_keywords,
@@ -56,6 +57,11 @@ POLICY_DISAPPROVAL_SYNC_INTERVAL_SETTING = "automation.policy_disapproval_sync_i
 POLICY_DISAPPROVAL_SYNC_MAX_ACCOUNTS_SETTING = "automation.policy_disapproval_sync_max_accounts"
 POLICY_DISAPPROVAL_SYNC_DEFAULT_INTERVAL = 12
 POLICY_DISAPPROVAL_SYNC_DEFAULT_MAX_ACCOUNTS = 100
+ROAS_IMPRESSION_MAINTENANCE_ENABLED_SETTING = "automation.roas_impression_maintenance_enabled"
+ROAS_IMPRESSION_MAINTENANCE_INTERVAL_SETTING = "automation.roas_impression_maintenance_interval_hours"
+ROAS_IMPRESSION_MAINTENANCE_MAX_ACCOUNTS_SETTING = "automation.roas_impression_maintenance_max_accounts"
+ROAS_IMPRESSION_MAINTENANCE_DEFAULT_INTERVAL = 24
+ROAS_IMPRESSION_MAINTENANCE_DEFAULT_MAX_ACCOUNTS = 100
 
 
 def customer_id_set(value: object) -> set[str]:
@@ -426,6 +432,105 @@ def _queue_policy_disapproval_sync_if_due(session, now: datetime, scheduler_sett
         raise
 
 
+def _queue_roas_impression_maintenance_if_due(session, now: datetime, scheduler_settings: dict) -> None:
+    if not parse_bool(scheduler_settings.get(ROAS_IMPRESSION_MAINTENANCE_ENABLED_SETTING, True)):
+        return
+    if _active_job(session, "google_ads_roas_impression_maintenance") is not None:
+        return
+    interval_hours = clamp_int(
+        scheduler_settings.get(ROAS_IMPRESSION_MAINTENANCE_INTERVAL_SETTING),
+        ROAS_IMPRESSION_MAINTENANCE_DEFAULT_INTERVAL,
+        1,
+        72,
+    )
+    latest_finished = session.scalar(
+        select(BackgroundJob.finished_at)
+        .where(
+            BackgroundJob.job_type == "google_ads_roas_impression_maintenance",
+            BackgroundJob.status == BackgroundJobStatus.succeeded,
+            BackgroundJob.finished_at.is_not(None),
+        )
+        .order_by(BackgroundJob.finished_at.desc())
+        .limit(1)
+    )
+    if latest_finished is not None and latest_finished.astimezone(timezone.utc) > now - timedelta(hours=interval_hours):
+        return
+
+    primary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_primary_customer_ids"))
+    secondary_customer_ids = customer_id_set(scheduler_settings.get("automation.scheduler_secondary_customer_ids"))
+    max_accounts = clamp_int(
+        scheduler_settings.get(ROAS_IMPRESSION_MAINTENANCE_MAX_ACCOUNTS_SETTING),
+        ROAS_IMPRESSION_MAINTENANCE_DEFAULT_MAX_ACCOUNTS,
+        1,
+        500,
+    )
+    candidates = []
+    for preference in enabled_automation_preferences(session):
+        account = preference.account
+        if account_api_red_flag(session, account) is not None:
+            continue
+        tier = scheduler_tier(account, primary_customer_ids, secondary_customer_ids)
+        quota_retry = active_google_ads_quota_retry_state(session, account, now=now)
+        candidates.append(
+            (
+                99 if quota_retry else tier,
+                preference.last_run_at or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                account.name or "",
+                account.id,
+            )
+        )
+    account_ids = [account_id for _tier, _last_run, _name, account_id in sorted(candidates)[:max_accounts]]
+    if not account_ids:
+        return
+
+    job = BackgroundJob(
+        job_type="google_ads_roas_impression_maintenance",
+        label=f"ROAS/impression maintenance: {len(account_ids)} account(s)",
+        requested_by_id=None,
+        payload={
+            "account_ids": account_ids,
+            "validate_only": False,
+            "queued_by": "scripts/queue_automation_monitor.py",
+            "reason": "recurring_roas_impression_rescue_and_recovery",
+            "interval_hours": interval_hours,
+            "rules": {
+                "primary": "baseline unless no-impression rescue triggers",
+                "secondary_target_roas": 3.0,
+                "other_target_roas": 2.0,
+                "no_impression_window_days": 7,
+                "initial_budget_floor_non_inr": 10,
+                "initial_budget_floor_inr": 500,
+                "first_lower_after_hours": 48,
+                "next_lower_every_hours": 24,
+                "lower_pct": 20,
+                "recovery_watch_days": 3,
+                "raise_every_hours": 24,
+                "raise_pct": 10,
+                "raise_cap_roas": 3.0,
+            },
+            "priority": {
+                "primary_customer_ids": sorted(primary_customer_ids),
+                "secondary_customer_ids": sorted(secondary_customer_ids),
+            },
+        },
+        status=BackgroundJobStatus.queued,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    try:
+        message = maintain_google_ads_roas_impression_rescue.send(job.id, account_ids, False)
+        job.message_id = str(message.message_id)
+        session.commit()
+        print(f"Queued ROAS/impression maintenance job #{job.id} for account ids {account_ids}")
+    except Exception as exc:  # noqa: BLE001 - keep failed dispatch visible in Jobs.
+        job.status = BackgroundJobStatus.failed
+        job.error = str(exc)
+        job.finished_at = datetime.now(timezone.utc)
+        session.commit()
+        raise
+
+
 def main() -> None:
     args = parse_args()
     runtime_block = primary_instance_required_result()
@@ -441,6 +546,7 @@ def main() -> None:
             _queue_daily_page_feed_publish_if_due(session, now, scheduler_settings)
             _queue_policy_disapproval_sync_if_due(session, now, scheduler_settings)
             _queue_universal_garbage_negative_sync_if_due(session, now, scheduler_settings)
+            _queue_roas_impression_maintenance_if_due(session, now, scheduler_settings)
         selected_ids = [int(item) for item in args.account_id if item]
         customer_ids = [str(item).replace("-", "").strip() for item in args.customer_id if str(item).strip()]
         if customer_ids:
