@@ -831,6 +831,9 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         )
 
         self.assertIn("shop online", universal_keys)
+        self.assertIn("buy", universal_keys)
+        self.assertIn("shop", universal_keys)
+        self.assertIn("website", universal_keys)
         self.assertIn("nutricity ca online", universal_keys)
         self.assertEqual(terms, ["no sale evidence term"])
 

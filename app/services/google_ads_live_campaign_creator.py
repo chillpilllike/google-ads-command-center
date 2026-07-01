@@ -83,12 +83,18 @@ UNIVERSAL_GENERIC_SHARED_SET_NAME = "universal generic negatives"
 RESTRICTED_TERMS_SETTING_KEY = "page_feed.restricted_title_terms"
 UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
     "health supplements",
+    "buy",
+    "shop",
+    "website",
     "shop online",
     "shop online today",
     "trusted online store",
     "best online store",
     "online store",
     "buy online",
+    "order online",
+    "where to buy",
+    "where can i buy",
 ]
 UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT_SETTING = "automation.universal_garbage_negative_bank_limit"
 DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT = 1500

@@ -707,6 +707,9 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
     def test_universal_generic_negative_terms_include_account_name(self) -> None:
         terms = _universal_generic_negative_terms(SimpleNamespace(name="Nutricity CA"))
 
+        self.assertIn("buy", terms)
+        self.assertIn("shop", terms)
+        self.assertIn("website", terms)
         self.assertIn("shop online", terms)
         self.assertIn("Nutricity CA online", terms)
 

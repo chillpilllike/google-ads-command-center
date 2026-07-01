@@ -134,12 +134,18 @@ CAMPAIGN_PLANNING_KEYWORD_DATASETS = {
 }
 UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
     "health supplements",
+    "buy",
+    "shop",
+    "website",
     "shop online",
     "shop online today",
     "trusted online store",
     "best online store",
     "online store",
     "buy online",
+    "order online",
+    "where to buy",
+    "where can i buy",
 ]
 NON_SUPPLEMENT_DOMAIN_TOKENS = ("gofinchkart", "secretgreen")
 COUNTRY_KEYWORD_MARKERS = {

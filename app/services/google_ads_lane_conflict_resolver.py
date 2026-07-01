@@ -110,8 +110,88 @@ def _negative_terms(draft: AdDraft) -> set[str]:
     return {_keyword_key(term) for term in _negative_keyword_texts_from_draft(draft, limit=5000) if _keyword_key(term)}
 
 
+def _negative_intent_terms(draft: AdDraft) -> set[str]:
+    assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    items = assets.get("negative_keywords") if isinstance(assets.get("negative_keywords"), list) else []
+    terms: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            if str(item.get("source") or "").strip().lower() == "lane_conflict_resolver":
+                continue
+            match_type = str(item.get("match_type") or "exact").strip().lower()
+            if match_type and match_type != "exact":
+                continue
+            text = item.get("keyword") or item.get("text") or ""
+        else:
+            text = item
+        key = _keyword_key(text)
+        if key and _valid_exact_keyword(key):
+            terms.add(key)
+    return terms
+
+
 def _negative_urls(draft: AdDraft) -> set[str]:
     return {_webpage_url_key(url) for url in _negative_page_urls_from_draft(draft, limit=5000) if _webpage_url_key(url)}
+
+
+def _resolver_negative_intent_url_keys(assets: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in assets.get("lane_conflict_url_exclusions") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source") or "").strip().lower() != "lane_conflict_resolver":
+            continue
+        if str(item.get("owner") or "").strip().lower() != "negative_intent_bank":
+            continue
+        key = _webpage_url_key(item.get("url") or "")
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _negative_intent_urls(draft: AdDraft) -> set[str]:
+    assets = draft.generated_assets if isinstance(draft.generated_assets, dict) else {}
+    resolver_urls = _resolver_negative_intent_url_keys(assets)
+    return {url for url in _negative_urls(draft) if url not in resolver_urls}
+
+
+def _prune_stale_resolver_negative_intent(assets: dict[str, Any], negative_intent_terms: set[str], negative_intent_urls: set[str]) -> bool:
+    changed = False
+    items = assets.get("negative_keywords") if isinstance(assets.get("negative_keywords"), list) else []
+    if items:
+        next_items: list[Any] = []
+        for item in items:
+            if isinstance(item, dict):
+                key = _keyword_key(item.get("keyword") or item.get("text") or "")
+                is_resolver_negative_intent = (
+                    str(item.get("source") or "").strip().lower() == "lane_conflict_resolver"
+                    and str(item.get("owner") or "").strip().lower() == "negative_intent_bank"
+                )
+                if is_resolver_negative_intent and key and key not in negative_intent_terms:
+                    changed = True
+                    continue
+            next_items.append(item)
+        if changed:
+            assets["negative_keywords"] = next_items
+
+    values = assets.get("negative_page_targets") if isinstance(assets.get("negative_page_targets"), list) else []
+    stale_url_keys = _resolver_negative_intent_url_keys(assets) - negative_intent_urls
+    if stale_url_keys and values:
+        next_values = [value for value in values if _webpage_url_key(value) not in stale_url_keys]
+        if len(next_values) != len(values):
+            assets["negative_page_targets"] = next_values
+            changed = True
+    governance = assets.get("lane_conflict_url_exclusions") if isinstance(assets.get("lane_conflict_url_exclusions"), list) else []
+    if stale_url_keys and governance:
+        next_governance = []
+        for item in governance:
+            key = _webpage_url_key(item.get("url") or "") if isinstance(item, dict) else ""
+            if key in stale_url_keys:
+                changed = True
+                continue
+            next_governance.append(item)
+        assets["lane_conflict_url_exclusions"] = next_governance
+    return changed
 
 
 def _winner(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -202,8 +282,8 @@ def resolve_account_lane_conflicts(
         label = _draft_label(draft)
         positives = _positive_search_terms(draft)
         urls = _positive_urls(draft)
-        negatives = _negative_terms(draft)
-        negative_urls = _negative_urls(draft)
+        negatives = _negative_intent_terms(draft)
+        negative_urls = _negative_intent_urls(draft)
         draft_state[draft.id] = {
             "draft": draft,
             "lane_class": lane_class,
@@ -226,6 +306,12 @@ def resolve_account_lane_conflicts(
     for state in draft_state.values():
         negative_intent_terms.update(state["negative_terms"])
         negative_intent_urls.update(state["negative_urls"])
+
+    for state in draft_state.values():
+        assets = dict(state["draft"].generated_assets or {})
+        if _prune_stale_resolver_negative_intent(assets, negative_intent_terms, negative_intent_urls):
+            state["draft"].generated_assets = assets
+            changed_drafts.add(state["draft"].id)
 
     for term, rows in sorted(term_rows.items()):
         if len(rows) < 2:
