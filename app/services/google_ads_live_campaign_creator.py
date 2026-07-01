@@ -82,6 +82,7 @@ RESTRICTED_SHARED_SET_NAME = "restricted"
 UNIVERSAL_GENERIC_SHARED_SET_NAME = "universal generic negatives"
 RESTRICTED_TERMS_SETTING_KEY = "page_feed.restricted_title_terms"
 UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
+    "health supplements",
     "shop online",
     "shop online today",
     "trusted online store",
@@ -429,6 +430,133 @@ def _limit_daily_criteria_items(
     return items[:allowed], reservation
 
 
+def _extract_json_object(text_value: str) -> dict[str, Any]:
+    value = str(text_value or "").strip()
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = value.find("{")
+    end = value.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(value[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _openai_rewrite_rejected_criteria(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    values: list[str],
+    failure_details: list[dict[str, Any]],
+) -> dict[str, Any]:
+    clean_values = [str(value or "").strip() for value in values if str(value or "").strip()]
+    if not clean_values:
+        return {"status": "skipped_empty", "replacements": []}
+    settings = get_sync_setting_map(session)
+    api_key = str(settings.get("openai.api_key") or "").strip()
+    if not api_key:
+        return {"status": "skipped_no_openai_api_key", "replacements": []}
+    model = str(settings.get("openai.model") or "gpt-5.2").strip() or "gpt-5.2"
+    is_url = "url" in str(kind or "").lower() or any(value.lower().startswith(("http://", "https://")) for value in clean_values)
+    instruction = (
+        "Rewrite rejected Google Ads URL criteria. Keep each replacement on the same host/path family, remove tracking "
+        "parameters/fragments, keep https URLs, and do not invent new products or domains."
+        if is_url
+        else "Rewrite rejected Google Ads keyword criteria into short, policy-safe exact-match phrases. Keep commercial intent, "
+        "avoid medical claims, prohibited substances, symbols, excessive length, and vague filler."
+    )
+    prompt = (
+        f"{instruction} Return strict JSON only: "
+        '{"replacements":[{"original":"...","replacement":"...","reason":"..."}]}. '
+        "Use an empty replacement if no safe rewrite exists. "
+        f"Account: {account.name} ({account.customer_id}). Kind: {kind}. "
+        f"Rejected values: {json.dumps(clean_values, ensure_ascii=True)}. "
+        f"Google failure details: {json.dumps(failure_details[:20], ensure_ascii=True)}"
+    )
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "input": prompt, "text": {"format": {"type": "json_object"}}},
+            timeout=45,
+        )
+        response.raise_for_status()
+        body = response.json()
+        text_value = body.get("output_text") or ""
+        if not text_value:
+            for item in body.get("output", []) or []:
+                for content in item.get("content", []) or []:
+                    if content.get("type") in {"output_text", "text"}:
+                        text_value += content.get("text", "")
+        parsed = _extract_json_object(text_value)
+    except Exception as exc:  # noqa: BLE001 - keep mutation retry state persisted.
+        return {"status": "failed", "model": model, "error": str(exc)[:500], "replacements": []}
+
+    replacement_rows = parsed.get("replacements") if isinstance(parsed.get("replacements"), list) else []
+    replacements: list[dict[str, str]] = []
+    seen: set[str] = set()
+    original_set = {item.lower() for item in clean_values}
+    for item in replacement_rows:
+        if not isinstance(item, dict):
+            continue
+        original = str(item.get("original") or "").strip()
+        replacement = str(item.get("replacement") or "").strip()
+        if not original or original.lower() not in original_set or not replacement:
+            continue
+        if replacement.lower() == original.lower() or replacement.lower() in seen:
+            continue
+        if is_url:
+            if not replacement.lower().startswith(("http://", "https://")) or not usable_landing_page_url(replacement):
+                continue
+        elif len(replacement) > 80 or not re.search(r"[a-zA-Z0-9]", replacement):
+            continue
+        seen.add(replacement.lower())
+        replacements.append(
+            {
+                "original": original,
+                "replacement": replacement,
+                "reason": str(item.get("reason") or "")[:300],
+            }
+        )
+    return {"status": "done", "model": model, "replacements": replacements}
+
+
+def _replacement_values(rewrite_result: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for item in rewrite_result.get("replacements") or []:
+        if isinstance(item, dict):
+            value = str(item.get("replacement") or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _coerce_criteria_mutation_result(result: Any, submitted_items: list[str]) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return {
+            "resources": list(result.get("resources") or []),
+            "successful_items": list(result.get("successful_items") or []),
+            "failed_items": list(result.get("failed_items") or []),
+            "failure_details": list(result.get("failure_details") or []),
+        }
+    resources = list(result or []) if isinstance(result, list) else []
+    return {
+        "resources": resources,
+        "successful_items": list(submitted_items[: len(resources)]),
+        "failed_items": list(submitted_items[len(resources) :]),
+        "failure_details": [],
+    }
+
+
 def _prepend_deferred_criteria_items(
     session: Session,
     account: GoogleAdsAccount,
@@ -446,7 +574,7 @@ def _prepend_deferred_criteria_items(
                 GoogleAdsCriteriaPublication.account_id == account.id,
                 GoogleAdsCriteriaPublication.kind == kind,
                 GoogleAdsCriteriaPublication.scope_key == scope_key,
-                GoogleAdsCriteriaPublication.status == "deferred_quota",
+                GoogleAdsCriteriaPublication.status.in_(["deferred_quota", "failed_rewrite_pending"]),
             )
             .order_by(
                 GoogleAdsCriteriaPublication.last_attempted_at.asc().nullsfirst(),
@@ -1240,6 +1368,67 @@ def _partial_failure_operation_indexes(response: Any) -> set[int]:
                     if index is not None:
                         failed_indexes.add(int(index))
     return failed_indexes
+
+
+def _partial_failure_details(response: Any, values: list[Any]) -> list[dict[str, Any]]:
+    partial_failure = getattr(response, "partial_failure_error", None)
+    if partial_failure is None or not getattr(partial_failure, "code", 0):
+        return []
+    failures: list[dict[str, Any]] = []
+    for detail in getattr(partial_failure, "details", []) or []:
+        try:
+            failure = GoogleAdsFailure.deserialize(detail.value)
+        except Exception:  # noqa: BLE001 - Google may return a plain status message.
+            continue
+        for error in getattr(failure, "errors", []) or []:
+            index: Optional[int] = None
+            for element in getattr(error.location, "field_path_elements", []) or []:
+                field_name = str(getattr(element, "field_name", "") or "")
+                if field_name in {"operations", "mutate_operations"}:
+                    raw_index = getattr(element, "index", None)
+                    if raw_index is not None:
+                        index = int(raw_index)
+                        break
+            if index is None:
+                continue
+            failures.append(
+                {
+                    "index": index,
+                    "value": str(values[index] if 0 <= index < len(values) else ""),
+                    "error_code": str(getattr(error, "error_code", "") or ""),
+                    "message": str(getattr(error, "message", "") or "")[:1000],
+                }
+            )
+    return failures
+
+
+def _mutation_item_result(response: Any, values: list[Any]) -> dict[str, Any]:
+    failed_indexes = _partial_failure_operation_indexes(response)
+    resources: list[str] = []
+    successful_items: list[str] = []
+    failed_items: list[str] = []
+    for index, result in enumerate(getattr(response, "results", []) or []):
+        value = str(values[index] if index < len(values) else "").strip()
+        if index in failed_indexes:
+            if value:
+                failed_items.append(value)
+            continue
+        resource_name = str(getattr(result, "resource_name", "") or "")
+        if resource_name:
+            resources.append(resource_name)
+            if value:
+                successful_items.append(value)
+    for index in sorted(failed_indexes):
+        if index < len(values):
+            value = str(values[index] or "").strip()
+            if value and value not in failed_items:
+                failed_items.append(value)
+    return {
+        "resources": resources,
+        "successful_items": successful_items,
+        "failed_items": failed_items,
+        "failure_details": _partial_failure_details(response, values),
+    }
 
 
 def _successful_resource_names(response: Any) -> list[str]:
@@ -3045,11 +3234,12 @@ def _create_ad_group_webpage_inclusions(
     urls: list[str],
     validate_only: bool,
 ) -> list[str]:
-    resources: list[str] = []
+    result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
     service = client.get_service("AdGroupCriterionService")
     for start in range(0, len(urls), URL_INCLUSION_MUTATION_BATCH_LIMIT):
+        batch = urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]
         operations = []
-        for url in urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]:
+        for url in batch:
             operation = client.get_type("AdGroupCriterionOperation")
             criterion = operation.create
             criterion.ad_group = ad_group_resource_name
@@ -3069,8 +3259,10 @@ def _create_ad_group_webpage_inclusions(
         request.partial_failure = True
         request.validate_only = validate_only
         response = _google_ads_mutate(service, "mutate_ad_group_criteria", request)
-        resources.extend(_successful_resource_names(response))
-    return resources
+        batch_result = _mutation_item_result(response, batch)
+        for key in result:
+            result[key].extend(batch_result.get(key) or [])
+    return result
 
 
 def _apply_ad_group_webpage_inclusions(
@@ -3102,13 +3294,37 @@ def _apply_ad_group_webpage_inclusions(
         items=planned_items,
         validate_only=validate_only,
     )
-    resources = _create_ad_group_webpage_inclusions(
+    mutation_result = _coerce_criteria_mutation_result(_create_ad_group_webpage_inclusions(
         client,
         account,
         ad_group_resource_name=ad_group_resource_name,
         urls=to_create,
         validate_only=validate_only,
-    )
+    ), to_create)
+    resources = list(mutation_result.get("resources") or [])
+    successful_items = list(mutation_result.get("successful_items") or [])
+    failed_items = list(mutation_result.get("failed_items") or [])
+    failure_details = list(mutation_result.get("failure_details") or [])
+    rewrite_result = {"status": "skipped_no_failures", "replacements": []}
+    retry_result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
+    if failed_items and not validate_only:
+        rewrite_result = _openai_rewrite_rejected_criteria(
+            session,
+            account,
+            kind="ad_group_url_inclusions",
+            values=failed_items,
+            failure_details=failure_details,
+        )
+        rewrite_values = _replacement_values(rewrite_result)
+        if rewrite_values:
+            retry_result = _coerce_criteria_mutation_result(_create_ad_group_webpage_inclusions(
+                client,
+                account,
+                ad_group_resource_name=ad_group_resource_name,
+                urls=rewrite_values,
+                validate_only=validate_only,
+            ), rewrite_values)
+            resources.extend(retry_result.get("resources") or [])
     scope_key = f"ad_group_url_inclusions:{ad_group_resource_name}"
     context = _criteria_publication_context(draft)
     _record_criteria_publications(
@@ -3116,10 +3332,32 @@ def _apply_ad_group_webpage_inclusions(
         account,
         kind="ad_group_url_inclusions",
         scope_key=scope_key,
-        items=to_create,
+        items=successful_items + list(retry_result.get("successful_items") or []),
         status="published" if not validate_only else "validated",
         resource_names=resources,
-        result={"reservation": reservation},
+        result={"reservation": reservation, "rewrite_result": rewrite_result},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="ad_group_url_inclusions",
+        scope_key=scope_key,
+        items=failed_items,
+        status="failed_rewritten" if _replacement_values(rewrite_result) else "failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": failure_details, "rewrite_result": rewrite_result},
+        error=json.dumps(failure_details[:3], ensure_ascii=True)[:1000],
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="ad_group_url_inclusions",
+        scope_key=scope_key,
+        items=list(retry_result.get("failed_items") or []),
+        status="failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": retry_result.get("failure_details") or [], "rewrite_result": rewrite_result},
+        error=json.dumps((retry_result.get("failure_details") or [])[:3], ensure_ascii=True)[:1000],
         **context,
     )
     _record_criteria_publications(
@@ -3136,7 +3374,7 @@ def _apply_ad_group_webpage_inclusions(
         "url_inclusion_count": len(urls),
         "existing_url_inclusion_count": len(existing),
         "planned_new_url_inclusion_count": planned_to_create,
-        "new_url_inclusion_count": len(to_create),
+        "new_url_inclusion_count": len(successful_items) + len(retry_result.get("successful_items") or []),
         "daily_deferred_url_inclusion_count": max(planned_to_create - len(to_create), 0),
         "url_inclusion_daily_budget": reservation,
         "url_inclusion_resources": resources,
@@ -3151,11 +3389,12 @@ def _create_exact_keywords(
     keywords: list[str],
     validate_only: bool,
 ) -> list[str]:
-    resources: list[str] = []
+    result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
     service = client.get_service("AdGroupCriterionService")
     for start in range(0, len(keywords), KEYWORD_MUTATION_BATCH_LIMIT):
+        batch = keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]
         operations = []
-        for keyword in keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]:
+        for keyword in batch:
             operation = client.get_type("AdGroupCriterionOperation")
             criterion = operation.create
             criterion.ad_group = ad_group_resource_name
@@ -3171,8 +3410,10 @@ def _create_exact_keywords(
         request.partial_failure = True
         request.validate_only = validate_only
         response = _google_ads_mutate(service, "mutate_ad_group_criteria", request)
-        resources.extend(_successful_resource_names(response))
-    return resources
+        batch_result = _mutation_item_result(response, batch)
+        for key in result:
+            result[key].extend(batch_result.get(key) or [])
+    return result
 
 
 def _enable_ad_group_criteria_if_needed(
@@ -3266,11 +3507,12 @@ def _create_campaign_negative_exact_keywords(
     keywords: list[str],
     validate_only: bool,
 ) -> list[str]:
-    resources: list[str] = []
+    result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
     service = client.get_service("CampaignCriterionService")
     for start in range(0, len(keywords), KEYWORD_MUTATION_BATCH_LIMIT):
+        batch = keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]
         operations = []
-        for keyword in keywords[start : start + KEYWORD_MUTATION_BATCH_LIMIT]:
+        for keyword in batch:
             operation = client.get_type("CampaignCriterionOperation")
             criterion = operation.create
             criterion.campaign = campaign_resource_name
@@ -3287,8 +3529,10 @@ def _create_campaign_negative_exact_keywords(
         request.partial_failure = True
         request.validate_only = validate_only
         response = _google_ads_mutate(service, "mutate_campaign_criteria", request)
-        resources.extend(_successful_resource_names(response))
-    return resources
+        batch_result = _mutation_item_result(response, batch)
+        for key in result:
+            result[key].extend(batch_result.get(key) or [])
+    return result
 
 
 def _create_campaign_negative_webpages(
@@ -3299,11 +3543,12 @@ def _create_campaign_negative_webpages(
     urls: list[str],
     validate_only: bool,
 ) -> list[str]:
-    resources: list[str] = []
+    result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
     service = client.get_service("CampaignCriterionService")
     for start in range(0, len(urls), URL_INCLUSION_MUTATION_BATCH_LIMIT):
+        batch = urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]
         operations = []
-        for url in urls[start : start + URL_INCLUSION_MUTATION_BATCH_LIMIT]:
+        for url in batch:
             operation = client.get_type("CampaignCriterionOperation")
             criterion = operation.create
             criterion.campaign = campaign_resource_name
@@ -3323,8 +3568,10 @@ def _create_campaign_negative_webpages(
         request.partial_failure = True
         request.validate_only = validate_only
         response = _google_ads_mutate(service, "mutate_campaign_criteria", request)
-        resources.extend(_successful_resource_names(response))
-    return resources
+        batch_result = _mutation_item_result(response, batch)
+        for key in result:
+            result[key].extend(batch_result.get(key) or [])
+    return result
 
 
 def _existing_campaign_location_targets(client: Any, account: GoogleAdsAccount, campaign_id: int) -> list[dict[str, str]]:
@@ -3498,13 +3745,37 @@ def _apply_campaign_negative_keywords(
         items=planned_items,
         validate_only=validate_only,
     )
-    resources = _create_campaign_negative_exact_keywords(
+    mutation_result = _coerce_criteria_mutation_result(_create_campaign_negative_exact_keywords(
         client,
         account,
         campaign_resource_name=campaign_resource_name,
         keywords=to_create,
         validate_only=validate_only,
-    )
+    ), to_create)
+    resources = list(mutation_result.get("resources") or [])
+    successful_items = list(mutation_result.get("successful_items") or [])
+    failed_items = list(mutation_result.get("failed_items") or [])
+    failure_details = list(mutation_result.get("failure_details") or [])
+    rewrite_result = {"status": "skipped_no_failures", "replacements": []}
+    retry_result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
+    if failed_items and not validate_only:
+        rewrite_result = _openai_rewrite_rejected_criteria(
+            session,
+            account,
+            kind="campaign_negative_keywords",
+            values=failed_items,
+            failure_details=failure_details,
+        )
+        rewrite_values = _replacement_values(rewrite_result)
+        if rewrite_values:
+            retry_result = _coerce_criteria_mutation_result(_create_campaign_negative_exact_keywords(
+                client,
+                account,
+                campaign_resource_name=campaign_resource_name,
+                keywords=rewrite_values,
+                validate_only=validate_only,
+            ), rewrite_values)
+            resources.extend(retry_result.get("resources") or [])
     removed_positive_resources = _remove_ad_group_criteria_if_needed(
         client,
         account,
@@ -3517,10 +3788,32 @@ def _apply_campaign_negative_keywords(
         account,
         kind="campaign_negative_keywords",
         scope_key=scope_key,
-        items=to_create,
+        items=successful_items + list(retry_result.get("successful_items") or []),
         status="published" if not validate_only else "validated",
         resource_names=resources,
-        result={"reservation": reservation},
+        result={"reservation": reservation, "rewrite_result": rewrite_result},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_negative_keywords",
+        scope_key=scope_key,
+        items=failed_items,
+        status="failed_rewritten" if _replacement_values(rewrite_result) else "failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": failure_details, "rewrite_result": rewrite_result},
+        error=json.dumps(failure_details[:3], ensure_ascii=True)[:1000],
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_negative_keywords",
+        scope_key=scope_key,
+        items=list(retry_result.get("failed_items") or []),
+        status="failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": retry_result.get("failure_details") or [], "rewrite_result": rewrite_result},
+        error=json.dumps((retry_result.get("failure_details") or [])[:3], ensure_ascii=True)[:1000],
         **context,
     )
     _record_criteria_publications(
@@ -3537,7 +3830,7 @@ def _apply_campaign_negative_keywords(
         "negative_keyword_count": len(keywords),
         "existing_negative_keyword_count": len(existing),
         "planned_new_negative_keyword_count": planned_to_create,
-        "new_negative_keyword_count": len(to_create),
+        "new_negative_keyword_count": len(successful_items) + len(retry_result.get("successful_items") or []),
         "daily_deferred_negative_keyword_count": max(planned_to_create - len(to_create), 0),
         "negative_keyword_daily_budget": reservation,
         "negative_keyword_resources": resources,
@@ -3582,13 +3875,37 @@ def _apply_campaign_negative_webpages(
         items=planned_items,
         validate_only=validate_only,
     )
-    resources = _create_campaign_negative_webpages(
+    mutation_result = _coerce_criteria_mutation_result(_create_campaign_negative_webpages(
         client,
         account,
         campaign_resource_name=campaign_resource_name,
         urls=to_create,
         validate_only=validate_only,
-    )
+    ), to_create)
+    resources = list(mutation_result.get("resources") or [])
+    successful_items = list(mutation_result.get("successful_items") or [])
+    failed_items = list(mutation_result.get("failed_items") or [])
+    failure_details = list(mutation_result.get("failure_details") or [])
+    rewrite_result = {"status": "skipped_no_failures", "replacements": []}
+    retry_result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
+    if failed_items and not validate_only:
+        rewrite_result = _openai_rewrite_rejected_criteria(
+            session,
+            account,
+            kind="campaign_url_exclusions",
+            values=failed_items,
+            failure_details=failure_details,
+        )
+        rewrite_values = _replacement_values(rewrite_result)
+        if rewrite_values:
+            retry_result = _coerce_criteria_mutation_result(_create_campaign_negative_webpages(
+                client,
+                account,
+                campaign_resource_name=campaign_resource_name,
+                urls=rewrite_values,
+                validate_only=validate_only,
+            ), rewrite_values)
+            resources.extend(retry_result.get("resources") or [])
     removed_positive_resources = _remove_ad_group_criteria_if_needed(
         client,
         account,
@@ -3601,10 +3918,32 @@ def _apply_campaign_negative_webpages(
         account,
         kind="campaign_url_exclusions",
         scope_key=scope_key,
-        items=to_create,
+        items=successful_items + list(retry_result.get("successful_items") or []),
         status="published" if not validate_only else "validated",
         resource_names=resources,
-        result={"reservation": reservation},
+        result={"reservation": reservation, "rewrite_result": rewrite_result},
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_url_exclusions",
+        scope_key=scope_key,
+        items=failed_items,
+        status="failed_rewritten" if _replacement_values(rewrite_result) else "failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": failure_details, "rewrite_result": rewrite_result},
+        error=json.dumps(failure_details[:3], ensure_ascii=True)[:1000],
+        **context,
+    )
+    _record_criteria_publications(
+        session,
+        account,
+        kind="campaign_url_exclusions",
+        scope_key=scope_key,
+        items=list(retry_result.get("failed_items") or []),
+        status="failed_rewrite_pending",
+        result={"reservation": reservation, "failure_details": retry_result.get("failure_details") or [], "rewrite_result": rewrite_result},
+        error=json.dumps((retry_result.get("failure_details") or [])[:3], ensure_ascii=True)[:1000],
         **context,
     )
     _record_criteria_publications(
@@ -3621,7 +3960,7 @@ def _apply_campaign_negative_webpages(
         "negative_page_count": len(urls),
         "existing_negative_page_count": len(existing),
         "planned_new_negative_page_count": planned_to_create,
-        "new_negative_page_count": len(to_create),
+        "new_negative_page_count": len(successful_items) + len(retry_result.get("successful_items") or []),
         "daily_deferred_negative_page_count": max(planned_to_create - len(to_create), 0),
         "negative_page_daily_budget": reservation,
         "negative_page_resources": resources,
@@ -5927,13 +6266,37 @@ def publish_rsa_draft(
             criterion_resource_names=keywords_to_remove,
             validate_only=validate_only,
         )
-        keyword_resources = _create_exact_keywords(
+        keyword_mutation_result = _coerce_criteria_mutation_result(_create_exact_keywords(
             client,
             account,
             ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
             keywords=keywords_to_create,
             validate_only=validate_only,
-        )
+        ), keywords_to_create)
+        keyword_resources = list(keyword_mutation_result.get("resources") or [])
+        successful_keyword_items = list(keyword_mutation_result.get("successful_items") or [])
+        failed_keyword_items = list(keyword_mutation_result.get("failed_items") or [])
+        keyword_failure_details = list(keyword_mutation_result.get("failure_details") or [])
+        keyword_rewrite_result = {"status": "skipped_no_failures", "replacements": []}
+        keyword_retry_result = {"resources": [], "successful_items": [], "failed_items": [], "failure_details": []}
+        if failed_keyword_items and not validate_only:
+            keyword_rewrite_result = _openai_rewrite_rejected_criteria(
+                session,
+                account,
+                kind="exact_keywords",
+                values=failed_keyword_items,
+                failure_details=keyword_failure_details,
+            )
+            keyword_rewrite_values = _replacement_values(keyword_rewrite_result)
+            if keyword_rewrite_values:
+                keyword_retry_result = _coerce_criteria_mutation_result(_create_exact_keywords(
+                    client,
+                    account,
+                    ad_group_resource_name=str(ad_group["ad_group_resource_name"]),
+                    keywords=keyword_rewrite_values,
+                    validate_only=validate_only,
+                ), keyword_rewrite_values)
+                keyword_resources.extend(keyword_retry_result.get("resources") or [])
         keyword_context = _criteria_publication_context(
             draft,
             ad_group_name=str(ad_group.get("ad_group_name") or ""),
@@ -5943,10 +6306,36 @@ def publish_rsa_draft(
             account,
             kind="exact_keywords",
             scope_key=keyword_scope_key,
-            items=keywords_to_create,
+            items=successful_keyword_items + list(keyword_retry_result.get("successful_items") or []),
             status="published" if not validate_only else "validated",
             resource_names=keyword_resources,
-            result={"reservation": keyword_daily_budget},
+            result={"reservation": keyword_daily_budget, "rewrite_result": keyword_rewrite_result},
+            **keyword_context,
+        )
+        _record_criteria_publications(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key=keyword_scope_key,
+            items=failed_keyword_items,
+            status="failed_rewritten" if _replacement_values(keyword_rewrite_result) else "failed_rewrite_pending",
+            result={"reservation": keyword_daily_budget, "failure_details": keyword_failure_details, "rewrite_result": keyword_rewrite_result},
+            error=json.dumps(keyword_failure_details[:3], ensure_ascii=True)[:1000],
+            **keyword_context,
+        )
+        _record_criteria_publications(
+            session,
+            account,
+            kind="exact_keywords",
+            scope_key=keyword_scope_key,
+            items=list(keyword_retry_result.get("failed_items") or []),
+            status="failed_rewrite_pending",
+            result={
+                "reservation": keyword_daily_budget,
+                "failure_details": keyword_retry_result.get("failure_details") or [],
+                "rewrite_result": keyword_rewrite_result,
+            },
+            error=json.dumps((keyword_retry_result.get("failure_details") or [])[:3], ensure_ascii=True)[:1000],
             **keyword_context,
         )
         _record_criteria_publications(
@@ -5975,11 +6364,13 @@ def publish_rsa_draft(
             "existing_keyword_count": len(existing_keywords),
             "enabled_existing_keyword_count": len(enabled_keyword_resources),
             "removed_stale_keyword_count": len(removed_keyword_resources),
-            "new_keyword_count": len(keywords_to_create),
+            "new_keyword_count": len(successful_keyword_items) + len(keyword_retry_result.get("successful_items") or []),
             "planned_new_keyword_count": planned_keywords_to_create,
             "daily_deferred_keyword_count": max(planned_keywords_to_create - len(keywords_to_create), 0),
             "keyword_daily_budget": keyword_daily_budget,
             "keyword_resources": keyword_resources,
+            "failed_keyword_count": len(failed_keyword_items) + len(keyword_retry_result.get("failed_items") or []),
+            "keyword_rewrite_result": keyword_rewrite_result,
             "enabled_keyword_resources": enabled_keyword_resources,
             "removed_keyword_resources": removed_keyword_resources,
         }

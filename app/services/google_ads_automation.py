@@ -133,6 +133,7 @@ CAMPAIGN_PLANNING_KEYWORD_DATASETS = {
     DATASET_AI_MAX_SEARCH_TERM_COMBINATIONS,
 }
 UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
+    "health supplements",
     "shop online",
     "shop online today",
     "trusted online store",

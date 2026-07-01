@@ -68,6 +68,7 @@ from app.services.google_ads_goals import sync_account_conversion_goals
 from app.services.google_ads_page_feed_publisher import publish_page_feeds_for_mappings
 from app.services.google_ads_keyword_bank import sync_account_all_time_keyword_candidates, sync_account_keyword_candidates
 from app.services.google_ads_landing_page_bank import sync_account_landing_page_candidates, sync_account_landing_page_pull
+from app.services.google_ads_lane_conflict_resolver import resolve_account_lane_conflicts
 from app.services.google_ads_negative_keyword_bank import sync_account_negative_keyword_candidates
 from app.services.google_ads_policy_disapprovals import sync_account_policy_disapproval_terms
 from app.services.google_ads_research_collector import sync_account_research_snapshots
@@ -1939,6 +1940,86 @@ def sync_google_ads_brand_list_candidates(
                     BackgroundJobStatus.succeeded if not errors else BackgroundJobStatus.failed,
                     current=processed,
                     error=f"{errors} account brand-list sync errors were recorded. {saved} brand candidates refreshed." if errors else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))
+                raise
+
+
+@dramatiq.actor(max_retries=0, time_limit=60 * 60 * 1000)
+def resolve_google_ads_lane_conflicts(
+    job_id: Optional[int] = None,
+    account_ids: Optional[list[int]] = None,
+    max_drafts: int = 200,
+) -> None:
+    with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
+        with SessionLocal() as session:
+            settings_map = get_sync_setting_map(session)
+            primary_ids = _customer_id_set(settings_map.get("automation.scheduler_primary_customer_ids"))
+            secondary_ids = _customer_id_set(settings_map.get("automation.scheduler_secondary_customer_ids"))
+            query = (
+                select(GoogleAdsAccount)
+                .join(GoogleAdsAutomationPreference, GoogleAdsAutomationPreference.account_id == GoogleAdsAccount.id)
+                .where(
+                    GoogleAdsAccount.is_active.is_(True),
+                    GoogleAdsAutomationPreference.automation_enabled.is_(True),
+                )
+            )
+            selected_ids = [int(item) for item in (account_ids or []) if item]
+            if selected_ids:
+                query = query.where(GoogleAdsAccount.id.in_(selected_ids))
+            accounts = list(session.scalars(query).all())
+            accounts.sort(key=lambda account: (_account_priority_tier(account, primary_ids, secondary_ids), account.name or "", account.id))
+            if not mark_job_started(session, job_id, total=len(accounts)):
+                return
+            processed = 0
+            errors = 0
+            changed_accounts = 0
+            keyword_conflicts = 0
+            url_conflicts = 0
+            try:
+                for account in accounts:
+                    if job_cancel_requested(session, job_id):
+                        mark_job_finished(session, job_id, BackgroundJobStatus.canceled, current=processed)
+                        return
+                    try:
+                        if account_api_red_flag(session, account) is not None:
+                            continue
+                        result = resolve_account_lane_conflicts(
+                            session,
+                            account,
+                            source_job_id=job_id,
+                            max_drafts=max_drafts,
+                        )
+                        if int(result.get("changed_draft_count") or 0) > 0:
+                            changed_accounts += 1
+                        keyword_conflicts += int(result.get("keyword_conflict_count") or 0)
+                        url_conflicts += int(result.get("url_conflict_count") or 0)
+                    except Exception as exc:  # noqa: BLE001 - keep account cleanup moving.
+                        errors += 1
+                        record_google_ads_generic_error(
+                            session,
+                            exc,
+                            account=account,
+                            job_id=job_id,
+                            context="lane_conflict_resolver",
+                            severity="manual_action_required",
+                            extra={"source": "db_draft_intent_no_google_api"},
+                        )
+                    finally:
+                        processed += 1
+                        update_job_progress(session, job_id, current=processed)
+                mark_job_finished(
+                    session,
+                    job_id,
+                    BackgroundJobStatus.succeeded if not errors else BackgroundJobStatus.failed,
+                    current=processed,
+                    error=(
+                        f"{errors} account errors. Updated {changed_accounts} accounts; planned "
+                        f"{keyword_conflicts} keyword negatives and {url_conflicts} URL exclusions from DB draft conflicts."
+                    )
+                    if errors
+                    else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))

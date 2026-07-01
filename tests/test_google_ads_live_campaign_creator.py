@@ -384,7 +384,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
                 return SimpleNamespace()
 
         client = FakeClient()
-        resources = _create_ad_group_webpage_inclusions(
+        result = _create_ad_group_webpage_inclusions(
             client,
             SimpleNamespace(customer_id="3495463031"),
             ad_group_resource_name="customers/3495463031/adGroups/99",
@@ -392,7 +392,11 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
             validate_only=False,
         )
 
-        self.assertEqual(len(resources), 2)
+        self.assertEqual(len(result["resources"]), 2)
+        self.assertEqual(
+            result["successful_items"],
+            ["https://nutricity.ca/shop/vitamins", "https://nutricity.ca/shop/minerals"],
+        )
         first_condition = client.criterion_service.last_request.operations[0].create.webpage.conditions[0]
         self.assertEqual(first_condition.operand, "URL")
         self.assertEqual(first_condition.operator, "EQUALS")
