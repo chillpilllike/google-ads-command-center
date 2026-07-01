@@ -12,6 +12,7 @@ from app.models import GoogleAdsAccount, GoogleAdsNegativeKeywordCandidate, Goog
 from app.services.google_ads_keyword_plan import clean_keyword, normalized_keyword
 from app.services.google_ads_live_campaign_creator import (
     _disapproved_policy_term_candidates,
+    _is_valid_policy_restricted_term,
     _valid_exact_keyword,
     sync_restricted_policy_terms,
 )
@@ -67,7 +68,7 @@ def _negative_candidate_rows(
     rows: list[dict[str, Any]] = []
     for term in terms:
         keyword = clean_keyword(term)
-        if not _valid_exact_keyword(keyword):
+        if not _valid_exact_keyword(keyword) or not _is_valid_policy_restricted_term(keyword):
             continue
         key = normalized_keyword(keyword)
         evidence = evidence_by_key.get(normalize_restricted_text(term), {})
@@ -184,6 +185,7 @@ def upsert_policy_disapproval_terms(
 ) -> int:
     if not terms:
         return 0
+    terms = [term for term in terms if _is_valid_policy_restricted_term(term)]
     negative_ids = _negative_candidate_ids(session, account, terms)
     shared_resources = list(shared_keyword_resources or [])
     rows: list[dict[str, Any]] = []
@@ -253,7 +255,11 @@ def sync_account_policy_disapproval_terms(
     pulled_at = utcnow()
     client = client or build_client(get_sync_setting_map(session), account.manager_customer_id, account.connection)
     scan = _disapproved_policy_term_candidates(client, account)
-    terms = [term for term in scan.get("terms", []) if _valid_exact_keyword(term)]
+    terms = [
+        term
+        for term in scan.get("terms", [])
+        if _valid_exact_keyword(term) and _is_valid_policy_restricted_term(term)
+    ]
     terms = list(dict.fromkeys(terms))
     evidence_by_key = _term_evidence_map(scan)
     negative_rows = _negative_candidate_rows(

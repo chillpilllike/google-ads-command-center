@@ -1622,16 +1622,23 @@ def sync_google_ads_policy_disapproval_terms(
 ) -> None:
     with open(os.devnull, "w") as sink, redirect_stdout(sink), redirect_stderr(sink):
         with SessionLocal() as session:
+            settings_map = get_sync_setting_map(session)
+            primary_ids = _customer_id_set(settings_map.get("automation.scheduler_primary_customer_ids"))
+            secondary_ids = _customer_id_set(settings_map.get("automation.scheduler_secondary_customer_ids"))
             query = select(GoogleAdsAccount).where(GoogleAdsAccount.is_active.is_(True))
             selected_ids = [int(item) for item in (account_ids or []) if item]
             if selected_ids:
                 query = query.where(GoogleAdsAccount.id.in_(selected_ids))
-            accounts = session.scalars(query.order_by(GoogleAdsAccount.name)).all()
+            accounts = list(session.scalars(query).all())
+            accounts.sort(key=lambda account: (_account_priority_tier(account, primary_ids, secondary_ids), account.name or "", account.id))
             if not mark_job_started(session, job_id, total=len(accounts)):
                 return
             processed = 0
             errors = 0
+            deferred = 0
+            blocked = 0
             term_count = 0
+            negative_refreshed = 0
             try:
                 for account in accounts:
                     if job_cancel_requested(session, job_id):
@@ -1639,6 +1646,10 @@ def sync_google_ads_policy_disapproval_terms(
                         return
                     api_lease = None
                     try:
+                        red_flag = account_api_red_flag(session, account)
+                        if red_flag:
+                            blocked += 1
+                            continue
                         api_lease = acquire_google_ads_api_account_lease(
                             session,
                             account,
@@ -1646,11 +1657,30 @@ def sync_google_ads_policy_disapproval_terms(
                             purpose="google_ads_policy_disapproval_sync",
                         )
                         if not api_lease.get("acquired"):
+                            if str(api_lease.get("status") or "") == "blocked_by_google_quota":
+                                deferred += 1
+                            else:
+                                blocked += 1
                             continue
                         result = sync_account_policy_disapproval_terms(session, account, source_job_id=job_id)
                         term_count += int(result.get("term_count") or 0)
+                        if int(result.get("term_count") or 0) > 0:
+                            protection_result = sync_universal_garbage_negatives_for_account(session, account)
+                            if str(protection_result.get("status") or "") in {"updated", "skipped"}:
+                                negative_refreshed += 1
+                            elif "quota" in str(protection_result).lower():
+                                deferred += 1
+                            elif str(protection_result.get("status") or "").startswith("blocked"):
+                                blocked += 1
+                            else:
+                                errors += 1
+                        session.commit()
                     except GoogleAdsException as exc:
                         errors += 1
+                        quota_retry = google_ads_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                            errors -= 1
                         record_google_ads_api_error(
                             session,
                             exc,
@@ -1661,7 +1691,11 @@ def sync_google_ads_policy_disapproval_terms(
                             extra={"source": "google_ads_policy_summary"},
                         )
                     except Exception as exc:  # noqa: BLE001 - keep remaining accounts moving.
-                        errors += 1
+                        quota_retry = google_ads_generic_exception_quota_retry_state(session, account, exc)
+                        if quota_retry is not None:
+                            deferred += 1
+                        else:
+                            errors += 1
                         record_google_ads_generic_error(
                             session,
                             exc,
@@ -1673,6 +1707,8 @@ def sync_google_ads_policy_disapproval_terms(
                         )
                     finally:
                         if api_lease and api_lease.get("acquired"):
+                            if not session.is_active:
+                                session.rollback()
                             release_google_ads_api_account_lease(session, account, job_id=job_id)
                         processed += 1
                         update_job_progress(session, job_id, current=processed)
@@ -1681,7 +1717,12 @@ def sync_google_ads_policy_disapproval_terms(
                     job_id,
                     BackgroundJobStatus.succeeded if not errors else BackgroundJobStatus.failed,
                     current=processed,
-                    error=f"{errors} account policy sync errors were recorded. {term_count} disapproved-substance terms refreshed." if errors else None,
+                    error=(
+                        f"{errors} account policy sync errors were recorded. {term_count} disapproved-substance terms refreshed; "
+                        f"{negative_refreshed} account shared-negative protections refreshed; {deferred} deferred by quota; {blocked} blocked/skipped."
+                    )
+                    if errors or deferred or blocked
+                    else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 mark_job_finished(session, job_id, BackgroundJobStatus.failed, current=processed, error=str(exc))

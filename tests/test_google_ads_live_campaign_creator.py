@@ -748,6 +748,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
                 "Unapproved substances",
                 "Destination contains: Graviola Leaf, Soursop Graviola Liquid Drops, and DHEA 50 mg",
                 "Contains: Zhong Gan Ling",
+                "Contains: DISAPPROVED, PROHIBITED, LIMITED, geoTargetConstants/2036",
                 "Certificate required in Canada",
                 "Remove any references to unapproved substances that are prohibited from ad text.",
             ]

@@ -90,6 +90,28 @@ UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
 ]
 UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT_SETTING = "automation.universal_garbage_negative_bank_limit"
 DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT = 1500
+POLICY_RESTRICTED_NOISE_TERMS = {
+    "approved",
+    "area of interest only",
+    "certificate required in canada",
+    "circumventing systems",
+    "circumventing_systems",
+    "compromised site",
+    "compromised_site",
+    "destination contains",
+    "disapproved",
+    "eligible",
+    "fully limited",
+    "fully_limited",
+    "limited",
+    "policy",
+    "prohibited",
+    "remove any references",
+    "read the policy",
+    "unapproved substances",
+    "unsupported language",
+    "unsupported_language",
+}
 MAX_DRAFT_ASSET_JSON_REWRITE_BYTES = 1_000_000
 LEGACY_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions"
 REPLACEMENT_PMAX_SCALE_SOURCE_SUFFIX = "pmax_scale_after_7d_conversions_s001"
@@ -4463,17 +4485,30 @@ def _restricted_terms_from_policy_strings(strings: list[str]) -> list[str]:
             if len(term) < 3 or len(term) > 80:
                 continue
             normalized = normalize_restricted_text(term)
-            if not normalized or normalized in {
-                "destination contains",
-                "contains",
-                "unapproved substances",
-                "remove any references",
-                "read the policy",
-                "certificate required in canada",
-            }:
+            if not _is_valid_policy_restricted_term(term):
                 continue
             candidates.append(term)
     return list(dict.fromkeys(candidates))
+
+
+def _is_valid_policy_restricted_term(term: Any) -> bool:
+    text = str(term or "").strip()
+    normalized = normalize_restricted_text(text)
+    if not normalized:
+        return False
+    if normalized in POLICY_RESTRICTED_NOISE_TERMS or normalized == "contains":
+        return False
+    if re.fullmatch(r"(?i)(approved|disapproved|limited|eligible|prohibited|under_review|unknown|pending)", text):
+        return False
+    if re.fullmatch(r"(?i)(geo)?targetconstants?[/ ]?\d+", text):
+        return False
+    if text.startswith("geoTargetConstants/"):
+        return False
+    if "_" in text and re.fullmatch(r"[A-Z_]+", text):
+        return False
+    if len(normalized) < 3 or len(normalized) > 80:
+        return False
+    return True
 
 
 def _disapproved_policy_term_candidates(client: Any, account: GoogleAdsAccount) -> dict[str, Any]:
@@ -4547,8 +4582,6 @@ def _disapproved_policy_term_candidates(client: Any, account: GoogleAdsAccount) 
 
 
 def _append_restricted_terms_setting(session: Session, terms: list[str]) -> dict[str, Any]:
-    if not terms:
-        return {"new_terms": [], "existing_term_count": 0, "updated": False}
     row = session.scalar(select(AppSetting).where(AppSetting.key == RESTRICTED_TERMS_SETTING_KEY))
     if row is None:
         row = AppSetting(
@@ -4562,18 +4595,27 @@ def _append_restricted_terms_setting(session: Session, terms: list[str]) -> dict
         )
         session.add(row)
         session.flush()
-    existing_lines = [str(item).strip() for item in str(row.value or "").splitlines() if str(item).strip()]
+    existing_raw_lines = [str(item).strip() for item in str(row.value or "").splitlines() if str(item).strip()]
+    existing_lines = [item for item in existing_raw_lines if _is_valid_policy_restricted_term(item)]
     existing_keys = {normalize_restricted_text(item) for item in existing_lines if normalize_restricted_text(item)}
     new_terms: list[str] = []
     for term in terms:
+        if not _is_valid_policy_restricted_term(term):
+            continue
         normalized = normalize_restricted_text(term)
         if normalized and normalized not in existing_keys:
             existing_keys.add(normalized)
             existing_lines.append(term)
             new_terms.append(term)
-    if new_terms:
+    removed_noise_count = len(existing_raw_lines) - len(existing_lines)
+    if new_terms or removed_noise_count:
         row.value = "\n".join(existing_lines)
-    return {"new_terms": new_terms, "existing_term_count": len(existing_lines) - len(new_terms), "updated": bool(new_terms)}
+    return {
+        "new_terms": new_terms,
+        "existing_term_count": len(existing_lines) - len(new_terms),
+        "removed_noise_count": removed_noise_count,
+        "updated": bool(new_terms or removed_noise_count),
+    }
 
 
 def _shared_negative_set_by_name(client: Any, account: GoogleAdsAccount, name: str) -> Optional[str]:
@@ -4692,7 +4734,12 @@ def _account_garbage_negative_candidate_terms(
         )
         .limit(max(1, min(int(limit or DEFAULT_UNIVERSAL_GARBAGE_NEGATIVE_BANK_LIMIT), 5000)))
     ).all()
-    return [str(row or "").strip() for row in rows if _valid_exact_keyword(_keyword_key(str(row or "")))]
+    return [
+        str(row or "").strip()
+        for row in rows
+        if _valid_exact_keyword(_keyword_key(str(row or "")))
+        and _is_valid_policy_restricted_term(str(row or ""))
+    ]
 
 
 def _universal_generic_negative_terms(
@@ -4982,7 +5029,7 @@ def sync_restricted_policy_terms(
             "evidence_rows": [],
             "errors": [str(exc)[:500]],
         }
-    terms = [term for term in scan["terms"] if _valid_exact_keyword(term)]
+    terms = [term for term in scan["terms"] if _valid_exact_keyword(term) and _is_valid_policy_restricted_term(term)]
     setting_result = _append_restricted_terms_setting(session, terms)
     shared_set_resource = None if validate_only else _shared_negative_set_by_name(client, account, RESTRICTED_SHARED_SET_NAME)
     created_shared_set = False

@@ -280,6 +280,22 @@ SETTING_DEFINITIONS = [
         "Maximum enabled Google Ads accounts checked per dedicated universal garbage negative sync run.",
     ),
     SettingDefinition(
+        "automation.policy_disapproval_sync_interval_hours",
+        "Policy disapproval sync interval",
+        "Safety controls",
+        "number",
+        24,
+        "How often the scheduler queues the dedicated unapproved-substance policy disapproval scanner.",
+    ),
+    SettingDefinition(
+        "automation.policy_disapproval_sync_max_accounts",
+        "Policy disapproval sync accounts",
+        "Safety controls",
+        "number",
+        100,
+        "Maximum enabled Google Ads accounts checked per policy disapproval sync run.",
+    ),
+    SettingDefinition(
         "automation.basic_access_daily_operation_budget",
         "Daily Google Ads operations budget",
         "Safety controls",
