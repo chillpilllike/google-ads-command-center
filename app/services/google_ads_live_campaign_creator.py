@@ -35,6 +35,7 @@ from app.services.google_ads_account_red_flags import account_api_red_flag
 from app.services.google_ads_api_errors import summarize_google_ads_exception
 from app.services.google_ads_browser_automation import generate_browser_automation_tasks
 from app.services.google_ads_landing_page_bank import usable_landing_page_url
+from app.services.google_ads_mutation_pacing import paced_google_ads_mutate
 from app.services.google_ads_pmax_gate import pmax_activation_gate
 from app.services.google_ads_sync import build_client, enum_name
 from app.services.page_feed_restrictions import normalize_restricted_text
@@ -409,6 +410,13 @@ def _limit_daily_criteria_items(
     items: list[Any],
     validate_only: bool,
 ) -> tuple[list[Any], dict[str, Any]]:
+    items = _prepend_deferred_criteria_items(
+        session,
+        account,
+        kind=kind,
+        scope_key=scope_key,
+        items=items,
+    )
     reservation = _reserve_daily_criteria_items(
         session,
         account,
@@ -419,6 +427,44 @@ def _limit_daily_criteria_items(
     )
     allowed = int(reservation.get("allowed_items") or 0)
     return items[:allowed], reservation
+
+
+def _prepend_deferred_criteria_items(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    kind: str,
+    scope_key: str,
+    items: list[Any],
+) -> list[Any]:
+    if not hasattr(session, "scalars"):
+        return items
+    deferred_rows = list(
+        session.scalars(
+            select(GoogleAdsCriteriaPublication)
+            .where(
+                GoogleAdsCriteriaPublication.account_id == account.id,
+                GoogleAdsCriteriaPublication.kind == kind,
+                GoogleAdsCriteriaPublication.scope_key == scope_key,
+                GoogleAdsCriteriaPublication.status == "deferred_quota",
+            )
+            .order_by(
+                GoogleAdsCriteriaPublication.last_attempted_at.asc().nullsfirst(),
+                GoogleAdsCriteriaPublication.id.asc(),
+            )
+        ).all()
+    )
+    if not deferred_rows:
+        return items
+    combined: list[Any] = []
+    seen: set[str] = set()
+    for value in [row.criterion_value for row in deferred_rows] + list(items):
+        key = _criterion_key(kind, value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        combined.append(value)
+    return combined
 
 
 def _criterion_key(kind: str, value: Any) -> str:
@@ -524,20 +570,7 @@ def _is_transient_concurrent_modification_error(exc: Any) -> bool:
 
 
 def _google_ads_mutate(service: Any, method_name: str, request: Any, *, timeout: int = 30) -> Any:
-    method = getattr(service, method_name)
-    attempts = 3
-    for attempt in range(attempts):
-        try:
-            return method(request=request, timeout=timeout)
-        except TypeError as exc:
-            if "timeout" not in str(exc):
-                raise
-            return method(request=request)
-        except GoogleAdsException as exc:
-            if attempt >= attempts - 1 or not _is_transient_concurrent_modification_error(exc):
-                raise
-            time.sleep(5 * (attempt + 1))
-    return method(request=request, timeout=timeout)
+    return paced_google_ads_mutate(service, method_name, request, timeout=timeout, attempts=3)
 
 
 def _sync_setting_value(session: Session, key: str, default: Any = None) -> Any:
@@ -557,6 +590,45 @@ def root_domain(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def _domain_brand_token(url: str) -> str:
+    root = root_domain(url)
+    if not root:
+        return ""
+    return root.split(".", 1)[0].replace("-", " ").replace("_", " ").strip().lower()
+
+
+def _mapped_domain_brand_token(session: Optional[Session], account: GoogleAdsAccount) -> str:
+    if session is None:
+        return ""
+    try:
+        mapping = session.scalar(
+            select(OdooStoreGoogleAdsMapping)
+            .where(
+                OdooStoreGoogleAdsMapping.account_id == account.id,
+                OdooStoreGoogleAdsMapping.is_active.is_(True),
+            )
+            .order_by(OdooStoreGoogleAdsMapping.revenue_weight.desc(), OdooStoreGoogleAdsMapping.created_at.desc())
+            .limit(1)
+        )
+    except Exception:
+        mapping = None
+    if mapping is None:
+        return ""
+    website = None
+    try:
+        website = session.scalar(
+            select(OdooWebsite).where(
+                OdooWebsite.store_id == mapping.store_id,
+                OdooWebsite.website_id == mapping.website_id,
+                OdooWebsite.is_active.is_(True),
+            )
+        )
+    except Exception:
+        website = None
+    domain = str(getattr(website, "domain", "") or getattr(mapping.store, "base_url", "") or "")
+    return _domain_brand_token(domain)
 
 
 def _country_from_domain(value: str) -> str:
@@ -1391,10 +1463,10 @@ def _campaign_by_code_or_lane(
 def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
     currency = str(account.currency_code or "").upper()
     if currency == "INR":
-        return 300.0
-    if currency in {"AUD", "CAD", "USD"}:
-        return 2.5
-    return 2.0
+        return 50.0
+    if currency in {"AUD", "CAD", "EUR", "GBP", "NZD", "SGD", "USD"}:
+        return 0.6
+    return 0.5
 
 
 def _automation_campaign_revision_plan(name: str) -> Optional[dict[str, Any]]:
@@ -2092,8 +2164,15 @@ def _api_quota_setting_matches_account(setting: AppSetting, account: GoogleAdsAc
 
 
 def _parse_retry_seconds(text: str) -> int:
-    match = re.search(r"retry\s+in\s+(\d+)\s+seconds", str(text or ""), flags=re.IGNORECASE)
+    value = str(text or "")
+    lowered = value.lower()
+    match = re.search(r"retry\s+in\s+(\d+)\s+seconds?", value, flags=re.IGNORECASE)
     if not match:
+        if any(token in lowered for token in ["basic access", "daily", "operation quota", "operations quota", "developer token"]):
+            next_day = (utcnow() + timedelta(days=1)).astimezone(timezone.utc).replace(hour=0, minute=5, second=0, microsecond=0)
+            return max(3600, int((next_day - utcnow()).total_seconds()))
+        if any(token in lowered for token in ["too many requests", "too frequent", "rate limit", "resource exhausted"]):
+            return 1800
         return 3600
     try:
         return max(int(match.group(1)), 300)
@@ -4752,6 +4831,9 @@ def _universal_generic_negative_terms(
     account_name = str(getattr(account, "name", "") or "").strip()
     if account_name:
         terms.append(f"{account_name} online")
+    domain_brand = _mapped_domain_brand_token(session, account)
+    if domain_brand:
+        terms.append(f"{domain_brand} online")
     if session is not None:
         settings_map = get_sync_setting_map(session)
         configured_limit = bank_limit

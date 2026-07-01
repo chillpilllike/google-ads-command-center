@@ -24,6 +24,7 @@ from app.models import (
 )
 from app.services.google_ads_api_errors import record_google_ads_api_error, record_google_ads_generic_error
 from app.services.google_ads_account_red_flags import account_api_red_flag, upsert_account_api_red_flag
+from app.services.google_ads_mutation_pacing import paced_google_ads_mutate
 from app.services.google_ads_sync import build_client, enum_name
 from app.services.page_feed_restrictions import get_restricted_title_terms_sync, restricted_title_match
 
@@ -84,13 +85,7 @@ def _google_ads_search(service: Any, account: GoogleAdsAccount, query: str, *, t
 
 
 def _google_ads_mutate(service: Any, method_name: str, request: Any, *, timeout: int = 30) -> Any:
-    method = getattr(service, method_name)
-    try:
-        return method(request=request, timeout=timeout)
-    except TypeError as exc:
-        if "timeout" not in str(exc):
-            raise
-        return method(request=request)
+    return paced_google_ads_mutate(service, method_name, request, timeout=timeout, attempts=3)
 
 
 def _is_suspended_account_error(exc: Any) -> bool:

@@ -466,16 +466,27 @@ def google_ads_quota_retry_state_from_haystack(
     account: GoogleAdsAccount,
     haystack: str,
 ) -> dict[str, Any] | None:
-    if not any(token in haystack for token in ["quota", "resource exhausted", "too many requests", "basic access"]):
+    haystack_lc = str(haystack or "").lower()
+    if not any(token in haystack_lc for token in ["quota", "resource exhausted", "too many requests", "basic access"]):
         return None
-    retry_after_seconds = 3600
-    match = re.search(r"retry\s+in\s+(\d+)\s+seconds?", haystack)
+    match = re.search(r"retry\s+in\s+(\d+)\s+seconds?", haystack_lc)
     if match:
         retry_after_seconds = max(60, int(match.group(1)))
+        reason = "Google Ads API requested a retry delay during live automation"
+    elif any(token in haystack_lc for token in ["basic access", "daily", "operation quota", "operations quota", "developer token"]):
+        next_day = (utcnow() + timedelta(days=1)).astimezone(timezone.utc).replace(hour=0, minute=5, second=0, microsecond=0)
+        retry_after_seconds = max(3600, int((next_day - utcnow()).total_seconds()))
+        reason = "Google Ads API daily/basic-access operations quota exhausted during live automation"
+    elif any(token in haystack_lc for token in ["too many requests", "too frequent", "rate limit", "resource exhausted"]):
+        retry_after_seconds = 1800
+        reason = "Google Ads API short-term mutation frequency limit hit during live automation"
+    else:
+        retry_after_seconds = 3600
+        reason = "Google Ads API quota retry window is active during live automation"
     now = utcnow()
     retry_not_before = now + timedelta(seconds=retry_after_seconds)
     value = {
-        "reason": "Google Ads API basic-access operations quota exhausted during live automation",
+        "reason": reason,
         "account_id": account.id,
         "customer_id": account.customer_id,
         "connection_id": account.connection_id,

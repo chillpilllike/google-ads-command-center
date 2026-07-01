@@ -20,6 +20,7 @@ from app.services.google_ads_automation import (
     automation_live_creation_control,
     automation_campaign_identity,
     automation_strategy_summary,
+    account_delivery_profile,
     budget_guard_due_now,
     campaign_planning_data_freshness,
     cap_budget_increase_operations_by_sales_room,
@@ -299,14 +300,69 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         self.assertEqual(summary["quota"]["pmax_min_7d_conversions"], 15)
         self.assertEqual(summary["quota"]["testing_sales_budget_ratio"], 5)
         self.assertEqual(categories["Fix / Watch"]["target_roas_pct"], 350)
-        self.assertEqual(categories["Waste / Recovery"]["target_roas_pct"], 200)
+        self.assertEqual(categories["Waste / Recovery"]["target_roas_pct"], 500)
         self.assertEqual(categories["Waste / Recovery"]["badge"], "Fixed 50 CAD")
         self.assertEqual(summary["quota"]["waste_fixed_daily_budget"], 50.0)
         self.assertIn("PMax drafts are prepared", categories["Testing / Discovery"]["campaign_types"])
         self.assertIn("20.0%", intervals["Peak conversion budget"]["detail"])
         self.assertIn("rolling 7-day window", intervals["Odoo sales guard"]["detail"])
-        self.assertIn("Target ROAS RSA", intervals["Testing campaign bootstrap"]["detail"])
-        self.assertNotIn("Maximize Clicks", intervals["Testing campaign bootstrap"]["detail"])
+        self.assertIn("lifetime impressions", intervals["Testing campaign bootstrap"]["detail"])
+        self.assertIn("Maximize Clicks", intervals["Testing campaign bootstrap"]["detail"])
+
+    def test_delivery_profile_dead_start_uses_lifetime_impressions(self) -> None:
+        account = GoogleAdsAccount(id=640, name="Cold Never Launched", customer_id="1112223333")
+        preference = GoogleAdsAutomationPreference(account_id=640, account=account, automation_enabled=True)
+
+        with patch(
+            "app.services.google_ads_automation.account_delivery_metric_profile",
+            return_value={
+                "lifetime_impressions": 0,
+                "lifetime_conversions": 0,
+                "lookback_impressions": 0,
+                "lookback_conversions": 0,
+            },
+        ), patch(
+            "app.services.google_ads_automation.account_recent_billing_or_payment_signal",
+            return_value={"has_signal": False, "matches": []},
+        ), patch("app.services.google_ads_automation.account_api_red_flag", return_value=None):
+            profile = account_delivery_profile(
+                self.FakeSession(),
+                preference,
+                settings={"automation.dead_start_no_impression_lookback_days": 90},
+                now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(profile["profile"], "dead_start_never_had_impressions")
+        self.assertTrue(profile["should_launch_max_clicks"])
+        self.assertFalse(profile["should_recover_existing"])
+
+    def test_delivery_profile_historical_payment_gap_does_not_dead_start(self) -> None:
+        account = GoogleAdsAccount(id=641, name="Payment Gap", customer_id="2223334444")
+        preference = GoogleAdsAutomationPreference(account_id=641, account=account, automation_enabled=True)
+
+        with patch(
+            "app.services.google_ads_automation.account_delivery_metric_profile",
+            return_value={
+                "lifetime_impressions": 1200,
+                "lifetime_conversions": 3,
+                "lookback_impressions": 0,
+                "lookback_conversions": 0,
+                "last_impression_date": "2026-03-01",
+            },
+        ), patch(
+            "app.services.google_ads_automation.account_recent_billing_or_payment_signal",
+            return_value={"has_signal": True, "matches": [{"matched_tokens": ["payment"]}]},
+        ), patch("app.services.google_ads_automation.account_api_red_flag", return_value=None):
+            profile = account_delivery_profile(
+                self.FakeSession(),
+                preference,
+                settings={"automation.dead_start_no_impression_lookback_days": 90},
+                now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(profile["profile"], "payment_or_serving_recovery")
+        self.assertFalse(profile["should_launch_max_clicks"])
+        self.assertTrue(profile["should_recover_existing"])
 
     def test_inr_waste_budget_uses_currency_specific_fixed_amount(self) -> None:
         account = GoogleAdsAccount(id=640, name="Nutricity India", customer_id="7373005276", currency_code="INR")

@@ -19,6 +19,7 @@ from app.models import (
     AutoPilotEvent,
     GoogleAdsAccount,
     GoogleAdsAccountDailyMetric,
+    GoogleAdsApiError,
     GoogleAdsAutomationPreference,
     GoogleAdsCampaignMetric,
     GoogleAdsCriteriaPublication,
@@ -111,11 +112,13 @@ BUDGET_BOOTSTRAP_STATE_PREFIX = "automation_budget_bootstrap"
 FORCE_MINIMUM_BUDGET_SETTING = "automation.force_minimum_budget_when_budget_guard_blocked"
 COLD_START_MINIMUM_BUDGET_SETTING = "automation.cold_start_minimum_budget_until_conversion_threshold"
 COLD_START_CONVERSION_THRESHOLD_SETTING = "automation.cold_start_conversion_threshold"
+DEAD_START_IMPRESSION_LOOKBACK_DAYS_SETTING = "automation.dead_start_no_impression_lookback_days"
 CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
 WASTE_RECOVERY_TARGET_ROAS = 5.0
 COLD_START_TARGET_ROAS = 3.5
+DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS = 90
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
 DEFAULT_TESTING_KEYWORD_LIMIT = 0
 DEFAULT_TESTING_LANDING_PAGE_LIMIT = 0
@@ -135,6 +138,53 @@ UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS = [
     "online store",
     "buy online",
 ]
+NON_SUPPLEMENT_DOMAIN_TOKENS = ("gofinchkart", "secretgreen")
+COUNTRY_KEYWORD_MARKERS = {
+    "AR": ("argentina",),
+    "AT": ("austria",),
+    "AU": ("australia", "australian", "aud"),
+    "BE": ("belgium",),
+    "BR": ("brazil",),
+    "CA": ("canada", "canadian", "cad"),
+    "CH": ("switzerland", "swiss"),
+    "CL": ("chile",),
+    "CN": ("china", "chinese"),
+    "CY": ("cyprus",),
+    "CZ": ("czech", "czechia", "czech republic"),
+    "DE": ("germany", "german"),
+    "DK": ("denmark", "danish"),
+    "EE": ("estonia",),
+    "ES": ("spain", "spanish"),
+    "FI": ("finland",),
+    "FR": ("france", "french"),
+    "GB": ("united kingdom", "uk", "britain", "british", "gbp"),
+    "GR": ("greece", "greek"),
+    "ID": ("indonesia",),
+    "IL": ("israel",),
+    "IN": ("india", "indian", "inr"),
+    "IT": ("italy", "italian"),
+    "JP": ("japan", "japanese"),
+    "KR": ("south korea", "korea", "korean"),
+    "LA": ("laos",),
+    "LT": ("lithuania",),
+    "LU": ("luxembourg",),
+    "LV": ("latvia",),
+    "MX": ("mexico", "mexican"),
+    "MY": ("malaysia",),
+    "NL": ("netherlands", "dutch"),
+    "NO": ("norway", "norwegian"),
+    "NZ": ("new zealand", "nzd"),
+    "PL": ("poland", "polish"),
+    "RO": ("romania",),
+    "SE": ("sweden", "swedish"),
+    "SG": ("singapore",),
+    "SI": ("slovenia",),
+    "TR": ("turkey", "turkiye", "turkish"),
+    "TW": ("taiwan",),
+    "US": ("united states", "usa", "america", "american", "usd"),
+    "UY": ("uruguay",),
+    "ZA": ("south africa",),
+}
 CAMPAIGN_METRIC_REFRESH_QUOTA_UNITS = 1
 DAILY_INSIGHT_REFRESH_QUOTA_UNITS = 10
 ALL_TIME_REFRESH_QUOTA_UNITS = 4
@@ -532,9 +582,14 @@ def cold_start_minimum_budget_state(
     settings: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     account = preference.account
-    settings = settings or get_sync_setting_map(session)
-    account_metrics = recent_account_metric_totals(session, account, days=7)
-    auto_search_metrics = auto_search_campaign_conversion_totals(session, account, days=7)
+    settings = settings if settings is not None else (get_sync_setting_map(session) if session is not None and hasattr(session, "scalars") else {})
+    metrics_available = bool(session is not None and hasattr(session, "execute"))
+    if metrics_available:
+        account_metrics = recent_account_metric_totals(session, account, days=7)
+        auto_search_metrics = auto_search_campaign_conversion_totals(session, account, days=7)
+    else:
+        account_metrics = {"impressions": 0, "conversions": 0.0, "conversion_value": 0.0}
+        auto_search_metrics = {"conversions": 0.0, "conversion_value": 0.0}
     try:
         configured_threshold = float(settings.get(COLD_START_CONVERSION_THRESHOLD_SETTING, 0) or 0)
     except (TypeError, ValueError):
@@ -547,6 +602,7 @@ def cold_start_minimum_budget_state(
     enabled = parse_bool(settings.get(COLD_START_MINIMUM_BUDGET_SETTING, True))
     active = bool(
         enabled
+        and metrics_available
         and preference.testing_bootstrap_enabled
         and preference.auto_create_campaigns_enabled
         and conversions < conversion_threshold
@@ -690,7 +746,7 @@ def reserve_automation_quota_units(
     settings_map = get_sync_setting_map(session)
     account_budget = clamp_int(preference.api_call_budget_per_day, 750, 1, 100000)
     developer_budget = clamp_int(settings_map.get("automation.basic_access_daily_operation_budget"), 15000, 1000, 100000)
-    reserve_floor = clamp_int(settings_map.get("automation.basic_access_budget_reserve"), 3000, 0, developer_budget - 1)
+    reserve_floor = clamp_int(settings_map.get("automation.basic_access_budget_reserve"), 1000, 0, developer_budget - 1)
     units = clamp_int(units, 1, 1, 100000)
     key = automation_quota_state_key(account, now)
     developer_key = developer_token_quota_state_key(account, now)
@@ -873,6 +929,199 @@ def recent_account_metric_totals(
         "conversion_value": conversion_value,
         "latest_synced_at": row[8].isoformat() if row[8] else None,
         "metric_day_count": int(row[9] or 0),
+    }
+
+
+def account_delivery_metric_profile(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    lookback_days: int = DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    lookback_days = clamp_int(lookback_days, DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS, 30, 365)
+    today = (now or utcnow()).astimezone(timezone.utc).date()
+    lookback_start = today - timedelta(days=lookback_days - 1)
+    row = session.execute(
+        select(
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.impressions), 0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.clicks), 0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.cost_micros), 0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.conversions), 0.0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.all_conversions), 0.0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.conversions_value), 0.0),
+            func.coalesce(func.sum(GoogleAdsAccountDailyMetric.all_conversions_value), 0.0),
+            func.coalesce(
+                func.sum(GoogleAdsAccountDailyMetric.impressions).filter(
+                    GoogleAdsAccountDailyMetric.metric_date >= lookback_start
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(GoogleAdsAccountDailyMetric.conversions).filter(
+                    GoogleAdsAccountDailyMetric.metric_date >= lookback_start
+                ),
+                0.0,
+            ),
+            func.coalesce(
+                func.sum(GoogleAdsAccountDailyMetric.all_conversions).filter(
+                    GoogleAdsAccountDailyMetric.metric_date >= lookback_start
+                ),
+                0.0,
+            ),
+            func.max(GoogleAdsAccountDailyMetric.metric_date).filter(
+                GoogleAdsAccountDailyMetric.impressions > 0
+            ),
+            func.max(GoogleAdsAccountDailyMetric.metric_date).filter(
+                (GoogleAdsAccountDailyMetric.conversions > 0)
+                | (GoogleAdsAccountDailyMetric.all_conversions > 0)
+            ),
+            func.max(GoogleAdsAccountDailyMetric.metric_date),
+            func.max(GoogleAdsAccountDailyMetric.synced_at),
+            func.count(GoogleAdsAccountDailyMetric.id),
+        ).where(GoogleAdsAccountDailyMetric.account_id == account.id)
+    ).one()
+    lifetime_conversions = float(row[3] or 0) + float(row[4] or 0)
+    lookback_conversions = float(row[8] or 0) + float(row[9] or 0)
+    return {
+        "lookback_days": lookback_days,
+        "lookback_start_date": lookback_start.isoformat(),
+        "end_date": today.isoformat(),
+        "lifetime_impressions": int(row[0] or 0),
+        "lifetime_clicks": int(row[1] or 0),
+        "lifetime_cost_micros": int(row[2] or 0),
+        "lifetime_conversions": lifetime_conversions,
+        "lifetime_conversion_value": float(row[5] or 0) + float(row[6] or 0),
+        "lookback_impressions": int(row[7] or 0),
+        "lookback_conversions": lookback_conversions,
+        "last_impression_date": row[10].isoformat() if row[10] else None,
+        "last_conversion_date": row[11].isoformat() if row[11] else None,
+        "latest_metric_date": row[12].isoformat() if row[12] else None,
+        "latest_synced_at": row[13].isoformat() if row[13] else None,
+        "metric_row_count": int(row[14] or 0),
+    }
+
+
+def account_recent_billing_or_payment_signal(
+    session: Session,
+    account: GoogleAdsAccount,
+    *,
+    now: Optional[datetime] = None,
+    days: int = 120,
+) -> dict[str, Any]:
+    cutoff = (now or utcnow()).astimezone(timezone.utc) - timedelta(days=clamp_int(days, 120, 7, 365))
+    tokens = [
+        "payment",
+        "billing",
+        "balance",
+        "funds",
+        "prepay",
+        "pre-pay",
+        "past due",
+        "due payment",
+        "suspended",
+        "serving",
+        "not enabled",
+        "customer_not_enabled",
+    ]
+    rows = session.scalars(
+        select(GoogleAdsApiError)
+        .where(
+            GoogleAdsApiError.account_id == account.id,
+            GoogleAdsApiError.created_at >= cutoff,
+        )
+        .order_by(GoogleAdsApiError.created_at.desc())
+        .limit(25)
+    ).all()
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        text_value = " ".join(
+            [
+                str(row.error_code or ""),
+                str(row.message or ""),
+                str(row.details or ""),
+            ]
+        ).lower()
+        matched = [token for token in tokens if token in text_value]
+        if not matched:
+            continue
+        matches.append(
+            {
+                "error_id": row.id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "error_code": row.error_code,
+                "matched_tokens": matched[:5],
+                "message": str(row.message or "")[:240],
+            }
+        )
+    return {
+        "has_signal": bool(matches),
+        "checked_since": cutoff.isoformat(),
+        "matches": matches[:5],
+    }
+
+
+def account_delivery_profile(
+    session: Session,
+    preference: GoogleAdsAutomationPreference,
+    *,
+    settings: Optional[dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    account = preference.account
+    settings = settings if settings is not None else (get_sync_setting_map(session) if session is not None and hasattr(session, "scalars") else {})
+    lookback_days = clamp_int(
+        settings.get(DEAD_START_IMPRESSION_LOOKBACK_DAYS_SETTING),
+        DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS,
+        30,
+        365,
+    )
+    metrics = account_delivery_metric_profile(session, account, lookback_days=lookback_days, now=now)
+    red_flag = account_api_red_flag(session, account)
+    payment_signal = account_recent_billing_or_payment_signal(session, account, now=now)
+    lifetime_impressions = int(metrics.get("lifetime_impressions") or 0)
+    lifetime_conversions = float(metrics.get("lifetime_conversions") or 0.0)
+    lookback_impressions = int(metrics.get("lookback_impressions") or 0)
+    lookback_conversions = float(metrics.get("lookback_conversions") or 0.0)
+
+    if red_flag is not None:
+        profile = "blocked_account"
+        action = "skip_api"
+        reason = red_flag.get("reason") or "Account is red-flagged; automation must not touch the API."
+    elif lifetime_impressions <= 0 and lifetime_conversions <= 0:
+        profile = "dead_start_never_had_impressions"
+        action = "launch_max_clicks"
+        reason = "No saved lifetime impressions or conversions; launch guarded Maximize Clicks to get first auction data."
+    elif lookback_impressions <= 0 and payment_signal.get("has_signal"):
+        profile = "payment_or_serving_recovery"
+        action = "recover_existing"
+        reason = "Historical delivery exists, but recent impressions stopped and billing/payment/serving signals exist; recover existing campaigns before creating new cold-start structure."
+    elif lookback_impressions <= 0:
+        profile = "historically_active_serving_gap"
+        action = "diagnose_then_recover"
+        reason = "Historical delivery exists but the recent lookback has no impressions; diagnose status, bidding, budget, policy, locations, and URLs before duplicate launch."
+    elif lookback_conversions <= 0:
+        profile = "active_cold_no_conversions"
+        action = "optimize_clicks_and_protect_spend"
+        reason = "Recent impressions exist but no conversions; keep traffic guarded, push negatives/URL exclusions, and only promote proven terms."
+    else:
+        profile = "learning_or_mature"
+        action = "normal_roas_governance"
+        reason = "Recent conversion signal exists; normal ROAS governance can run."
+
+    return {
+        "profile": profile,
+        "action": action,
+        "reason": reason,
+        "lookback_days": lookback_days,
+        "metrics": metrics,
+        "payment_or_serving_signal": payment_signal,
+        "red_flag": red_flag,
+        "dead_start": profile == "dead_start_never_had_impressions",
+        "serving_gap": profile in {"payment_or_serving_recovery", "historically_active_serving_gap"},
+        "cold_without_conversions": profile in {"dead_start_never_had_impressions", "active_cold_no_conversions"},
+        "should_launch_max_clicks": profile == "dead_start_never_had_impressions",
+        "should_recover_existing": profile in {"payment_or_serving_recovery", "historically_active_serving_gap"},
     }
 
 
@@ -1221,6 +1470,147 @@ def _root_domain(host: str) -> str:
         netloc = netloc[4:]
     parts = [part for part in netloc.split(".") if part]
     return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+
+
+def _domain_brand_token(website_url: str) -> str:
+    root = _root_domain(website_url)
+    if not root:
+        return ""
+    return root.split(".", 1)[0].replace("-", " ").replace("_", " ").strip().lower()
+
+
+def _keyword_country_marker(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    if not text:
+        return ""
+    padded = f" {text} "
+    matches: list[tuple[int, str]] = []
+    for country_code, markers in COUNTRY_KEYWORD_MARKERS.items():
+        for marker in markers:
+            marker_text = str(marker or "").strip().lower()
+            if marker_text and f" {marker_text} " in padded:
+                matches.append((len(marker_text), country_code))
+                break
+    if not matches:
+        return ""
+    return sorted(matches, reverse=True)[0][1]
+
+
+def _country_code_from_domain_or_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        host = _root_domain(text)
+        if host:
+            suffix_map = [
+                (".com.au", "AU"),
+                (".co.nz", "NZ"),
+                (".co.uk", "GB"),
+                (".co.in", "IN"),
+                (".co.za", "ZA"),
+                (".ca", "CA"),
+                (".in", "IN"),
+                (".au", "AU"),
+                (".nz", "NZ"),
+                (".uk", "GB"),
+                (".us", "US"),
+            ]
+            for suffix, code in suffix_map:
+                if host.endswith(suffix):
+                    return code
+        marker = _keyword_country_marker(text)
+        if marker:
+            return marker
+    return ""
+
+
+def _account_keyword_country_code(account: GoogleAdsAccount, *, website_url: str = "") -> str:
+    return _country_code_from_domain_or_text(website_url, getattr(account, "name", ""), getattr(account, "currency_code", ""))
+
+
+def _customer_id_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = str(value).replace("\\n", "\n").replace(",", "\n").splitlines()
+    return {"".join(ch for ch in item if ch.isdigit()) for item in raw_items if "".join(ch for ch in item if ch.isdigit())}
+
+
+def _primary_or_secondary_max_clicks_enabled(account: GoogleAdsAccount, settings: dict[str, Any]) -> bool:
+    customer_id = "".join(ch for ch in str(getattr(account, "customer_id", "") or "") if ch.isdigit())
+    if not customer_id:
+        return False
+    primary_ids = _customer_id_set(settings.get("automation.scheduler_primary_customer_ids"))
+    secondary_ids = _customer_id_set(settings.get("automation.scheduler_secondary_customer_ids"))
+    return customer_id in primary_ids or customer_id in secondary_ids
+
+
+def _keyword_country_allowed(term: Any, target_country_code: str) -> bool:
+    marker = _keyword_country_marker(term)
+    target = str(target_country_code or "").upper()
+    return not marker or not target or marker == target
+
+
+def _is_non_supplement_domain(website_url: str) -> bool:
+    root = _root_domain(website_url)
+    return any(token in root for token in NON_SUPPLEMENT_DOMAIN_TOKENS)
+
+
+def _generic_positive_block_reason(term: Any, account: Optional[GoogleAdsAccount] = None, *, website_url: str = "", cold_start: bool = False) -> str:
+    text = _clean_pmax_search_theme(term)
+    key = _term_key_from_text(text)
+    if not key:
+        return "empty_keyword"
+    generic_keys = {_term_key_from_text(item) for item in UNIVERSAL_GENERIC_NEGATIVE_KEYWORDS}
+    if key in generic_keys:
+        return "universal_generic_filler"
+    if cold_start and key.endswith(" online"):
+        account_name = _clean_pmax_search_theme(str(getattr(account, "name", "") or ""))
+        account_key = _term_key_from_text(account_name)
+        brand_key = _term_key_from_text(_domain_brand_token(website_url))
+        prefix = key[: -len(" online")].strip()
+        if account_key and prefix == account_key:
+            return "cold_start_account_name_online_filler"
+        if brand_key and prefix == brand_key:
+            return "cold_start_domain_brand_online_filler"
+        return "cold_start_online_suffix_filler"
+    return ""
+
+
+def _keyword_row_allowed_for_positive(
+    row: GoogleAdsKeywordCandidate,
+    account: GoogleAdsAccount,
+    *,
+    website_url: str = "",
+    cold_start: bool = False,
+) -> bool:
+    keyword = getattr(row, "keyword", "")
+    if _generic_positive_block_reason(keyword, account, website_url=website_url, cold_start=cold_start):
+        return False
+    target_country = _account_keyword_country_code(account, website_url=website_url)
+    return _keyword_country_allowed(keyword, target_country)
+
+
+def _non_supplement_account_ids(session: Session) -> set[int]:
+    rows = session.execute(
+        select(OdooStoreGoogleAdsMapping.account_id, OdooWebsite.domain, OdooStore.base_url)
+        .join(OdooStore, OdooStore.id == OdooStoreGoogleAdsMapping.store_id)
+        .outerjoin(
+            OdooWebsite,
+            (OdooWebsite.store_id == OdooStoreGoogleAdsMapping.store_id)
+            & (OdooWebsite.website_id == OdooStoreGoogleAdsMapping.website_id),
+        )
+        .where(OdooStoreGoogleAdsMapping.is_active.is_(True))
+    ).all()
+    account_ids: set[int] = set()
+    for account_id, website_domain, store_url in rows:
+        text_value = f"{website_domain or ''} {store_url or ''}".lower()
+        if any(token in text_value for token in NON_SUPPLEMENT_DOMAIN_TOKENS):
+            account_ids.add(int(account_id))
+    return account_ids
 
 
 def _clean_similar_url(value: Any) -> str:
@@ -1595,6 +1985,8 @@ def best_keyword_candidates_for_testing(
     *,
     limit: Optional[int] = DEFAULT_TESTING_KEYWORD_LIMIT,
     allow_cross_account_fallback: bool = True,
+    website_url: str = "",
+    cold_start: bool = False,
 ) -> tuple[list[GoogleAdsKeywordCandidate], str]:
     target_limit = int(limit or 0)
     if target_limit <= 0:
@@ -1620,12 +2012,20 @@ def best_keyword_candidates_for_testing(
     )
     if target_limit:
         query = query.limit(target_limit)
-    rows = session.scalars(query).all()
+    rows = [
+        row
+        for row in session.scalars(query).all()
+        if _keyword_row_allowed_for_positive(row, account, website_url=website_url, cold_start=cold_start)
+    ]
     source = "same_account_keyword_bank"
+    non_supplement_account_ids = _non_supplement_account_ids(session)
+    target_is_non_supplement = account.id in non_supplement_account_ids or _is_non_supplement_domain(website_url)
+    cross_account_minimum = min(target_limit, 50) if cold_start and not target_is_non_supplement and target_limit else 0
     # Cross-account keywords are only a bootstrap fallback for genuinely new
-    # accounts. Once an account has its own usable keyword bank, keep targeting
-    # country/site-specific instead of making mature accounts converge.
-    if allow_cross_account_fallback and not rows:
+    # accounts, plus cold supplement accounts that need proven Core / Scale
+    # product/category terms to get first traffic. Non-supplement stores stay
+    # isolated so supplement terms do not bleed into Secretgreen/Gofinchkart.
+    if allow_cross_account_fallback and not target_is_non_supplement and (not rows or (cross_account_minimum and len(rows) < cross_account_minimum)):
         seen = {row.normalized_keyword for row in rows}
         fallback_query = (
             select(GoogleAdsKeywordCandidate)
@@ -1636,6 +2036,7 @@ def best_keyword_candidates_for_testing(
             )
             .where(
                 GoogleAdsKeywordCandidate.account_id != account.id,
+                GoogleAdsKeywordCandidate.account_id.notin_(non_supplement_account_ids or {-1}),
                 GoogleAdsKeywordCandidate.quality_label.in_(quality_order),
                 GoogleAdsKeywordCandidate.review_status != "rejected",
             )
@@ -1649,13 +2050,13 @@ def best_keyword_candidates_for_testing(
             fallback_query = fallback_query.limit(target_limit * 3)
         fallback = session.scalars(fallback_query).all()
         for row in fallback:
-            if row.normalized_keyword in seen:
+            if row.normalized_keyword in seen or not _keyword_row_allowed_for_positive(row, account, website_url=website_url, cold_start=cold_start):
                 continue
             rows.append(row)
             seen.add(row.normalized_keyword)
             if target_limit and len(rows) >= target_limit:
                 break
-        if len(rows) > len(seen):
+        if rows and seen:
             source = "mixed_keyword_bank"
         elif fallback:
             source = "same_account_then_cross_account_keyword_bank"
@@ -2322,7 +2723,7 @@ def testing_daily_budget_from_sales(
     preference: GoogleAdsAutomationPreference,
 ) -> dict[str, Any]:
     account = preference.account
-    settings = get_sync_setting_map(session)
+    settings = get_sync_setting_map(session) if session is not None and hasattr(session, "scalars") else {}
     ratio = min(max(float(preference.testing_sales_budget_ratio or 0.05), 0.001), 1.0)
     window_days = clamp_int(preference.odoo_sales_guard_window_days, 7, 1, 90)
     guard = odoo_sales_budget_guard_for_account(
@@ -2429,6 +2830,8 @@ def campaign_bootstrap_decision(
 ) -> dict[str, Any]:
     now = now or utcnow()
     account = preference.account
+    settings = get_sync_setting_map(session)
+    delivery_profile = account_delivery_profile(session, preference, settings=settings, now=now)
     metrics = recent_account_metric_totals(session, account, days=7, now=now)
     threshold = pmax_conversion_threshold(preference)
     pmax_gate = pmax_activation_gate(session, account, preference, now=now)
@@ -2440,12 +2843,13 @@ def campaign_bootstrap_decision(
     enough_conversions = bool(pmax_gate.get("allowed"))
     existing_automation_lanes = _has_existing_automation_production_lanes(session, account)
 
-    if no_recent_impressions and not existing_automation_lanes and started_at is None:
+    if delivery_profile.get("should_launch_max_clicks") and not existing_automation_lanes and started_at is None:
         started_at = now.astimezone(timezone.utc)
         state = {
             **state,
             "started_at_utc": iso_datetime(started_at),
-            "reason": "no_last_7d_impressions",
+            "reason": "dead_start_never_had_impressions",
+            "delivery_profile": delivery_profile,
         }
         save_campaign_bootstrap_state(session, account, state)
         age_days = 0
@@ -2455,10 +2859,18 @@ def campaign_bootstrap_decision(
         mode = "pmax_allowed"
         allowed_campaign_types = ["rsa", "dsa", "pmax"]
         reason = str(pmax_gate.get("reason") or "Automation-owned Search campaigns have enough conversion signal for PMax.")
-    elif no_recent_impressions or in_bootstrap:
+    elif delivery_profile.get("should_launch_max_clicks") or in_bootstrap:
         mode = "testing_no_pmax"
         allowed_campaign_types = ["rsa", "dsa"]
-        reason = "No recent delivery or account is inside the RSA/DSA-only testing bootstrap window. " + str(pmax_gate.get("reason") or "")
+        reason = "Dead-start/no-delivery account uses guarded Testing Search first. " + str(pmax_gate.get("reason") or "")
+    elif delivery_profile.get("should_recover_existing"):
+        mode = "delivery_recovery_no_pmax"
+        allowed_campaign_types = ["rsa", "dsa"]
+        reason = str(delivery_profile.get("reason") or "") + " " + str(pmax_gate.get("reason") or "")
+    elif no_recent_impressions:
+        mode = "testing_no_pmax"
+        allowed_campaign_types = ["rsa", "dsa"]
+        reason = "No recent delivery is visible in saved metrics; use guarded Search recovery before PMax. " + str(pmax_gate.get("reason") or "")
     else:
         mode = "normal_categories_no_pmax"
         allowed_campaign_types = ["rsa", "dsa"]
@@ -2481,6 +2893,9 @@ def campaign_bootstrap_decision(
         "enough_auto_search_conversions": enough_conversions,
         "enough_7d_conversions": enough_conversions,
         "existing_automation_lanes": existing_automation_lanes,
+        "delivery_profile": delivery_profile,
+        "should_launch_max_clicks": bool(delivery_profile.get("should_launch_max_clicks")),
+        "should_recover_existing": bool(delivery_profile.get("should_recover_existing")),
         "pmax_min_7d_conversions": threshold,
         "pmax_gate": pmax_gate,
         "bootstrap_days": bootstrap_days,
@@ -2818,10 +3233,10 @@ def _existing_automation_draft(
 def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
     currency = str(account.currency_code or "").upper()
     if currency == "INR":
-        return 300.0
-    if currency in {"AUD", "CAD", "USD"}:
-        return 2.5
-    return 2.0
+        return 50.0
+    if currency in {"AUD", "CAD", "EUR", "GBP", "NZD", "SGD", "USD"}:
+        return 0.6
+    return 0.5
 
 
 def _keyword_payload(rows: list[GoogleAdsKeywordCandidate]) -> list[dict[str, Any]]:
@@ -4355,7 +4770,7 @@ def retire_legacy_max_clicks_automation_drafts(
             continue
         validation = dict(draft.validation_json or {})
         warnings = list(validation.get("warnings") or [])
-        warning = "Legacy Max Clicks automation lane retired; automation now uses Target ROAS RSA/DSA only."
+        warning = "Legacy Max Clicks automation lane retired; dead-start accounts use the dedicated guarded Max Clicks cold-start lane."
         if warning not in warnings:
             warnings.append(warning)
         validation["ok"] = False
@@ -4453,11 +4868,25 @@ def run_testing_campaign_automation(
     keyword_limit = max(int(preference.testing_keyword_limit or DEFAULT_TESTING_KEYWORD_LIMIT or 0), 0)
     keyword_fetch_limit = 0
     landing_page_limit = max(int(preference.testing_landing_page_limit or DEFAULT_TESTING_LANDING_PAGE_LIMIT or 0), 0)
+    delivery_profile = decision.get("delivery_profile") if isinstance(decision.get("delivery_profile"), dict) else {}
+    priority_max_clicks_active = _primary_or_secondary_max_clicks_enabled(account, get_sync_setting_map(session))
+    early_cold_start_max_clicks_active = bool(
+        priority_max_clicks_active
+        or
+        decision.get("should_launch_max_clicks")
+        or delivery_profile.get("profile") == "active_cold_no_conversions"
+        or (
+            decision.get("mode") == "testing_no_pmax"
+            and not decision.get("should_recover_existing")
+        )
+    )
     keyword_rows, keyword_source = best_keyword_candidates_for_testing(
         session,
         account,
         limit=keyword_fetch_limit,
         allow_cross_account_fallback=True,
+        website_url=website_url,
+        cold_start=early_cold_start_max_clicks_active,
     )
     page_rows, page_source = best_landing_page_candidates_for_testing(
         session,
@@ -4523,11 +4952,23 @@ def run_testing_campaign_automation(
     pmax_source_rows = same_account_keyword_rows or list(keyword_rows)
     pmax_theme_plan = pmax_search_theme_plan(pmax_source_rows, policy_terms=pmax_policy_terms)
     pmax_search_themes = list(pmax_theme_plan["active_terms"])
-    lane_keyword_limit = keyword_limit or (max((len(keyword_rows) + 2) // 3, 1) if keyword_rows else 0)
-    core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
-    testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
-    fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
-    search_console_terms = search_console_keyword_terms(search_console_matrix, limit=0)
+    sparse_lane_limit = max((len(keyword_rows) + 2) // 3, 1) if keyword_rows else 0
+    lane_keyword_limit = min(keyword_limit, sparse_lane_limit) if keyword_limit and sparse_lane_limit else (keyword_limit or sparse_lane_limit)
+    if early_cold_start_max_clicks_active:
+        core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+        testing_terms = list(core_rsa_terms)
+        testing_rows = list(core_rsa_rows)
+        fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+    else:
+        core_rsa_terms, core_rsa_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+        testing_terms, testing_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+        fix_watch_terms, fix_watch_rows = claim_keyword_terms(keyword_rows, term_ledger_keys, limit=lane_keyword_limit)
+    target_keyword_country = _account_keyword_country_code(account, website_url=website_url)
+    search_console_terms = [
+        term
+        for term in search_console_keyword_terms(search_console_matrix, limit=0)
+        if _keyword_country_allowed(term, target_keyword_country)
+    ]
 
     def fill_with_search_console_terms(target_terms: list[str], *, limit: Optional[int] = None) -> None:
         target_limit = int(limit or 0)
@@ -4570,6 +5011,19 @@ def run_testing_campaign_automation(
         fix_watch_terms,
         limit=keyword_limit,
     )
+    if early_cold_start_max_clicks_active and core_rsa_terms:
+        existing_testing_keys = {_term_key_from_text(term) for term in testing_terms}
+        for term in core_rsa_terms:
+            key = _term_key_from_text(term)
+            if key and key not in existing_testing_keys:
+                testing_terms.append(term)
+                existing_testing_keys.add(key)
+        existing_testing_row_keys = {_keyword_row_key(row) for row in testing_rows}
+        for row in core_rsa_rows:
+            key = _keyword_row_key(row)
+            if key and key not in existing_testing_row_keys:
+                testing_rows.append(row)
+                existing_testing_row_keys.add(key)
     testing_pmax_source_rows = available_keyword_rows_for_terms(keyword_rows, term_ledger_keys)
     testing_pmax_theme_plan = pmax_search_theme_plan(testing_pmax_source_rows, policy_terms=pmax_policy_terms)
     term_ledger_keys.update(_pmax_theme_keys(testing_pmax_theme_plan))
@@ -4599,7 +5053,8 @@ def run_testing_campaign_automation(
         ga4_matrix=ga4_matrix,
         search_console_matrix=search_console_matrix,
     )
-    core_owned_theme_plan = pmax_search_theme_plan(same_account_keyword_rows, policy_terms=pmax_policy_terms)
+    core_owned_keyword_rows_for_testing_negatives = [] if early_cold_start_max_clicks_active else same_account_keyword_rows
+    core_owned_theme_plan = pmax_search_theme_plan(core_owned_keyword_rows_for_testing_negatives, policy_terms=pmax_policy_terms)
     scale_migration_state = sync_scale_search_theme_migration_state(session, account, core_owned_theme_plan)
     scale_negative_plan = testing_scale_negative_keyword_plan(
         core_owned_theme_plan,
@@ -4627,7 +5082,8 @@ def run_testing_campaign_automation(
                 + " PMax live publishing is still gated, but Core / Scale Search-owned URLs remain tracked for Testing URL exclusions."
             ).strip(),
         }
-    core_owned_testing_negatives = core_owned_testing_negative_keywords(list(pmax_search_themes) + list(core_rsa_terms))
+    pmax_terms_for_testing_negatives = [] if early_cold_start_max_clicks_active else list(pmax_search_themes)
+    core_owned_testing_negatives = core_owned_testing_negative_keywords(pmax_terms_for_testing_negatives + list(core_rsa_terms))
     testing_negative_keywords = merge_negative_keywords(
         universal_negative_keywords,
         core_owned_testing_negatives,
@@ -4741,9 +5197,15 @@ def run_testing_campaign_automation(
                 "criteria_only_maintenance": True,
                 "criteria_only_reason": budget.get("budget_block_reason"),
             }
+    delivery_profile = decision.get("delivery_profile") if isinstance(decision.get("delivery_profile"), dict) else {}
     cold_start_max_clicks_active = bool(
-        decision.get("mode") == "testing_no_pmax"
-        or decision.get("no_recent_impressions")
+        priority_max_clicks_active
+        or decision.get("should_launch_max_clicks")
+        or delivery_profile.get("profile") == "active_cold_no_conversions"
+        or (
+            decision.get("mode") == "testing_no_pmax"
+            and not decision.get("should_recover_existing")
+        )
         or (isinstance(budget.get("cold_start_minimum"), dict) and budget["cold_start_minimum"].get("active"))
     )
     testing_target_roas = COLD_START_TARGET_ROAS if cold_start_max_clicks_active else TESTING_DISCOVERY_TARGET_ROAS
@@ -4778,7 +5240,7 @@ def run_testing_campaign_automation(
         "Campaign names include category and a stable AUTO code so reconnects can resume existing campaigns.",
     ]
 
-    if decision["mode"] in {"testing_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
+    if decision["mode"] in {"testing_no_pmax", "delivery_recovery_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
         assets, validation, prompt = generate_ad_copy(
             session,
             ad_type="dsa",
@@ -4873,7 +5335,7 @@ def run_testing_campaign_automation(
             )
         )
 
-    if decision["mode"] in {"testing_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
+    if decision["mode"] in {"testing_no_pmax", "delivery_recovery_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
         if testing_rsa_terms:
             testing_keyword_rows_for_payload = testing_rows or available_keyword_rows_for_terms(keyword_rows, set())
             assets, validation, prompt = generate_ad_copy(
@@ -7482,7 +7944,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             {
                 "name": "Testing campaign bootstrap",
                 "cadence": "After each daily insight refresh" if testing_bootstrap_enabled else "Disabled",
-                "detail": f"If an account has no last-7-day impressions, or is inside the {testing_bootstrap_days}-day bootstrap, automation publishes Testing / Discovery Search using Target ROAS RSA plus AI Max DSA page-discovery URL inclusions from the best keyword and URL banks. Core / Scale, Fix / Watch, and Waste / Recovery can stay in the closed loop, but PMax is drafted/held from live until automation-owned Search campaigns reach at least {pmax_min_7d_conversions:g} conversions. The testing lane uses {testing_sales_budget_pct:g}% of rolling Odoo sales, capped by the account guard.",
+                "detail": f"Automation classifies accounts by lifetime impressions first, then last {DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS} days. True never-impression dead-start accounts publish Testing / Discovery RSA on capped Maximize Clicks plus AI Max DSA URL inclusions; historically active accounts with no recent impressions go through delivery recovery/diagnosis instead of duplicate cold-start creation. PMax is held from live until automation-owned Search campaigns reach at least {pmax_min_7d_conversions:g} conversions.",
             },
             {
                 "name": "Mutation cooldown",

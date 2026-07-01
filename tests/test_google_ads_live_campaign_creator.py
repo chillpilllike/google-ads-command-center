@@ -790,7 +790,7 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
                     "campaign_code": "AUTO-RSA",
                     "campaign_name": "AUTO | Testing / Discovery | RSA Max Clicks Keywords | AUTO-RSA",
                 },
-                "bidding": {"daily_budget": 1, "max_cpc_bid_limit": 2.5},
+                "bidding": {"daily_budget": 1, "max_cpc_bid_limit": 0.6},
                 "final_url": "https://nutricity.ca",
                 "keyword_clusters": [
                     {"exact_terms": ["klaire labs probiotics", "juven", "new exact keyword"]},

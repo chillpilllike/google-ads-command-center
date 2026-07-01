@@ -308,7 +308,7 @@ SETTING_DEFINITIONS = [
         "Daily operations reserve",
         "Safety controls",
         "number",
-        3000,
+        1000,
         "Operations kept unused for budget up/down, monitoring, retries, and urgent fixes. Heavy campaign/asset work stops before this reserve is consumed.",
     ),
     SettingDefinition(
