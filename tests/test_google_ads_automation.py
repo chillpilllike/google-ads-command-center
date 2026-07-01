@@ -296,6 +296,7 @@ class GoogleAdsAutomationTests(unittest.TestCase):
 
         self.assertEqual(summary["quota"]["sales_guard_window_type"], "rolling")
         self.assertEqual(summary["quota"]["fix_watch_target_roas"], 3.5)
+        self.assertEqual(summary["quota"]["cold_start_target_roas"], 3.0)
         self.assertEqual(summary["quota"]["testing_bootstrap_days"], 15)
         self.assertEqual(summary["quota"]["pmax_min_7d_conversions"], 15)
         self.assertEqual(summary["quota"]["testing_sales_budget_ratio"], 5)
@@ -304,6 +305,7 @@ class GoogleAdsAutomationTests(unittest.TestCase):
         self.assertEqual(categories["Waste / Recovery"]["badge"], "Fixed 50 CAD")
         self.assertEqual(summary["quota"]["waste_fixed_daily_budget"], 50.0)
         self.assertIn("PMax drafts are prepared", categories["Testing / Discovery"]["campaign_types"])
+        self.assertIn("300% while delivery evidence is thin", categories["Testing / Discovery"]["rule"])
         self.assertIn("20.0%", intervals["Peak conversion budget"]["detail"])
         self.assertIn("rolling 7-day window", intervals["Odoo sales guard"]["detail"])
         self.assertIn("lifetime impressions", intervals["Testing campaign bootstrap"]["detail"])

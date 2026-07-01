@@ -354,7 +354,7 @@ def _plan_delivery_actions(
     disable_after = _num(settings, "autopilot.disable_after_hours", 72)
     observation_interval = _num(settings, "autopilot.observation_interval_hours", 3)
     red_budget_cut_pct = min(max(_num(settings, "spend_guard.red_budget_cut_pct", 0.2), 0.01), 0.95)
-    roas_start = _num(settings, "autopilot.target_roas_start", 3.5)
+    roas_start = _num(settings, "autopilot.target_roas_start", 3.0)
     roas_step = _num(settings, "autopilot.target_roas_step", 0.5)
     roas_floor = _num(settings, "autopilot.target_roas_floor", 1)
     spend_guard = spend_guard or {}

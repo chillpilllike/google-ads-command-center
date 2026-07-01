@@ -112,12 +112,14 @@ BUDGET_BOOTSTRAP_STATE_PREFIX = "automation_budget_bootstrap"
 FORCE_MINIMUM_BUDGET_SETTING = "automation.force_minimum_budget_when_budget_guard_blocked"
 COLD_START_MINIMUM_BUDGET_SETTING = "automation.cold_start_minimum_budget_until_conversion_threshold"
 COLD_START_CONVERSION_THRESHOLD_SETTING = "automation.cold_start_conversion_threshold"
+COLD_START_TARGET_ROAS_SETTING = "automation.cold_start_target_roas"
 DEAD_START_IMPRESSION_LOOKBACK_DAYS_SETTING = "automation.dead_start_no_impression_lookback_days"
 CORE_SCALE_TARGET_ROAS = 6.67
 TESTING_DISCOVERY_TARGET_ROAS = 5.0
 FIX_WATCH_TARGET_ROAS = 3.5
 WASTE_RECOVERY_TARGET_ROAS = 5.0
-COLD_START_TARGET_ROAS = 3.5
+DEFAULT_COLD_START_TARGET_ROAS = 3.0
+COLD_START_TARGET_ROAS = DEFAULT_COLD_START_TARGET_ROAS
 DEFAULT_DEAD_START_NO_IMPRESSION_LOOKBACK_DAYS = 90
 MAX_AUTOMATION_DATA_AGE_HOURS = 30
 DEFAULT_TESTING_KEYWORD_LIMIT = 0
@@ -373,6 +375,24 @@ def clamp_int(value: Any, default: int, low: int, high: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return min(max(parsed, low), high)
+
+
+def clamp_float(value: Any, default: float, low: float, high: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, low), high)
+
+
+def cold_start_target_roas_from_settings(settings: Optional[dict[str, Any]] = None) -> float:
+    settings = settings or {}
+    return clamp_float(
+        settings.get(COLD_START_TARGET_ROAS_SETTING),
+        DEFAULT_COLD_START_TARGET_ROAS,
+        1.0,
+        10.0,
+    )
 
 
 def numeric_value(row: dict[str, Any], key: str) -> float:
@@ -5175,9 +5195,10 @@ def run_testing_campaign_automation(
             "basis": "Audience signals are disabled for this account.",
         }
     )
+    settings = get_sync_setting_map(session)
+    cold_start_target_roas = cold_start_target_roas_from_settings(settings)
     budget = testing_daily_budget_from_sales(session, preference)
     if budget.get("budget_blocked"):
-        settings = get_sync_setting_map(session)
         if parse_bool(settings.get(FORCE_MINIMUM_BUDGET_SETTING, False)):
             minimum_budget = currency_minimum_daily_budget(account, preference.minimum_daily_budget_amount)
             budget = {
@@ -5208,7 +5229,7 @@ def run_testing_campaign_automation(
         )
         or (isinstance(budget.get("cold_start_minimum"), dict) and budget["cold_start_minimum"].get("active"))
     )
-    testing_target_roas = COLD_START_TARGET_ROAS if cold_start_max_clicks_active else TESTING_DISCOVERY_TARGET_ROAS
+    testing_target_roas = cold_start_target_roas if cold_start_max_clicks_active else TESTING_DISCOVERY_TARGET_ROAS
     bidding = {
         "strategy": "maximize_conversion_value_target_roas",
         "strategy_label": "Maximize conversion value with Target ROAS",
@@ -5219,7 +5240,7 @@ def run_testing_campaign_automation(
         "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
         "sales_budget_ratio": budget["ratio"],
         "sales_budget_ratio_pct": budget["ratio_pct"],
-        "cold_start_target_roas": COLD_START_TARGET_ROAS if cold_start_max_clicks_active else None,
+        "cold_start_target_roas": cold_start_target_roas if cold_start_max_clicks_active else None,
     }
     testing_rsa_bidding = bidding
     if cold_start_max_clicks_active:
@@ -5460,11 +5481,13 @@ def run_testing_campaign_automation(
             )
 
     if fix_watch_terms:
+        fix_watch_target_roas = cold_start_target_roas if cold_start_max_clicks_active else FIX_WATCH_TARGET_ROAS
         fix_watch_bidding = {
             **bidding,
-            "target_roas": FIX_WATCH_TARGET_ROAS,
-            "target_roas_percent": round(FIX_WATCH_TARGET_ROAS * 100, 2),
+            "target_roas": fix_watch_target_roas,
+            "target_roas_percent": round(fix_watch_target_roas * 100, 2),
             "category_strategy": "fix_watch_rescue",
+            "cold_start_target_roas": cold_start_target_roas if cold_start_max_clicks_active else None,
         }
         assets, validation, prompt = generate_ad_copy(
             session,
@@ -5673,7 +5696,7 @@ def run_testing_campaign_automation(
 
     if decision["mode"] in {"testing_no_pmax", "normal_categories_no_pmax", "pmax_allowed"}:
         pmax_roas = (
-            COLD_START_TARGET_ROAS
+            cold_start_target_roas
             if cold_start_max_clicks_active
             else max(CORE_SCALE_TARGET_ROAS, 1 / max(float(preference.odoo_sales_max_spend_ratio or 0.15), 0.01))
         )
@@ -7855,6 +7878,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
         testing_landing_page_limit = max(int(preference.testing_landing_page_limit or DEFAULT_TESTING_LANDING_PAGE_LIMIT or 0), 0)
         waste_currency_code = str((preference.account.currency_code if preference.account else "") or "USD").upper()
     waste_fixed_amount = waste_fixed_daily_budget(preference.account if preference else None)
+    cold_start_target_roas = cold_start_target_roas_from_settings()
     core_scale_roas = round(1 / max(float(sales_guard_ratio or 15) / 100, 0.01), 2)
     if core_scale_roas < CORE_SCALE_TARGET_ROAS:
         core_scale_roas = CORE_SCALE_TARGET_ROAS
@@ -7873,7 +7897,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "target_roas": TESTING_DISCOVERY_TARGET_ROAS,
             "target_roas_pct": round(TESTING_DISCOVERY_TARGET_ROAS * 100),
             "campaign_types": "Cold accounts use Maximize Clicks RSA with CPC ceilings from the keyword bank; mature Testing accounts use Target-ROAS RSA plus AI Max DSA page discovery. PMax drafts are prepared but held from live until automation-owned Search campaigns have enough conversion evidence.",
-            "rule": f"Use RSA/page discovery only for the first {testing_bootstrap_days} day(s) when delivery is missing or conversion evidence is thin; promote to Core / Scale only after purchase evidence, healthy spend efficiency, and no duplicate keyword or landing-page conflict.",
+            "rule": f"Cold Target-ROAS lanes use {round(cold_start_target_roas * 100)}% while delivery evidence is thin. Use RSA/page discovery only for the first {testing_bootstrap_days} day(s) when delivery is missing or conversion evidence is thin; promote to Core / Scale only after purchase evidence, healthy spend efficiency, and no duplicate keyword or landing-page conflict.",
         },
         {
             "name": "Fix / Watch",
@@ -7963,6 +7987,7 @@ def automation_strategy_summary(preference: Optional[GoogleAdsAutomationPreferen
             "peak_budget_check_interval_minutes": peak_check_minutes,
             "sales_guard_window_type": "rolling",
             "fix_watch_target_roas": FIX_WATCH_TARGET_ROAS,
+            "cold_start_target_roas": cold_start_target_roas,
             "testing_bootstrap_enabled": testing_bootstrap_enabled,
             "testing_bootstrap_days": testing_bootstrap_days,
             "pmax_min_7d_conversions": pmax_min_7d_conversions,

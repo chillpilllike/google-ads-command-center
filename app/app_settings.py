@@ -328,6 +328,14 @@ SETTING_DEFINITIONS = [
         "Number of recent conversions after which cold accounts return to the normal Odoo sales/spend budget guard.",
     ),
     SettingDefinition(
+        "automation.cold_start_target_roas",
+        "Cold-start Target ROAS",
+        "Automation",
+        "number",
+        3.0,
+        "Target ROAS used for cold/dead-start account Target-ROAS lanes. 3.0 equals 300%. Maximize Clicks cold-start RSA campaigns still use CPC caps instead of ROAS.",
+    ),
+    SettingDefinition(
         "automation.scheduler_primary_customer_ids",
         "Primary automation accounts",
         "Safety controls",
@@ -673,8 +681,8 @@ SETTING_DEFINITIONS = [
         "Starting Target ROAS",
         "Autopilot ROAS",
         "number",
-        3.5,
-        "First rescue Target ROAS. 3.5 equals 350%.",
+        3.0,
+        "First rescue Target ROAS. 3.0 equals 300%.",
     ),
     SettingDefinition(
         "autopilot.target_roas_step",
