@@ -17,9 +17,12 @@ from app.services.google_ads_live_campaign_creator import (
     _create_search_theme_signals,
     _draft_live_creation_control,
     _existing_asset_group_audience_signals,
+    _active_max_clicks_cpc_maintenance_plan,
+    _apply_campaign_revision,
     _is_replaced_legacy_pmax_draft,
     _keyword_texts_from_draft,
     _live_creation_batch_status,
+    _max_cpc_bid_limit_for_account,
     _pmax_asset_group_copy_assets,
     _pmax_final_urls_from_assets,
     _record_criteria_publications,
@@ -452,6 +455,44 @@ class GoogleAdsLiveCampaignCreatorTests(unittest.TestCase):
         campaign = client.campaign_service.last_request.operations[0].create
         self.assertEqual(campaign.target_spend.cpc_bid_ceiling_micros, 2_500_000)
         self.assertEqual(campaign.maximize_conversion_value.target_roas, 0)
+
+    def test_max_clicks_cpc_default_is_ten_inr_equivalent(self) -> None:
+        account = SimpleNamespace(currency_code="AUD")
+
+        cpc = _max_cpc_bid_limit_for_account(account, {"USD": 1, "INR": 83, "AUD": 1.5})
+
+        self.assertEqual(cpc, 0.18)
+
+    def test_active_auto_max_clicks_revision_sets_ten_inr_equivalent_cpc(self) -> None:
+        client = self.FakeGoogleAdsClient()
+        account = SimpleNamespace(customer_id="3495463031", currency_code="AUD")
+        campaign = {
+            "campaign_resource_name": "customers/3495463031/campaigns/123",
+            "campaign_name": "AUTO | Cold Start | Search Max Clicks | AUTO-123",
+            "campaign_status": "ENABLED",
+            "channel_type": "SEARCH",
+            "bidding_strategy_type": "TARGET_SPEND",
+            "cpc_bid_ceiling_micros": 600_000,
+            "target_google_search": True,
+            "target_search_network": False,
+            "target_partner_search_network": False,
+            "target_content_network": False,
+        }
+        plan = _active_max_clicks_cpc_maintenance_plan(campaign)
+
+        changed = _apply_campaign_revision(
+            client,
+            account,
+            campaign,
+            plan,
+            rates={"USD": 1, "INR": 83, "AUD": 1.5},
+            validate_only=False,
+        )
+
+        update = client.campaign_service.last_request.operations[0].update
+        self.assertEqual(changed, ["max_clicks_cpc"])
+        self.assertEqual(update.target_spend.cpc_bid_ceiling_micros, 180_000)
+        self.assertIn("target_spend.cpc_bid_ceiling_micros", client.campaign_service.last_request.operations[0].update_mask.paths)
 
     def test_create_search_campaign_can_enable_ai_max_for_dsa_lane(self) -> None:
         client = self.FakeGoogleAdsClient()

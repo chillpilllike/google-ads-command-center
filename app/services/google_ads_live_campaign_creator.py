@@ -38,6 +38,7 @@ from app.services.google_ads_landing_page_bank import usable_landing_page_url
 from app.services.google_ads_mutation_pacing import paced_google_ads_mutate
 from app.services.google_ads_pmax_gate import pmax_activation_gate
 from app.services.google_ads_sync import build_client, enum_name
+from app.services.currency_rates import convert_amount_with_fallback, get_latest_rate_snapshot_sync, snapshot_payload
 from app.services.page_feed_restrictions import normalize_restricted_text
 
 
@@ -1118,6 +1119,10 @@ def _micros(amount: float) -> int:
     return max(int(round(float(amount or 0) * 1_000_000)), 1_000_000)
 
 
+def _bid_micros(amount: float) -> int:
+    return max(int(round(float(amount or 0) * 1_000_000)), 1)
+
+
 def _float_value(value: Any, default: float = 0.0) -> float:
     try:
         return float(value if value is not None else default)
@@ -1655,13 +1660,12 @@ def _campaign_by_code_or_lane(
     return _campaign_by_lane_name(client, account, campaign_name)
 
 
-def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
-    currency = str(account.currency_code or "").upper()
+def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount, rates: Optional[dict[str, Any]] = None) -> float:
+    currency = str(account.currency_code or "INR").upper()
     if currency == "INR":
-        return 50.0
-    if currency in {"AUD", "CAD", "EUR", "GBP", "NZD", "SGD", "USD"}:
-        return 0.6
-    return 0.5
+        return 10.0
+    converted = convert_amount_with_fallback(10.0, "INR", currency, rates or {})
+    return round(float(converted if converted is not None else 10.0), 2)
 
 
 def _automation_campaign_revision_plan(name: str) -> Optional[dict[str, Any]]:
@@ -1742,6 +1746,21 @@ def _is_legacy_max_clicks_auto_campaign(campaign: dict[str, Any], plan: dict[str
     )
 
 
+def _active_max_clicks_cpc_maintenance_plan(campaign: dict[str, Any]) -> Optional[dict[str, Any]]:
+    name = str(campaign.get("campaign_name") or "").lower()
+    strategy = str(campaign.get("bidding_strategy_type") or "").upper()
+    status = str(campaign.get("campaign_status") or "").upper()
+    is_auto = "auto |" in name
+    is_max_clicks = strategy in {"TARGET_SPEND", "MAXIMIZE_CLICKS"} or "max clicks" in name or "maximize clicks" in name
+    if not is_auto or not is_max_clicks or status != "ENABLED":
+        return None
+    return {
+        "strategy": "maximize_clicks",
+        "lane": "active_max_clicks_cpc_maintenance",
+        "allow_max_clicks": True,
+    }
+
+
 def _legacy_max_clicks_paused_name(name: str) -> str:
     text = str(name or "").strip() or "AUTO | Legacy Max Clicks"
     text = re.sub(r"RSA Max Clicks CPC Cap", "RSA Legacy Paused", text, flags=re.I)
@@ -1805,6 +1824,7 @@ def _apply_campaign_revision(
     campaign: dict[str, Any],
     plan: dict[str, Any],
     *,
+    rates: Optional[dict[str, Any]] = None,
     validate_only: bool,
 ) -> list[str]:
     resource_name = str(campaign.get("campaign_resource_name") or "")
@@ -1891,6 +1911,13 @@ def _apply_campaign_revision(
             update._pb.maximize_conversion_value.CopyFrom(maximize_conversion_value._pb)
         operation.update_mask.paths.append("maximize_conversion_value.target_roas")
         changed.append("target_roas")
+    if strategy == "maximize_clicks":
+        desired_cpc_micros = int(plan.get("max_cpc_micros") or _bid_micros(_max_cpc_bid_limit_for_account(account, rates)))
+        current_cpc_micros = int(campaign.get("cpc_bid_ceiling_micros") or 0)
+        if desired_cpc_micros > 0 and current_cpc_micros != desired_cpc_micros:
+            update.target_spend.cpc_bid_ceiling_micros = desired_cpc_micros
+            operation.update_mask.paths.append("target_spend.cpc_bid_ceiling_micros")
+            changed.append("max_clicks_cpc")
     if not operation.update_mask.paths:
         return []
     request = client.get_type("MutateCampaignsRequest")
@@ -1927,6 +1954,8 @@ def enforce_automation_campaign_revisions(
             },
         }
     settings = get_sync_setting_map(session)
+    rate_payload = snapshot_payload(get_latest_rate_snapshot_sync(session))
+    rates = rate_payload.get("rates") or {}
     client = build_client(settings, account.manager_customer_id, account.connection)
     rows = _automation_campaign_revision_rows(client, account)
     has_core_scale_s001_pmax = any(
@@ -1940,6 +1969,9 @@ def enforce_automation_campaign_revisions(
     errors: list[dict[str, Any]] = []
     for campaign in rows:
         plan = _automation_campaign_revision_plan(str(campaign.get("campaign_name") or ""))
+        active_max_clicks_plan = _active_max_clicks_cpc_maintenance_plan(campaign)
+        if active_max_clicks_plan is not None:
+            plan = {**(plan or {}), **active_max_clicks_plan}
         if not plan:
             skipped += 1
             continue
@@ -1965,7 +1997,7 @@ def enforce_automation_campaign_revisions(
                 "desired_name": str(campaign.get("campaign_name") or "").replace("PMax Target ROAS Scale |", "PMax Target ROAS Scale Legacy Paused |"),
             }
         try:
-            changed = _apply_campaign_revision(client, account, campaign, plan, validate_only=validate_only)
+            changed = _apply_campaign_revision(client, account, campaign, plan, rates=rates, validate_only=validate_only)
             country_target = resolve_account_country_target(session, account)
             location_result = _ensure_campaign_country_target(
                 client,
@@ -5623,7 +5655,7 @@ def publish_dsa_draft(
             account,
             name=campaign_name,
             budget_resource_name=budget_resource,
-            max_cpc_micros=_micros(max_cpc),
+            max_cpc_micros=_bid_micros(max_cpc),
             bidding=bidding,
             domain_name=domain,
             enable_ai_max=True,
@@ -5866,7 +5898,7 @@ def publish_dsa_draft(
             campaign_resource_name=str(campaign["campaign_resource_name"]),
             name=ad_group_name,
             ad_group_type="dsa",
-            max_cpc_micros=_micros(max_cpc),
+            max_cpc_micros=_bid_micros(max_cpc),
             validate_only=validate_only,
         )
         ad_group = {
@@ -6043,7 +6075,7 @@ def publish_rsa_draft(
             account,
             name=campaign_name,
             budget_resource_name=budget_resource,
-            max_cpc_micros=_micros(max_cpc),
+            max_cpc_micros=_bid_micros(max_cpc),
             bidding=bidding,
             enable_ai_max=True,
             ai_max_final_url_expansion=ai_max_final_url_expansion,
@@ -6165,7 +6197,7 @@ def publish_rsa_draft(
             campaign_resource_name=str(campaign["campaign_resource_name"]),
             name=ad_group_name,
             ad_group_type="rsa",
-            max_cpc_micros=_micros(max_cpc),
+            max_cpc_micros=_bid_micros(max_cpc),
             validate_only=validate_only,
         )
         ad_group = {

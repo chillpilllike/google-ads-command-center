@@ -33,6 +33,23 @@ TARGET_CURRENCIES = (
     "DKK",
 )
 OPENEXCHANGE_URL = "https://openexchangerates.org/api/latest.json"
+FALLBACK_USD_BASE_RATES = {
+    "USD": 1.0,
+    "INR": 95.25,
+    "AUD": 1.46,
+    "CAD": 1.37,
+    "GBP": 0.74,
+    "EUR": 0.86,
+    "NZD": 1.65,
+    "SGD": 1.28,
+    "JPY": 144.0,
+    "BRL": 5.45,
+    "MXN": 18.5,
+    "CHF": 0.80,
+    "SEK": 9.6,
+    "NOK": 10.2,
+    "DKK": 6.4,
+}
 
 
 def normalize_currency(value: Any) -> str:
@@ -69,6 +86,18 @@ def convert_amount(
     if not source_rate or not target_rate:
         return None
     return (float(amount or 0) / source_rate) * target_rate
+
+
+def convert_amount_with_fallback(
+    amount: float,
+    from_currency: str,
+    to_currency: str,
+    rates: dict[str, Any] | None,
+) -> Optional[float]:
+    converted = convert_amount(amount, from_currency, to_currency, rates)
+    if converted is not None:
+        return converted
+    return convert_amount(amount, from_currency, to_currency, FALLBACK_USD_BASE_RATES)
 
 
 def snapshot_payload(snapshot: CurrencyRateSnapshot | None) -> dict[str, Any]:

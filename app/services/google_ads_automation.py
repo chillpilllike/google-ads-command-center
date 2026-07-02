@@ -34,7 +34,7 @@ from app.models import (
     OdooStoreGoogleAdsMapping,
     OdooWebsite,
 )
-from app.services.currency_rates import convert_amount, get_latest_rate_snapshot_sync, snapshot_payload
+from app.services.currency_rates import convert_amount, convert_amount_with_fallback, get_latest_rate_snapshot_sync, snapshot_payload
 from app.services.google_ads_api_errors import record_google_ads_api_error, record_google_ads_generic_error
 from app.services.google_ads_account_red_flags import (
     account_api_red_flag,
@@ -3257,13 +3257,12 @@ def _existing_automation_draft(
     )
 
 
-def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount) -> float:
-    currency = str(account.currency_code or "").upper()
+def _max_cpc_bid_limit_for_account(account: GoogleAdsAccount, rates: Optional[dict[str, Any]] = None) -> float:
+    currency = str(account.currency_code or "INR").upper()
     if currency == "INR":
-        return 50.0
-    if currency in {"AUD", "CAD", "EUR", "GBP", "NZD", "SGD", "USD"}:
-        return 0.6
-    return 0.5
+        return 10.0
+    converted = convert_amount_with_fallback(10.0, "INR", currency, rates or {})
+    return round(float(converted if converted is not None else 10.0), 2)
 
 
 def _keyword_payload(rows: list[GoogleAdsKeywordCandidate]) -> list[dict[str, Any]]:
@@ -5237,6 +5236,8 @@ def run_testing_campaign_automation(
         or (isinstance(budget.get("cold_start_minimum"), dict) and budget["cold_start_minimum"].get("active"))
     )
     testing_target_roas = cold_start_target_roas if cold_start_max_clicks_active else TESTING_DISCOVERY_TARGET_ROAS
+    rate_payload = snapshot_payload(get_latest_rate_snapshot_sync(session))
+    max_clicks_cpc_cap = _max_cpc_bid_limit_for_account(account, rate_payload.get("rates") or {})
     bidding = {
         "strategy": "maximize_conversion_value_target_roas",
         "strategy_label": "Maximize conversion value with Target ROAS",
@@ -5244,7 +5245,7 @@ def run_testing_campaign_automation(
         "daily_budget": round(float(budget["daily_budget"] or 0), 2),
         "target_roas": testing_target_roas,
         "target_roas_percent": round(testing_target_roas * 100, 2),
-        "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
+        "max_cpc_bid_limit": max_clicks_cpc_cap,
         "sales_budget_ratio": budget["ratio"],
         "sales_budget_ratio_pct": budget["ratio_pct"],
         "cold_start_target_roas": cold_start_target_roas if cold_start_max_clicks_active else None,
@@ -5258,7 +5259,7 @@ def run_testing_campaign_automation(
             "target_roas": 0,
             "target_roas_percent": 0,
             "cold_start_max_clicks": True,
-            "max_cpc_bid_limit": _max_cpc_bid_limit_for_account(account),
+            "max_cpc_bid_limit": max_clicks_cpc_cap,
         }
     drafts: list[dict[str, Any]] = []
     retired_max_clicks_drafts = retire_legacy_max_clicks_automation_drafts(session, preference)
